@@ -1,0 +1,35 @@
+[package]
+name = "phantom-animate"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+phantom-core = { path = "../core" }
+phantom-runtime = { path = "../runtime" }
+glam = "0.30"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+bevy = { version = "0.17.3", default-features = false, features = [
+    "bevy_asset",
+    "bevy_log",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_image",
+    "bevy_window",
+    "bevy_winit",
+    "x11",
+    "png",
+    "std",
+    "async_executor",
+] }
+bevy_egui = "0.38.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rmcp = { version = "3.8", default-features = false, features = ["server", "macros", "transport-io"] }
+tokio = { version = "1", features = ["rt", "io-std"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+thiserror = "2"

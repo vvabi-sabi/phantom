@@ -1,0 +1,9 @@
+/target/
+
+# OS junk
+.DS_Store
+
+# third-party test assets: kept locally for a full cargo test run,
+# not checked into the repository (no redistribution license)
+/Hip Hop Dancing.fbx
+/43-obj/
