@@ -2,7 +2,7 @@
 
 Stage short stylized animation by directing 3D characters like actors — without the complexity of a full Blender setup. The director stages a scene, puts the background on a curved arc screen, imports characters and motion (OBJ/FBX, Mixamo-compatible), drives Phantom from the keyboard or from keys on the timeline, records takes, sets up the camera, and gets frames with 2D styling (inverted-hull outline).
 
-A short architecture overview is below; the bundled actors and their actions are listed in [docs/builtin-actors.md](docs/builtin-actors.md).
+The full design and status document is [docs/architecture.md](docs/architecture.md); the bundled actors and their actions are listed in [docs/builtin-actors.md](docs/builtin-actors.md).
 
 ## How the program is put together
 
@@ -157,6 +157,7 @@ Render jobs run as child CLI processes: `render_*` returns a job ID, progress an
 - `crates/core` — project document, commands, timeline, audio mix (no GPU, no window)
 - `crates/runtime` — storage, OBJ/FBX import, FFmpeg, audio, GPU rendering
 - `crates/app` — the binary: CLI, GUI, MCP server, and the bridge to an open window
+- `docs/architecture.md` — architecture, decisions and implementation status
 - `docs/builtin-actors.md` — the bundled procedural actors and their actions
 - `BUILTIN-ACTORS-LICENSE.txt` — license for the bundled actors (MIT)
 

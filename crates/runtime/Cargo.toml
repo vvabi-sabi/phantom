@@ -20,7 +20,7 @@ bevy = { version = "0.17.3", default-features = false, features = [
     "std",
     "async_executor",
 ] }
-# tiff is available from the offline cache; webp/exr need new crates (see architecture.md B7).
+# tiff is available from the offline cache; webp/exr need new crates (see docs/architecture.md).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
 thiserror = "2"
 ufbx = "0.4"

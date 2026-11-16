@@ -411,7 +411,7 @@ fn main() -> Result<()> {
         Cmd::Capabilities => {
             println!("phantom-animate {}", env!("CARGO_PKG_VERSION"));
             println!("fps: 24 (fixed), audio: 48 kHz stereo");
-            println!("import: obj, fbx, png, jpg, tiff, mp3/wav/ogg/flac/m4a, mp4/webm/mov/gif; gltf/glb, webp/exr are not supported yet (see architecture.md B7)");
+            println!("import: obj, fbx, png, jpg, tiff, mp3/wav/ogg/flac/m4a, mp4/webm/mov/gif; gltf/glb, webp/exr are not supported yet (see docs/architecture.md)");
             println!("output: png sequence, mp4 (h.264 + aac 48 kHz)");
             println!("bevy: render+pbr+core_pipeline without bloom/vignette/dof (not in 0.17.3), LUT-free Reinhard tonemapping, msaa 4x");
             println!("limits: frame <= 4096x4096, particles per effect <= 1024, outputs — inside the project directory");
