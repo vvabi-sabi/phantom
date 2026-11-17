@@ -283,10 +283,10 @@ impl CameraTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CameraTargetMode {
-    /// Слежение: the camera stands where its keys put it and only turns to keep
+    /// Tracking: the camera stands where its keys put it and only turns to keep
     /// the subject in view — it does not travel with the subject.
     Track,
-    /// Следование: the camera is attached to the subject. Its keys are read in
+    /// Following: the camera is attached to the subject. Its keys are read in
     /// the subject's frame (position, angles and aim point alike), so it travels
     /// and turns with the subject — a third-person view.
     Follow,

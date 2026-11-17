@@ -85,9 +85,9 @@ pub fn camera_target(scene: &Scene, id: Option<CameraId>) -> Option<CameraTarget
 /// The world pose of a camera at a frame, with its subject attachment applied.
 ///
 /// - A free camera is its own keys.
-/// - **Слежение** (`Track`): the key position and angles stand, and the camera
+/// - **Tracking** (`Track`): the key position and angles stand, and the camera
 ///   only turns to keep the subject in view.
-/// - **Следование** (`Follow`): the keys are read in the subject's frame —
+/// - **Following** (`Follow`): the keys are read in the subject's frame —
 ///   position, angles and aim point alike — so the camera travels and turns with
 ///   the subject, a third-person view. `Camera::sample` has already resolved a
 ///   key's `look_at` against that key's own (local) position, so the resolved
