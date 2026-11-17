@@ -160,6 +160,7 @@ fn core_error_code(error: &CoreError) -> &'static str {
         | CoreError::InvalidAudioClipParam(_)
         | CoreError::InvalidLightParam(_)
         | CoreError::InvalidScatter(_)
+        | CoreError::InvalidCrowd(_)
         | CoreError::InvalidBatch(_) => "invalid_input",
     }
 }
@@ -176,6 +177,11 @@ fn core_error_details(error: &CoreError) -> Value {
         CoreError::UnknownProp(name) => json!({ "entity": "catalog_entry", "name": name, "hint": "catalog_query" }),
         // A fill that will not fit says what to lower; the message carries it.
         CoreError::InvalidScatter(why) => json!({ "entity": "scatter", "why": why, "hint": "scatter_presets" }),
+        // Same for a crowd: over the ceiling, or a role or rows the shape has no
+        // use for — the message names what to change.
+        CoreError::InvalidCrowd(why) => json!({
+            "entity": "crowd", "why": why, "formations": phantom_core::CROWD_FORMATIONS,
+        }),
         CoreError::InvalidRange { start, end } => json!({ "start": start, "end": end }),
         CoreError::NonFinite(field) => json!({ "field": field }),
         CoreError::EmptyName => json!({ "field": "name" }),
@@ -583,6 +589,54 @@ pub enum Op {
         #[serde(default)]
         prefix: Option<String>,
     },
+    /// Fill a formation with people in ONE atomic step (one undo): a line, arc,
+    /// wedge, scattered crowd or queue. Every person is a real Phantom with one
+    /// pose key, so the crowd stays actable afterwards — the point of a crowd
+    /// generator is that you can then move someone.
+    Crowd {
+        scene: u64,
+        formation: String,
+        count: usize,
+        /// `mixed` | `adults` | a catalog role name (`adult|child|teen|elder`).
+        #[serde(default)]
+        roles: Option<String>,
+        /// Pose held by everyone; `stand` by default.
+        #[serde(default)]
+        pose: Option<String>,
+        #[serde(default)]
+        spacing: Option<f32>,
+        #[serde(default)]
+        rows: Option<usize>,
+        /// How far a person may look off the formation's facing, degrees.
+        #[serde(default)]
+        scatter_deg: Option<f32>,
+        #[serde(default)]
+        seed: Option<u64>,
+        #[serde(default)]
+        prefix: Option<String>,
+        /// Where the formation's origin stands, in world coordinates.
+        #[serde(default)]
+        pos: Option<[f32; 3]>,
+        #[serde(default)]
+        yaw: f32,
+        /// Frame the pose key is set at.
+        #[serde(default)]
+        frame: Option<Frame>,
+    },
+    /// One person: a Phantom **and** its pose key, created together. Split from
+    /// `crowd` so the batch composes plain ops, and never split further — a
+    /// phantom with no key is not a person, and a half-built crowd would be a
+    /// document state no render should ever see.
+    CrowdMember {
+        scene: u64,
+        name: String,
+        /// Rig name: `humanoid|child|teen|elder`.
+        actor: String,
+        frame: Frame,
+        pos: [f32; 3],
+        pose: ActorPose,
+        yaw: f32,
+    },
     /// One object whose mesh is a replayed scatter plan (the far band of a
     /// fill). Split from `scatter` so the batch composes plain ops.
     ScatterBand {
@@ -645,7 +699,7 @@ impl Op {
             | CameraKeyRemove { .. } | CameraLensSet { .. } | CameraFocalKeySet { .. } | CameraTargetSet { .. }
             | FilmMove { .. } | FilmTrim { .. }
             | FilmRemove { .. } | PhantomRemove { .. } | MotionKeyRemove { .. } | MotionReplace { .. }
-            | PropGrid { .. } | Scatter { .. } | ScatterBand { .. }
+            | PropGrid { .. } | Scatter { .. } | Crowd { .. } | CrowdMember { .. } | ScatterBand { .. }
             | AudioTrackAdd { .. } | AudioClipAdd { .. } | AudioClipUpdate { .. } | TrackVolumeSet { .. }
             | TrackMuteSet { .. } | AudioClipRemove { .. } | AudioTrackRemove { .. }
             | LayerAdd2D { .. } | ExposureRemove { .. } | HistoryUndo | HistoryRedo
@@ -1219,9 +1273,17 @@ impl Session {
                 "objects": result["objects"].as_array().map(|v| v.len()).unwrap_or(0),
                 "band": result["band"], "seed": result["seed"],
             }),
+            CrowdMember { scene: sid, name, actor, .. } => result["phantom"].as_u64().map(|id| json!({
+                "kind":"phantom", "scene":sid, "id":id, "name":name, "actor":actor
+            })).unwrap_or(Value::Null),
             ScatterBand { scene: sid, name, .. } => result["object"].as_u64().map(|id| json!({
                 "kind":"object", "scene":sid, "id":id, "name":name, "band":true
             })).unwrap_or(Value::Null),
+            Crowd { scene: sid, formation, .. } => json!({
+                "kind":"crowd", "scene":sid, "formation":formation,
+                "people": result["crowd"].as_array().map(|v| v.len()).unwrap_or(0),
+                "seed": result["seed"],
+            }),
             ObjectKeySet { scene: sid, object, frame, .. } => scene(*sid).and_then(|s| s.objects.get(&ObjectId(*object))).and_then(|o| o.keys.iter().find(|k| k.frame == *frame)).map(|key| json!({
                 "kind":"object_key", "scene":sid, "object":object, "id":{"object":object,"frame":frame}, "key":key
             })).unwrap_or(Value::Null),
@@ -1625,6 +1687,53 @@ impl Session {
                     return Ok(json!({ "object": out.object.map(|o| o.0), "objects": created, "furniture": created.len() - 1 }));
                 }
                 Ok(json!({ "object": out.object.map(|o| o.0) }))
+            }
+            Crowd { scene, formation, count, roles, pose, spacing, rows, scatter_deg, seed, prefix, pos, yaw, frame } => {
+                // The scene's name is only read to name the people, so the borrow
+                // ends here — the batch below needs &mut self.
+                let default_base = {
+                    let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
+                    p.scenes
+                        .get(&SceneId(scene))
+                        .ok_or(CoreError::SceneNotFound(SceneId(scene)))?
+                        .name
+                        .clone()
+                };
+                let spec = crowd_spec(&formation, count, roles.as_deref(), spacing, rows, scatter_deg)?;
+                let pose = match pose.as_deref() {
+                    Some(name) => crate::builtin::parse_pose(name).map_err(SessionError::BadInput)?,
+                    None => phantom_core::ActorPose::Stand,
+                };
+                // Drawn once and reported: the answer has to name the crowd that
+                // was actually built, the same way a fill reports its seed.
+                let seed = seed.unwrap_or_else(random_seed);
+                let people = phantom_core::plan_crowd(&spec, seed)?;
+                let base = prefix.filter(|s| !s.trim().is_empty()).unwrap_or(default_base);
+                let ops = crowd_ops(scene, &people, pose, &base, pos, yaw, frame.unwrap_or(0));
+                let mut value = self.execute_batch(ops)?;
+                let ids: Vec<u64> = value["results"]
+                    .as_array()
+                    .map(|rs| rs.iter().filter_map(|r| r["phantom"].as_u64()).collect())
+                    .unwrap_or_default();
+                value["crowd"] = json!(ids);
+                value["count"] = json!(ids.len());
+                value["seed"] = json!(seed);
+                Ok(value)
+            }
+            CrowdMember { scene, name, actor, frame, pos, pose, yaw } => {
+                let rig = phantom_core::RigRef::BuiltinActor {
+                    actor: crate::builtin::parse_actor(&actor).map_err(SessionError::BadInput)?,
+                };
+                let out = self.cmd(Command::AddPhantom { scene: SceneId(scene), name, rig })?;
+                let phantom = out
+                    .phantom
+                    .ok_or_else(|| SessionError::BadInput("the document created no phantom".into()))?;
+                self.cmd(Command::SetMotionKey {
+                    scene: SceneId(scene),
+                    phantom,
+                    key: MotionKey { frame, position: pos.into(), pose, yaw },
+                })?;
+                Ok(json!({ "phantom": phantom.0, "actor": actor }))
             }
             ScatterBand { scene, name, field, pos, yaw } => {
                 let key = ObjectKey { frame: 0, position: pos.into(), yaw, pitch: 0.0, roll: 0.0, scale: glam::Vec3::ONE };
@@ -3179,6 +3288,67 @@ fn to_local_box(box_: &[f32; 4], center: [f32; 2], yaw: f32) -> [[f32; 2]; 2] {
     ]
 }
 
+/// The crowd knobs a caller gives, resolved into a core spec. Names and numbers
+/// are validated here so the error text speaks the caller's vocabulary.
+fn crowd_spec(
+    formation: &str,
+    count: usize,
+    roles: Option<&str>,
+    spacing: Option<f32>,
+    rows: Option<usize>,
+    scatter_deg: Option<f32>,
+) -> Result<phantom_core::CrowdSpec, SessionError> {
+    use phantom_core::{CrowdMix, CrowdSpec};
+    let formation = phantom_core::crowd_formation(formation).ok_or_else(|| {
+        SessionError::BadInput(format!(
+            "crowd: unknown formation \"{formation}\" (available: {})",
+            phantom_core::CROWD_FORMATIONS.join(", ")
+        ))
+    })?;
+    let mix = match roles.map(str::trim).filter(|s| !s.is_empty()) {
+        None | Some("mixed") => CrowdMix::Mixed,
+        Some("adults") => CrowdMix::Adults,
+        Some(role) => CrowdMix::Role(role.to_string()),
+    };
+    let mut spec = CrowdSpec::new(formation, count, mix);
+    spec.spacing = spacing.unwrap_or(phantom_core::CROWD_SPACING);
+    spec.rows = rows;
+    spec.scatter_deg = scatter_deg.unwrap_or(60.0);
+    Ok(spec)
+}
+
+/// Phantoms plus one pose key each, ready for the atomic batch path. A person is
+/// added and keyed as two plain ops: the crowd is a batch of ordinary Phantoms,
+/// which is exactly why it stays actable afterwards.
+fn crowd_ops(
+    scene: u64,
+    people: &[phantom_core::PlacedPerson],
+    pose: phantom_core::ActorPose,
+    base: &str,
+    pos: Option<[f32; 3]>,
+    yaw: f32,
+    frame: phantom_core::Frame,
+) -> Vec<Op> {
+    let origin = glam::Vec3::from(pos.unwrap_or([0.0, 0.0, 0.0]));
+    let rot = glam::Quat::from_rotation_y(yaw);
+    people
+        .iter()
+        .enumerate()
+        .map(|(i, person)| {
+            let at = origin + rot * glam::Vec3::from_array(person.position);
+            Op::CrowdMember {
+                scene,
+                name: format!("{base} {}", i + 1),
+                actor: crate::builtin::role_rig(person.actor).to_string(),
+                frame,
+                pos: at.to_array(),
+                pose,
+                yaw: yaw + person.yaw,
+            }
+        })
+        .collect()
+}
+
 /// A seed for a fill the director did not pin. The document stores whatever is
 /// chosen, so reproducibility starts at the saved project, not at this moment.
 fn random_seed() -> u64 {
@@ -3328,6 +3498,81 @@ mod look_and_grid_tests {
         let b_spots = spots(&session, &b);
         assert!(!a_spots.is_empty());
         assert_eq!(a_spots, b_spots, "the seed, not the clock, decides the wood");
+    }
+
+    #[test]
+    fn a_crowd_is_one_undo_step_of_actable_people() {
+        let (mut session, scene) = session_with_scene();
+        session
+            .execute(Op::StageSet { scene, preset: Some("medium".into()), width: None, height: None, depth: None, center: None })
+            .unwrap();
+        let depth = session.history.undo_depth();
+        let out = session
+            .execute(Op::Crowd {
+                scene,
+                formation: "wedge".into(),
+                count: 12,
+                roles: None,
+                pose: None,
+                spacing: None,
+                rows: None,
+                scatter_deg: None,
+                seed: Some(5),
+                prefix: Some("villager".into()),
+                pos: Some([0.0, 0.0, -6.0]),
+                yaw: 0.0,
+                frame: None,
+            })
+            .unwrap();
+        let ids = out["crowd"].as_array().unwrap();
+        assert_eq!(ids.len(), 12, "everyone the director asked for");
+        assert_eq!(out["seed"], 5, "the pinned seed comes back");
+        let s = session.project.as_ref().unwrap().scenes.get(&SceneId(scene)).unwrap();
+        // A person is a Phantom WITH a pose key: a keyless phantom is a stub no
+        // renderer should ever be asked to draw.
+        assert_eq!(s.phantoms.len(), 12);
+        assert!(s.phantoms.values().all(|p| p.motion.len() == 1 && p.motion[0].pose == phantom_core::ActorPose::Stand));
+        // Roles are mixed and every name is a real rig name.
+        let rigs: std::collections::BTreeSet<_> = s
+            .phantoms
+            .values()
+            .map(|p| match &p.rig {
+                phantom_core::RigRef::BuiltinActor { actor } => crate::builtin::actor_name(*actor).to_string(),
+                _ => "builtin".to_string(),
+            })
+            .collect();
+        assert!(rigs.len() > 1, "a mixed crowd with one silhouette: {rigs:?}");
+        assert_eq!(session.history.undo_depth(), depth + 1, "the whole crowd is one undo step");
+        assert!(session.execute(Op::HistoryUndo).is_ok());
+        assert!(session.project.as_ref().unwrap().scenes[&SceneId(scene)].phantoms.is_empty());
+    }
+
+    #[test]
+    fn a_crowd_reports_the_people_it_refused_to_truncate() {
+        let (mut session, scene) = session_with_scene();
+        session
+            .execute(Op::StageSet { scene, preset: Some("medium".into()), width: None, height: None, depth: None, center: None })
+            .unwrap();
+        let err = session
+            .execute(Op::Crowd {
+                scene,
+                formation: "phalanx".into(),
+                count: 10,
+                roles: None,
+                pose: None,
+                spacing: None,
+                rows: None,
+                scatter_deg: None,
+                seed: Some(1),
+                prefix: None,
+                pos: None,
+                yaw: 0.0,
+                frame: None,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("phalanx"), "{err}");
+        assert!(err.to_string().contains("line"), "the error should list what exists: {err}");
+        assert!(session.project.as_ref().unwrap().scenes[&SceneId(scene)].phantoms.is_empty(), "nothing was built");
     }
 
     #[test]

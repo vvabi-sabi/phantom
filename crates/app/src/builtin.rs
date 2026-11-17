@@ -31,6 +31,19 @@ pub fn parse_rig(name: &str) -> Result<RigRef, String> {
     name.parse().map(|id| RigRef::Imported { asset: AssetId(id) })
         .map_err(|_| "rig: builtin|humanoid|child|teen|elder|wolf|horse|bird or asset ID".into())
 }
+/// A crowd role name (the catalog's `adult|child|teen|elder`) as a rig name.
+/// The two vocabularies differ in one place only: the catalog calls a grown-up
+/// "adult", the rig is `humanoid`. Roles are what a crowd mixes, so the planner
+/// speaks roles and this is where it becomes something you can create a Phantom
+/// with. The role comes from the core's role table, hence `'static`.
+pub fn role_rig(role: &'static str) -> &'static str {
+    if role == "adult" {
+        "humanoid"
+    } else {
+        role
+    }
+}
+
 /// Catalog dimensions in JSON: millimeter precision as f64. The table stores
 /// f32, and standalone and bridge serialize f32 differently — rounding makes
 /// the contract stable (and honest: these are metric dimensions, not computations).

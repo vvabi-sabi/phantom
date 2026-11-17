@@ -145,6 +145,50 @@ enum Cmd {
         #[arg(long, default_value = "1,1,1")]
         scale: String,
     },
+    /// Fill a formation with people in one atomic step (one undo): line, arc,
+    /// wedge, scattered or queue. Every person is a real Phantom with one pose
+    /// key, so the crowd stays actable — you can move someone afterwards.
+    Crowd {
+        project: PathBuf,
+        #[arg(long)]
+        scene: u64,
+        /// Formation: line | arc | wedge | scattered | queue.
+        formation: String,
+        /// How many people (up to 128).
+        #[arg(long, default_value_t = 12)]
+        count: usize,
+        /// Who stands there: mixed (default) | adults | a role name
+        /// (adult|child|teen|elder).
+        #[arg(long)]
+        roles: Option<String>,
+        /// Pose held by everyone: stand (default) | sit | lie.
+        #[arg(long)]
+        pose: Option<String>,
+        /// Meters between neighbors; 0.8 by default.
+        #[arg(long)]
+        spacing: Option<f32>,
+        /// Rows for a line/scattered crowd; by default close to square.
+        #[arg(long)]
+        rows: Option<usize>,
+        /// How far a person may look off the formation's facing, degrees.
+        #[arg(long)]
+        scatter_deg: Option<f32>,
+        /// Determinism seed; a random one is drawn and printed when omitted.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Name prefix; without it — the scene name.
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Where the formation's origin stands "x,y,z".
+        #[arg(long)]
+        pos: Option<String>,
+        /// Which way the formation faces, degrees.
+        #[arg(long, default_value_t = 0.0)]
+        yaw: f32,
+        /// Frame the pose key is set at.
+        #[arg(long)]
+        frame: Option<u32>,
+    },
     /// Fill an area or a line from a preset in one atomic step (one undo):
     /// forest, grove, undergrowth, hedge, street_row, pole_row. Inside
     /// --action the fill places movable props; the ring beyond it becomes one
@@ -818,6 +862,42 @@ fn main() -> Result<()> {
                 "sheet": value["sheet"], "tiles": value["tiles"], "findings": value["findings"],
             }))?);
             println!("sheet -> {}", out.display());
+        }
+        Cmd::Crowd {
+            project, scene, formation, count, roles, pose, spacing, rows, scatter_deg, seed, prefix, pos, yaw, frame,
+        } => {
+            let mut session = crate::session::Session::new();
+            session.project = Some(storage::load_project(&project)?);
+            session.dir = Some(project.clone());
+            let value = session.execute(crate::session::Op::Crowd {
+                scene,
+                formation,
+                count,
+                roles,
+                pose,
+                spacing,
+                rows,
+                scatter_deg,
+                seed,
+                prefix,
+                pos: match pos.as_deref() {
+                    Some(s) => {
+                        let v = parse_vec3(s)?;
+                        Some([v.x, v.y, v.z])
+                    }
+                    None => None,
+                },
+                yaw: yaw.to_radians(),
+                frame: frame.map(|f| f as phantom_core::Frame),
+            })?;
+            storage::save_project(&project, session.project.as_ref().expect("project was loaded"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "crowd": value["crowd"], "count": value["count"], "seed": value["seed"],
+                    "clamped": value["clamped"],
+                }))?
+            );
         }
         Cmd::Scatter { project, scene, preset, area, plate, inset, action, density, from, to, step, seed, prefix } => {
             // The same Session Op the MCP tool calls: one implementation of

@@ -1452,6 +1452,26 @@ impl PhantomMcp {
         })
     }
 
+    #[tool(output_schema = structured_object_schema(), description = "Fill a formation with people in ONE atomic step (one undo): `line` (rank and file), `arc` (concave on the lens, reads bigger than a line), `wedge` (a V walking toward the camera), `scattered` (jittered grid — a market square), `queue` (one file). Every person is a real Phantom holding one pose key, so the crowd stays actable afterwards: move someone, turn someone, key someone. `roles` mixes who stands there — `mixed` (default: adult-heavy with teens, elders and children, which is what makes a crowd read as real), `adults`, or one catalog role (`adult|child|teen|elder`). One pose for everyone (`stand` by default); glances are random within `scatter_deg` of the formation's facing, drawn from the seed. The seed is stored in the document, so the same call rebuilds the same crowd; omit it and the drawn seed comes back in the answer. Over 128 people the call fails with the limit and the fix (split into several crowds) instead of quietly truncating. Angles in degrees.")]
+    async fn crowd(&self, Parameters(p): Parameters<PCrowd>) -> Result<CallToolResult, ErrorData> {
+        let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
+        self.exec(Op::Crowd {
+            scene,
+            formation: p.formation,
+            count: p.count,
+            roles: p.roles,
+            pose: p.pose,
+            spacing: p.spacing,
+            rows: p.rows,
+            scatter_deg: p.scatter_deg,
+            seed: p.seed,
+            prefix: p.prefix,
+            pos: p.pos,
+            yaw: p.yaw_deg.unwrap_or(0.0).to_radians(),
+            frame: p.frame,
+        })
+    }
+
     #[tool(output_schema = structured_object_schema(), description = "Cancel a job (the process is killed and temporary files are deleted)")]
     async fn job_cancel(&self, Parameters(p): Parameters<PJob>) -> Result<CallToolResult, ErrorData> {
         self.exec(Op::JobCancel { job: p.job })
@@ -2091,6 +2111,37 @@ struct PLook {
     /// Tile height in pixels, 1..=4096; default 270.
     height: Option<u32>,
 }
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PCrowd {
+    /// Scene ID; omit to use the active scene.
+    scene: Option<u64>,
+    /// Formation: `line`, `arc`, `wedge`, `scattered` or `queue`.
+    formation: String,
+    /// How many people; up to 128.
+    count: usize,
+    /// Who stands there: `mixed` (default), `adults`, or a catalog role name (`adult|child|teen|elder`).
+    roles: Option<String>,
+    /// Pose held by everyone: `stand` (default), `sit` or `lie`.
+    pose: Option<String>,
+    /// Meters between neighbors; 0.8 by default.
+    spacing: Option<f32>,
+    /// Rows for a `line` or `scattered` crowd; close to square by default. Rejected for the shapes that have no rows.
+    rows: Option<usize>,
+    /// How far a person may look off the formation's facing, in degrees; 60 by default.
+    scatter_deg: Option<f32>,
+    /// Determinism seed; omit to draw one (it comes back in the answer and is stored).
+    seed: Option<u64>,
+    /// Name prefix for the people; default the scene name.
+    prefix: Option<String>,
+    /// Where the formation's origin stands, [x,y,z] in meters; the origin by default.
+    pos: Option<[f32; 3]>,
+    /// Which way the formation faces, in degrees about +Y.
+    yaw_deg: Option<f32>,
+    /// Frame the pose key is set at; frame 0 by default.
+    frame: Option<i64>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PScatter {

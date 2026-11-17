@@ -5,6 +5,7 @@ pub mod audio;
 pub mod camera;
 pub mod catalog;
 pub mod command;
+pub mod crowd;
 pub mod draw;
 pub mod error;
 pub mod film;
@@ -22,6 +23,10 @@ pub use audio::{
     clamp_i16, mix_frame, mix_into, peak_of, AudioClip, AudioClipId, AudioTrack, PcmBuf, PcmCache, TrackId, SAMPLES_PER_FRAME, SAMPLE_RATE,
 };
 pub use command::{Command, CommandOutput, History};
+pub use crowd::{
+    crowd_formation, formation_name, plan_crowd, CrowdFormation, CrowdMix, CrowdSpec, PlacedPerson, CROWD_FORMATIONS,
+    CROWD_SPACING, MAX_CROWD_PHANTOMS,
+};
 pub use draw::{Exposure, Layer2D, LayerId, Stroke, DEFAULT_CANVAS};
 pub use error::CoreError;
 pub use film::{film_len, film_map, film_map_clip, ClipId, FilmClip};

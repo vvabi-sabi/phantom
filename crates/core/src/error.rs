@@ -55,6 +55,8 @@ pub enum CoreError {
     InvalidBatch(&'static str),
     #[error("invalid scatter: {0}")]
     InvalidScatter(String),
+    #[error("invalid crowd: {0}")]
+    InvalidCrowd(String),
     #[error("invalid audio clip parameter: {0}")]
     InvalidAudioClipParam(&'static str),
     #[error("light source {0} not found")]
