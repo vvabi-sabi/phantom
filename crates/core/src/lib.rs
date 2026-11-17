@@ -24,7 +24,7 @@ pub use audio::{
 };
 pub use command::{Command, CommandOutput, History};
 pub use crowd::{
-    crowd_formation, formation_name, plan_crowd, CrowdFormation, CrowdMix, CrowdSpec, PlacedPerson, CROWD_FORMATIONS,
+    crowd_footprint, crowd_formation, formation_name, plan_crowd, CrowdFormation, CrowdMix, CrowdSpec, PlacedPerson, CROWD_FORMATIONS,
     CROWD_SPACING, MAX_CROWD_PHANTOMS,
 };
 pub use draw::{Exposure, Layer2D, LayerId, Stroke, DEFAULT_CANVAS};

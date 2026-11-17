@@ -1709,6 +1709,22 @@ impl Session {
                 let seed = seed.unwrap_or_else(random_seed);
                 let people = phantom_core::plan_crowd(&spec, seed)?;
                 let base = prefix.filter(|s| !s.trim().is_empty()).unwrap_or(default_base);
+                // The crowd fits the stage as ONE body: shift its origin, and
+                // everybody keeps their spacing. Clamping person by person —
+                // which is what each phantom's own key does — drags everyone who
+                // sticks past the border onto the border, and a queue in a
+                // narrow room becomes a pile at the wall.
+                let (pos, crowd_clamp) = {
+                    let stage = self
+                        .project
+                        .as_ref()
+                        .expect("checked above")
+                        .scenes
+                        .get(&SceneId(scene))
+                        .ok_or(CoreError::SceneNotFound(SceneId(scene)))?
+                        .stage;
+                    fit_crowd_on_stage(&stage, &spec, pos, yaw).map_err(SessionError::Core)?
+                };
                 let ops = crowd_ops(scene, &people, pose, &base, pos, yaw, frame.unwrap_or(0));
                 let mut value = self.execute_batch(ops)?;
                 let ids: Vec<u64> = value["results"]
@@ -1718,6 +1734,15 @@ impl Session {
                 value["crowd"] = json!(ids);
                 value["count"] = json!(ids.len());
                 value["seed"] = json!(seed);
+                // The batch reports the per-key clamps (there are none, since the
+                // whole body was moved inside first); the crowd's own shift is
+                // reported in addition, because it is the correction the director
+                // actually made.
+                let mut clamps = value.get("clamped").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+                if let Some(shift) = crowd_clamp {
+                    clamps.insert(0, serde_json::to_value(shift).unwrap_or(Value::Null));
+                    value["clamped"] = json!(clamps);
+                }
                 Ok(value)
             }
             CrowdMember { scene, name, actor, frame, pos, pose, yaw } => {
@@ -3349,6 +3374,69 @@ fn crowd_ops(
         .collect()
 }
 
+/// Bring a crowd onto the stage as one body: the whole formation shifts by one
+/// offset, so its shape survives. Returns the origin to place it at and the
+/// correction, when there was one. The stage clamps a single key by its own
+/// footprint; for a crowd that per-key rule would fold the formation against the
+/// border, which is why the batch resolves its envelope first.
+fn fit_crowd_on_stage(
+    stage: &phantom_core::Stage,
+    spec: &phantom_core::CrowdSpec,
+    pos: Option<[f32; 3]>,
+    yaw: f32,
+) -> Result<(Option<[f32; 3]>, Option<phantom_core::Clamp>), CoreError> {
+    let rot = glam::Quat::from_rotation_y(yaw);
+    let footprint = phantom_core::crowd_footprint(spec);
+    let wanted = glam::Vec3::from(pos.unwrap_or([0.0, 0.0, 0.0]));
+    if !stage.room_for(footprint, rot) {
+        // Refuse rather than fold: the per-key clamp would drag each person who
+        // sticks past the border onto the border, and a smoke test did exactly
+        // that — ten people of a queue ended up in a 0.1 m pile at the wall,
+        // reported as a crowd of ten. A crowd that does not fit is a question for
+        // the director, not something to guess at. The message quotes the floor
+        // the formation needs against the floor the scene has, so the fix is
+        // arithmetic the caller can do, not a guess.
+        let half = footprint.world_half(rot);
+        let size = stage.size;
+        let turned = if yaw.abs() < 1e-4 { String::new() } else { format!(" turned {:.0}°", yaw.to_degrees()) };
+        return Err(CoreError::InvalidCrowd(format!(
+            "crowd: {}{turned} needs {:.1}x{:.1} m of floor and the stage is {:.1}x{:.1} m — lower the count, tighten --spacing, or grow the stage",
+            describe(spec),
+            half.x * 2.0,
+            half.z * 2.0,
+            size.width,
+            size.depth
+        )));
+    }
+    let (placed, moved) = stage.clamp(wanted, footprint, rot);
+    if moved {
+        Ok((
+            Some(placed.to_array()),
+            Some(phantom_core::Clamp {
+                kind: phantom_core::ClampKind::Phantom,
+                // The shift belongs to the crowd as a whole, not to one person;
+                // id 0 and frame 0 say "the formation itself".
+                id: 0,
+                frame: 0,
+                from: wanted.to_array(),
+                to: placed.to_array(),
+            }),
+        ))
+    } else {
+        Ok((pos, None))
+    }
+}
+
+/// How a crowd is said out loud, for errors.
+fn describe(spec: &phantom_core::CrowdSpec) -> String {
+    format!(
+        "{} {} in a {}",
+        spec.count,
+        if spec.count == 1 { "person" } else { "people" },
+        phantom_core::formation_name(spec.formation)
+    )
+}
+
 /// A seed for a fill the director did not pin. The document stores whatever is
 /// chosen, so reproducibility starts at the saved project, not at this moment.
 fn random_seed() -> u64 {
@@ -3545,6 +3633,52 @@ mod look_and_grid_tests {
         assert_eq!(session.history.undo_depth(), depth + 1, "the whole crowd is one undo step");
         assert!(session.execute(Op::HistoryUndo).is_ok());
         assert!(session.project.as_ref().unwrap().scenes[&SceneId(scene)].phantoms.is_empty());
+    }
+
+    #[test]
+    fn a_crowd_that_does_not_fit_is_refused_instead_of_folded() {
+        let (mut session, scene) = session_with_scene();
+        // A room whose floor is smaller than the formation's envelope.
+        session
+            .execute(Op::StageSet { scene, preset: None, width: Some(6.0), height: Some(4.0), depth: Some(6.0), center: None })
+            .unwrap();
+        let run = |session: &mut Session, count: usize| {
+            session.execute(Op::Crowd {
+                scene,
+                formation: "queue".into(),
+                count,
+                roles: None,
+                pose: None,
+                spacing: None,
+                rows: None,
+                scatter_deg: None,
+                seed: Some(1),
+                prefix: None,
+                pos: Some([0.0, 0.0, -4.0]),
+                yaw: 0.0,
+                frame: None,
+            })
+        };
+        // Ten deep is 10 m of floor in a 6 m room. Clamping each person by their
+        // own key would have parked all ten in a pile at the wall and answered
+        // "10 people" — so the call says no, and quotes both floors.
+        let err = run(&mut session, 10).unwrap_err().to_string();
+        assert!(err.contains("needs") && err.contains("of floor"), "{err}");
+        assert!(err.contains("10.2") && err.contains("6.0"), "the error should quote both floors: {err}");
+        assert!(session.project.as_ref().unwrap().scenes[&SceneId(scene)].phantoms.is_empty());
+
+        // Six deep fits: the crowd is shifted as one body and keeps its stride.
+        let out = run(&mut session, 6).unwrap();
+        assert_eq!(out["count"], 6);
+        let s = session.project.as_ref().unwrap().scenes.get(&SceneId(scene)).unwrap();
+        let mut z: Vec<f32> = s.phantoms.values().map(|p| p.motion[0].position.z).collect();
+        z.sort_by(|a, b| a.total_cmp(b));
+        assert!(z.iter().all(|v| v.abs() <= 3.0 + 0.4 + 1e-3), "everyone on the floor: {z:?}");
+        let stride: Vec<f32> = z.windows(2).map(|w| w[1] - w[0]).collect();
+        let (big, small) = stride.iter().copied().fold((0.0f32, f32::MAX), |(hi, lo), v| (hi.max(v), lo.min(v)));
+        assert!(big - small < 1e-4, "the queue kept no stride: {stride:?}");
+        // And the director is told the formation moved.
+        assert!(out["clamped"].as_array().is_some_and(|c| !c.is_empty()), "the shift must be reported");
     }
 
     #[test]

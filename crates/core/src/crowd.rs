@@ -413,3 +413,40 @@ mod tests {
         assert!(crowd_formation("phalanx").is_none());
     }
 }
+
+/// The crowd's local box: the whole formation, tall enough for the tallest role
+/// the mix can draw.
+///
+/// This exists because a crowd must be clamped as ONE body. Clamping each
+/// person by their own point — which is what a plain motion key does — pushes
+/// everyone who sticks past the border to the border, and a queue in a narrow
+/// room collapses into a pile at the wall: the formation stops being a
+/// formation. So the batch shifts the entire crowd by one offset and every
+/// person keeps their spacing.
+pub fn crowd_footprint(spec: &CrowdSpec) -> crate::stage::Footprint {
+    // The envelope is a real bounding box, not a radius: a queue is deep and
+    // narrow, and calling it a square would turn down a queue that fits along
+    // the wall. Half-extent plus the center, so the formation may sit anywhere
+    // inside it — the origin is not its middle.
+    let mut rng = SeedRng::new(0);
+    let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for i in 0..spec.count {
+        let [x, z] = slot(spec.formation, spec, i, &mut rng);
+        lo = [lo[0].min(x), lo[1].min(z)];
+        hi = [hi[0].max(x), hi[1].max(z)];
+    }
+    let height = roles_of(&spec.mix)
+        .iter()
+        .filter_map(|(role, _)| crate::catalog::human_role(role))
+        .map(|r| r.height_m)
+        .fold(0.0f32, f32::max)
+        .max(1.74);
+    // Half a body of slack each way: a person is not a point.
+    let half = [
+        (hi[0] - lo[0]) * 0.5 + 0.4,
+        height * 0.5,
+        (hi[1] - lo[1]) * 0.5 + 0.4,
+    ];
+    let offset = [(lo[0] + hi[0]) * 0.5, height * 0.5, (lo[1] + hi[1]) * 0.5];
+    crate::stage::Footprint::new(half, offset)
+}

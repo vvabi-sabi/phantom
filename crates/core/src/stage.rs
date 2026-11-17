@@ -167,6 +167,18 @@ impl Stage {
         }
         Ok(())
     }
+
+    /// Is there a place on the stage for a box this size at all, turned as
+    /// `rotation`? [`Stage::fits`] answers about one position; this answers about
+    /// the box itself. [`Stage::clamp`] centers what cannot fit and lets the
+    /// overflow spill symmetrically, which is the right answer for a single prop
+    /// and the wrong one for a group: its members would be clamped apart from
+    /// each other, one by one, and the group would stop being a group. A caller
+    /// that owns a group asks this first and refuses instead of folding it.
+    pub fn room_for(&self, footprint: Footprint, rotation: Quat) -> bool {
+        let half = footprint.world_half(rotation);
+        half.x * 2.0 <= self.size.width + 1e-4 && half.z * 2.0 <= self.size.depth + 1e-4
+    }
 }
 
 /// Bounding box of an entity in its own local frame, meters, relative to the
