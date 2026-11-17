@@ -895,7 +895,7 @@ fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "crowd": value["crowd"], "count": value["count"], "seed": value["seed"],
-                    "clamped": value["clamped"],
+                    "clamped": value["clamped"], "shifted": value["shifted"],
                 }))?
             );
         }

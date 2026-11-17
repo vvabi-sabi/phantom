@@ -1714,7 +1714,7 @@ impl Session {
                 // which is what each phantom's own key does — drags everyone who
                 // sticks past the border onto the border, and a queue in a
                 // narrow room becomes a pile at the wall.
-                let (pos, crowd_clamp) = {
+                let (pos, crowd_shift) = {
                     let stage = self
                         .project
                         .as_ref()
@@ -1734,14 +1734,12 @@ impl Session {
                 value["crowd"] = json!(ids);
                 value["count"] = json!(ids.len());
                 value["seed"] = json!(seed);
-                // The batch reports the per-key clamps (there are none, since the
-                // whole body was moved inside first); the crowd's own shift is
-                // reported in addition, because it is the correction the director
-                // actually made.
-                let mut clamps = value.get("clamped").and_then(|c| c.as_array()).cloned().unwrap_or_default();
-                if let Some(shift) = crowd_clamp {
-                    clamps.insert(0, serde_json::to_value(shift).unwrap_or(Value::Null));
-                    value["clamped"] = json!(clamps);
+                // The move of the formation is its own field, not an entry in
+                // `clamped`: that array means "keys the stage moved", and every
+                // entry names a phantom id. The crowd has no phantom of its own —
+                // reporting one with id 0 would name a person who does not exist.
+                if let Some(shift) = crowd_shift {
+                    value["shifted"] = json!({ "from": shift.0, "to": shift.1 });
                 }
                 Ok(value)
             }
@@ -3384,7 +3382,7 @@ fn fit_crowd_on_stage(
     spec: &phantom_core::CrowdSpec,
     pos: Option<[f32; 3]>,
     yaw: f32,
-) -> Result<(Option<[f32; 3]>, Option<phantom_core::Clamp>), CoreError> {
+) -> Result<(Option<[f32; 3]>, Option<([f32; 3], [f32; 3])>), CoreError> {
     let rot = glam::Quat::from_rotation_y(yaw);
     let footprint = phantom_core::crowd_footprint(spec);
     let wanted = glam::Vec3::from(pos.unwrap_or([0.0, 0.0, 0.0]));
@@ -3409,22 +3407,11 @@ fn fit_crowd_on_stage(
         )));
     }
     let (placed, moved) = stage.clamp(wanted, footprint, rot);
-    if moved {
-        Ok((
-            Some(placed.to_array()),
-            Some(phantom_core::Clamp {
-                kind: phantom_core::ClampKind::Phantom,
-                // The shift belongs to the crowd as a whole, not to one person;
-                // id 0 and frame 0 say "the formation itself".
-                id: 0,
-                frame: 0,
-                from: wanted.to_array(),
-                to: placed.to_array(),
-            }),
-        ))
+    Ok(if moved {
+        (Some(placed.to_array()), Some((wanted.to_array(), placed.to_array())))
     } else {
-        Ok((pos, None))
-    }
+        (pos, None)
+    })
 }
 
 /// How a crowd is said out loud, for errors.
@@ -3677,8 +3664,12 @@ mod look_and_grid_tests {
         let stride: Vec<f32> = z.windows(2).map(|w| w[1] - w[0]).collect();
         let (big, small) = stride.iter().copied().fold((0.0f32, f32::MAX), |(hi, lo), v| (hi.max(v), lo.min(v)));
         assert!(big - small < 1e-4, "the queue kept no stride: {stride:?}");
-        // And the director is told the formation moved.
-        assert!(out["clamped"].as_array().is_some_and(|c| !c.is_empty()), "the shift must be reported");
+        // And the director is told the formation moved: the crowd's own field,
+        // because `clamped` names per-key moves by phantom id and no phantom is
+        // the formation.
+        let shift = &out["shifted"];
+        assert_eq!(shift["from"], json!([0.0, 0.0, -4.0]), "the shift must be reported: {out}");
+        assert!(shift["to"][2].as_f64().unwrap() > 0.0, "the formation was pulled onto the floor: {shift}");
     }
 
     #[test]
