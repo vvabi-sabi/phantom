@@ -33,7 +33,7 @@ fn project_with_object(dir: &std::path::Path) -> (Project, SceneId, ObjectId) {
         .scene
         .unwrap();
     let asset = history
-        .apply(&mut project, phantom_core::Command::RegisterAsset { kind: AssetKind::ModelObj, path: "assets/quad/quad.obj".into() })
+        .apply(&mut project, phantom_core::Command::RegisterAsset { kind: AssetKind::ModelObj, path: "assets/quad/quad.obj".into(), bounds: None })
         .unwrap()
         .asset
         .unwrap();
@@ -72,11 +72,11 @@ fn forge_spawns_static_object_and_apply_moves_root() {
     assert!(world.get::<bevy::mesh::skinning::SkinnedMesh>(children[0]).is_none());
 
     // Frame 12 is midway between the keys: the root is halfway.
-    apply_scene_frame(&mut world, &scene, &forge, 12, false, None, false, None);
+    apply_scene_frame(&mut world, &Project::new("t"), &scene, &forge, 12, false, None);
     let t = world.get::<Transform>(root).unwrap();
     assert!((t.translation.x - 1.2).abs() < 1e-4, "x={}", t.translation.x);
     // Hold after the last key.
-    apply_scene_frame(&mut world, &scene, &forge, 47, false, None, false, None);
+    apply_scene_frame(&mut world, &Project::new("t"), &scene, &forge, 47, false, None);
     let t = world.get::<Transform>(root).unwrap();
     assert!((t.translation.x - 2.4).abs() < 1e-4, "x={}", t.translation.x);
 

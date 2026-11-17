@@ -57,6 +57,56 @@ impl Project {
         self.next_id += 1;
         T::from(id)
     }
+
+    /// Local bounding box of a Phantom for the stage clamp: the builtin actor's
+    /// box for its current action, the asset's recorded bounds for an imported
+    /// model (a point when the model has none), under the actor scale.
+    pub fn phantom_footprint(&self, phantom: &Phantom, pose: ActorPose) -> crate::stage::Footprint {
+        self.phantom_footprint_at(phantom, pose, phantom.scale)
+    }
+
+    /// The same box under an explicit scale — a scale change has to check the
+    /// actor's new size before the new scale reaches the document.
+    pub fn phantom_footprint_at(&self, phantom: &Phantom, pose: ActorPose, scale: f32) -> crate::stage::Footprint {
+        let base = match phantom.rig.builtin_actor() {
+            Some(actor) => actor.footprint(pose),
+            None => match &phantom.rig {
+                RigRef::Imported { asset } => self
+                    .assets
+                    .get(asset)
+                    .and_then(|a| a.bounds)
+                    .map(|b| b.footprint())
+                    .unwrap_or_else(crate::stage::Footprint::point),
+                _ => crate::stage::Footprint::point(),
+            },
+        };
+        base.scaled(Vec3::splat(scale))
+    }
+
+    /// Local bounding box of a scene object for the stage clamp: the metric
+    /// catalog entry for a builtin prop, the asset's recorded bounds otherwise,
+    /// under the key's scale.
+    pub fn object_footprint(&self, object: &SceneObject, scale: Vec3) -> crate::stage::Footprint {
+        if let Some(field) = &object.scatter {
+            // The plate, not the tallest tree: the field's own box is what has
+            // to stay inside the stage.
+            let preset = crate::scatter::scatter_preset(&field.preset);
+            let base = preset
+                .map(|p| crate::scatter::field_footprint(p, &field.shape))
+                .unwrap_or_else(crate::stage::Footprint::point);
+            return base.scaled(scale);
+        }
+        let base = match object.builtin.as_deref().and_then(crate::catalog::catalog_find) {
+            Some(entry) => entry.footprint(),
+            None => self
+                .assets
+                .get(&object.asset)
+                .and_then(|a| a.bounds)
+                .map(|b| b.footprint())
+                .unwrap_or_else(crate::stage::Footprint::point),
+        };
+        base.scaled(scale)
+    }
 }
 
 impl From<u64> for SceneId {
@@ -79,12 +129,7 @@ impl From<u64> for ObjectId {
         Self(v)
     }
 }
-impl From<u64> for ShotId {
-    fn from(v: u64) -> Self {
-        Self(v)
-    }
-}
-impl From<u64> for ClipUseId {
+impl From<u64> for CameraId {
     fn from(v: u64) -> Self {
         Self(v)
     }
@@ -106,6 +151,11 @@ pub struct Asset {
     pub kind: AssetKind,
     /// Path relative to the project root.
     pub path: PathBuf,
+    /// Bounding box of an imported model in the model's own frame, computed
+    /// once at import (layout mode). `None` — unknown (old manifests, assets
+    /// that are not models); such an entity is clamped by its origin point.
+    #[serde(default)]
+    pub bounds: Option<crate::stage::ModelBounds>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -114,7 +164,8 @@ pub enum AssetKind {
     ModelObj,
     /// FBX character with skeleton and weights.
     ModelFbx,
-    /// Standalone FBX motion clip (Mixamo).
+    /// Legacy standalone FBX motion clip. The layout program no longer imports
+    /// or plays clips; the variant stays so an old manifest still deserializes.
     MotionFbx,
     /// Image (background, texture).
     Image,
@@ -130,7 +181,10 @@ pub struct Scene {
     pub name: String,
     pub range: FrameRange,
     pub background: Option<Background>,
-    pub camera: Camera,
+    /// Legacy single camera (the pre-camera-entity document). Read for the
+    /// migration into `cameras[SCENE_CAMERA]` and never written.
+    #[serde(default, rename = "camera", skip_serializing)]
+    pub legacy_camera: Option<Camera>,
     pub phantoms: BTreeMap<PhantomId, Phantom>,
     /// Raster 2D layers on top of the frame (order = stacking order).
     #[serde(default)]
@@ -151,11 +205,16 @@ pub struct Scene {
     /// Old manifests without the field load empty.
     #[serde(default)]
     pub objects: BTreeMap<ObjectId, SceneObject>,
-    /// Named shots: their own camera and range inside a scene, sharing the
-    /// scene's Phantoms, objects and background. An empty map is the legacy
-    /// path: a single `scene.camera` over the whole scene range.
-    #[serde(default)]
-    pub shots: BTreeMap<ShotId, Shot>,
+    /// The scene's cameras. `SCENE_CAMERA` (id 0) is always present — it is
+    /// where a legacy manifest's single camera lands; every other entry is a
+    /// named camera with its own range. Replaces the old `shots` map, which is
+    /// read as cameras with the same ids.
+    #[serde(default, alias = "shots")]
+    pub cameras: BTreeMap<CameraId, SceneCamera>,
+    /// The camera the viewport shows and a render without a camera uses.
+    /// Living in the document keeps a headless render reproducible.
+    #[serde(default = "default_active_camera")]
+    pub active_camera: CameraId,
     /// Document light sources with keys (corrective B1): point/spot/
     /// directional, living in the project and the undo history. Old manifests
     /// load empty.
@@ -176,31 +235,159 @@ pub struct Scene {
     /// Exponential fog (B3); None — no fog.
     #[serde(default)]
     pub fog: Option<SceneFog>,
+    /// Stage bounds (layout mode): actors and props live inside this box and
+    /// every placement command clamps to it. Old manifests without the field
+    /// get the medium preset.
+    #[serde(default)]
+    pub stage: crate::stage::Stage,
     /// Scene effects (particles/water) with keys (B3).
     #[serde(default)]
     pub vfx: Vec<SceneVfx>,
 }
 
-/// Named shot: a camera and a frame range inside a scene; performance,
-/// objects and background are shared with the scene.
+/// The scene's own camera: every scene has it, it is where a legacy manifest's
+/// single camera lands, and it is the default active camera.
+///
+/// Kept public as the serde default of `Scene::active_camera`.
+pub const SCENE_CAMERA: CameraId = CameraId(0);
+
+/// A camera of the scene: its own keys and lens, the range it is used for, and
+/// an optional attachment to a moving subject. Actors, props and the background
+/// are shared with the scene.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Shot {
-    pub id: ShotId,
+pub struct SceneCamera {
+    pub id: CameraId,
     pub name: String,
     /// Frame range [start, end) within the scene's range.
     pub range: FrameRange,
     pub camera: Camera,
+    /// Attachment to a subject; `None` — a free camera that follows only its keys.
+    #[serde(default)]
+    pub target: Option<CameraTarget>,
+}
+
+/// What a camera is pointed at or attached to.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CameraTarget {
+    pub mode: CameraTargetMode,
+    pub subject: CameraSubject,
+}
+
+impl CameraTarget {
+    pub fn new(mode: CameraTargetMode, subject: CameraSubject) -> Self {
+        Self { mode, subject }
+    }
+}
+
+/// How a camera follows its subject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CameraTargetMode {
+    /// Слежение: the camera stands where its keys put it and only turns to keep
+    /// the subject in view — it does not travel with the subject.
+    Track,
+    /// Следование: the camera is attached to the subject. Its keys are read in
+    /// the subject's frame (position, angles and aim point alike), so it travels
+    /// and turns with the subject — a third-person view.
+    Follow,
+}
+
+/// The moving thing a camera can be attached to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "id")]
+pub enum CameraSubject {
+    Phantom(PhantomId),
+    Object(ObjectId),
+}
+
+fn default_active_camera() -> CameraId {
+    SCENE_CAMERA
+}
+
+impl SceneCamera {
+    /// A camera over the whole scene, with the default rig.
+    pub fn new(id: CameraId, name: impl Into<String>, range: FrameRange) -> Self {
+        Self { id, name: name.into(), range, camera: Camera::default(), target: None }
+    }
 }
 
 impl Scene {
-    /// The shot's camera; `None` or an unknown shot — the legacy scene camera.
-    pub fn camera_for_shot(&self, shot: Option<ShotId>) -> &Camera {
-        shot.and_then(|id| self.shots.get(&id)).map(|s| &s.camera).unwrap_or(&self.camera)
+    /// A scene with its own camera (id 0) over the whole range.
+    pub fn new(id: SceneId, name: impl Into<String>, range: FrameRange) -> Self {
+        let mut cameras = BTreeMap::new();
+        cameras.insert(SCENE_CAMERA, SceneCamera::new(SCENE_CAMERA, "Camera", range));
+        Self {
+            id,
+            name: name.into(),
+            range,
+            background: None,
+            legacy_camera: None,
+            phantoms: BTreeMap::new(),
+            layers_2d: Vec::new(),
+            audio_tracks: Vec::new(),
+            lighting: SceneLighting::default(),
+            floor: None,
+            objects: BTreeMap::new(),
+            cameras,
+            active_camera: SCENE_CAMERA,
+            lights: Vec::new(),
+            ambient: AmbientMode::default(),
+            sky: None,
+            grade: None,
+            fog: None,
+            stage: crate::stage::Stage::default(),
+            vfx: Vec::new(),
+        }
     }
 
-    /// The shot's range; `None` or an unknown shot — the scene's range.
-    pub fn range_for_shot(&self, shot: Option<ShotId>) -> FrameRange {
-        shot.and_then(|id| self.shots.get(&id)).map(|s| s.range).unwrap_or(self.range)
+    /// A camera by id; `None` or an unknown id — the scene's own camera.
+    ///
+    /// A hand-written document that lost camera 0 still renders: the fallback
+    /// is a plain default camera rather than a panic (loading normalizes, and
+    /// `validate` reports the hole).
+    pub fn camera_for(&self, id: Option<CameraId>) -> &Camera {
+        id.and_then(|id| self.cameras.get(&id))
+            .or_else(|| self.cameras.get(&SCENE_CAMERA))
+            .map(|c| &c.camera)
+            .unwrap_or_else(|| {
+                static FALLBACK: std::sync::OnceLock<Camera> = std::sync::OnceLock::new();
+                FALLBACK.get_or_init(Camera::default)
+            })
+    }
+
+    /// The range of a camera; `None` or an unknown id — the scene's range.
+    pub fn range_for(&self, id: Option<CameraId>) -> FrameRange {
+        id.and_then(|id| self.cameras.get(&id)).map(|c| c.range).unwrap_or(self.range)
+    }
+
+    /// The document's active camera (falls back to camera 0 for a hand-made
+    /// scene that names one that does not exist).
+    pub fn active_camera(&self) -> &SceneCamera {
+        self.cameras
+            .get(&self.active_camera)
+            .or_else(|| self.cameras.get(&SCENE_CAMERA))
+            .unwrap_or_else(|| {
+                static FALLBACK: std::sync::OnceLock<SceneCamera> = std::sync::OnceLock::new();
+                FALLBACK.get_or_init(|| {
+                    SceneCamera::new(SCENE_CAMERA, "Camera", FrameRange { start: 0, end: 1 })
+                })
+            })
+    }
+
+    /// Bring a loaded document to the current shape: a legacy single `camera`
+    /// becomes camera 0 over the whole range, a scene without cameras gains
+    /// camera 0, and an active camera that does not exist falls back to it.
+    pub fn normalize_legacy(&mut self) {
+        let scene_range = self.range;
+        if let Some(camera) = self.legacy_camera.take() {
+            let entry = self.cameras.entry(SCENE_CAMERA).or_insert_with(|| SceneCamera::new(SCENE_CAMERA, "Camera", scene_range));
+            entry.camera = camera;
+            entry.range = scene_range;
+        }
+        self.cameras.entry(SCENE_CAMERA).or_insert_with(|| SceneCamera::new(SCENE_CAMERA, "Camera", scene_range));
+        if !self.cameras.contains_key(&self.active_camera) {
+            self.active_camera = SCENE_CAMERA;
+        }
     }
 }
 
@@ -228,6 +415,25 @@ pub struct SceneObject {
     /// Object material patches (B4).
     #[serde(default)]
     pub material_patches: Vec<MaterialPatch>,
+    /// Generated fill (a far band of forest and so on): the object's mesh is
+    /// built by replaying the scatter plan of `(preset, shape, seed)` — the
+    /// same pure function the generating command used to count and place the
+    /// editable props. The field carries the recipe, not baked geometry, so
+    /// the document stays small and the mesh stays reproducible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scatter: Option<ScatterField>,
+}
+
+/// A generated fill stored on its object: the recipe the renderer replays.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScatterField {
+    /// `scatter::ScatterPreset` name (forest, grove, hedge, ...).
+    pub preset: String,
+    /// Shape in the field's own frame; the object key places the field.
+    pub shape: crate::scatter::ScatterShape,
+    /// Determinism seed: the same (preset, shape, seed) always replays the
+    /// same instances — a saved project must render identically everywhere.
+    pub seed: u64,
 }
 
 /// Object transform key: position, Euler angles (yaw is primary; pitch/roll
@@ -780,22 +986,6 @@ impl BackgroundSource {
     }
 }
 
-/// Curved elliptical screen behind the characters.
-/// Orientation of the arc screen's bulge (corrective A3a).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Bulge {
-    /// The arc center is closer to the viewer and the edges fall back — a
-    /// stage-curtain screen (the render behavior before A3). Kept as an
-    /// opt-in for curtain shots.
-    TowardCamera,
-    /// The edges are closer and the screen wraps around the scene (the
-    /// corrective A3 default: the panorama does not read as an inside-out
-    /// backdrop, and the edges do not run away from the camera).
-    #[default]
-    AwayFromCamera,
-}
-
 /// Panorama UV mode on the screen (corrective A3c).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -811,24 +1001,85 @@ pub enum BackgroundFit {
     Stretch,
 }
 
+/// Flat screen behind the characters (layout mode).
+/// Old manifests carry a curved arc screen instead; it is read as the flat
+/// screen of the same horizontal length (`arc_radians × radius`), and the
+/// curve itself is gone from the program.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(try_from = "BackgroundInput")]
 pub struct Background {
     pub image: BackgroundSource,
-    /// Angular width of the screen arc in radians.
-    pub arc_radians: f32,
-    /// Arc radius in meters.
-    pub radius: f32,
+    /// Screen width in meters.
+    pub width: f32,
     /// Screen height in meters.
     pub height: f32,
-    /// Arc center in the scene.
+    /// Screen center in the scene; the screen faces the camera side (+Z).
     pub center: Vec3,
-    /// Orientation of the arc bulge; the serde default is `away_from_camera`
-    /// (corrective A3; deliberately changes how old scenes look).
-    #[serde(default)]
-    pub bulge: Bulge,
     /// Panorama UV mode; the serde default is `cover` (corrective A3).
     #[serde(default)]
     pub fit: BackgroundFit,
+}
+
+/// Wire form of [`Background`]: accepts the current fields and the legacy arc
+/// screen, so an old manifest loads without a migration step.
+#[derive(Deserialize)]
+struct BackgroundInput {
+    image: BackgroundSource,
+    #[serde(default)]
+    width: Option<f32>,
+    #[serde(default)]
+    height: Option<f32>,
+    #[serde(default)]
+    center: Option<Vec3>,
+    #[serde(default)]
+    fit: BackgroundFit,
+    /// Legacy curved screen: its angular width and radius.
+    #[serde(default)]
+    arc_radians: Option<f32>,
+    #[serde(default)]
+    radius: Option<f32>,
+    /// Legacy bulge direction, accepted and dropped.
+    #[serde(default, rename = "bulge")]
+    _bulge: Option<serde::de::IgnoredAny>,
+}
+
+impl TryFrom<BackgroundInput> for Background {
+    type Error = crate::error::CoreError;
+
+    fn try_from(input: BackgroundInput) -> Result<Self, Self::Error> {
+        let width = match (input.width, input.arc_radians, input.radius) {
+            (Some(width), _, _) => width,
+            // The flat screen takes the arc's horizontal length, so an old
+            // scene keeps roughly the same backdrop size.
+            (None, Some(arc), Some(radius)) => arc * radius,
+            _ => return Err(crate::error::CoreError::InvalidBackground("width (or a legacy arc_radians + radius)")),
+        };
+        let background = Self {
+            image: input.image,
+            width,
+            height: input.height.ok_or(crate::error::CoreError::InvalidBackground("height"))?,
+            center: input.center.ok_or(crate::error::CoreError::InvalidBackground("center"))?,
+            fit: input.fit,
+        };
+        background.validate()?;
+        Ok(background)
+    }
+}
+
+impl Background {
+    pub fn validate(&self) -> Result<(), crate::error::CoreError> {
+        use crate::error::CoreError::{InvalidBackground, NonFinite};
+        if !self.width.is_finite() || !self.height.is_finite() || !self.center.is_finite() {
+            return Err(NonFinite("background.width/height/center"));
+        }
+        if self.width <= 0.0 {
+            return Err(InvalidBackground("width must be positive"));
+        }
+        if self.height <= 0.0 {
+            return Err(InvalidBackground("height must be positive"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1030,51 +1281,14 @@ pub fn shortest_arc(from: f32, to: f32) -> f32 {
     d
 }
 
-/// Take identifier.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
-pub struct TakeId(pub u64);
-impl std::fmt::Display for TakeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-impl From<u64> for TakeId {
-    fn from(v: u64) -> Self {
-        Self(v)
-    }
-}
-
-/// A recorded performance take: its own track over a range.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Take {
-    pub id: TakeId,
-    pub name: String,
-    pub range: FrameRange,
-    pub motion: Vec<MotionKey>,
-}
-
 /// A controllable skeleton with an attached character model.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Phantom {
     pub id: PhantomId,
     pub name: String,
     pub rig: RigRef,
-    /// Controller keys: root position and action, sorted by frame.
+    /// Controller keys: root position, held pose and yaw, sorted by frame.
     pub motion: Vec<MotionKey>,
-    /// Motion clip for an imported rig (FBX asset).
-    /// Legacy path: one clip, the longest stack, looped over the whole scene.
-    /// Only in effect while `clip_track` is empty.
-    #[serde(default)]
-    pub clip: Option<AssetId>,
-    /// Ordered motion clip sequence (no overlaps;
-    /// validation lives in the commands). An empty list is the legacy `clip` behavior.
-    #[serde(default)]
-    pub clip_track: Vec<crate::clips::ClipUse>,
-    /// Recorded takes; the active one overrides the manual track within its range.
-    #[serde(default)]
-    pub takes: Vec<Take>,
-    #[serde(default)]
-    pub active_take: Option<TakeId>,
     /// Outline width in output pixels.
     pub outline_px: f32,
     /// Actor scale (B2); the serde default 1.0 covers old manifests without the field.
@@ -1120,18 +1334,18 @@ pub enum RigRef {
     Imported { asset: AssetId },
 }
 
+/// A static position of a builtin actor (layout mode). Actors are not
+/// animated: a key names one of these and the figure holds it.
+///
+/// The wire name is lowercase (`stand|sit|lie`) — the same string the CLI, the
+/// MCP tools and `builtin_catalog` use, so an agent never has to remember two
+/// spellings of the same pose.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub enum Action {
-    Idle,
-    Walk,
-    Jump,
+#[serde(rename_all = "snake_case")]
+pub enum ActorPose {
+    Stand,
     Sit,
     Lie,
-    Sneak,
-    Trot,
-    Gallop,
-    Fly,
-    Perch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -1140,10 +1354,19 @@ pub struct MotionKey {
     pub frame: Frame,
     /// Controller root position (the floor clamps y >= 0).
     pub position: Vec3,
-    pub action: Action,
+    /// Held pose of a builtin actor. An imported rig has no poses and renders
+    /// in bind pose; the field is ignored for it.
+    #[serde(default)]
+    pub pose: ActorPose,
     /// Root rotation about +Y in radians (forward +Z).
     #[serde(default)]
     pub yaw: f32,
+}
+
+impl Default for ActorPose {
+    fn default() -> Self {
+        Self::Stand
+    }
 }
 
 /// Stable procedural skeleton/animation profiles (meters, Y up, forward +Z).
@@ -1153,23 +1376,86 @@ pub enum BuiltinActor {
     Wolf,
     Horse,
     Bird,
+    /// A child — the same rig and poses as the humanoid, proportions from
+    /// [`crate::catalog::HumanRole`] ("child").
+    Child,
+    /// A teenager (the "teen" role).
+    Teen,
+    /// An elderly person (the "elder" role).
+    Elder,
 }
 
 impl BuiltinActor {
-    pub fn actions(self) -> &'static [Action] {
-        use Action::*;
+    /// Every bundled actor, in wire-name order.
+    pub const ALL: &'static [BuiltinActor] = &[
+        BuiltinActor::Humanoid,
+        BuiltinActor::Wolf,
+        BuiltinActor::Horse,
+        BuiltinActor::Bird,
+        BuiltinActor::Child,
+        BuiltinActor::Teen,
+        BuiltinActor::Elder,
+    ];
+
+    /// Poses this actor can hold. A horse cannot sit and a bird has no lying
+    /// pose — an unavailable pose is an error, not a silently approximated one.
+    pub fn poses(self) -> &'static [ActorPose] {
+        use ActorPose::*;
         match self {
-            Self::Humanoid => &[Idle, Walk, Jump],
-            Self::Wolf => &[Idle, Walk, Sit, Lie, Sneak],
-            Self::Horse => &[Idle, Trot, Gallop],
-            Self::Bird => &[Fly, Perch],
+            Self::Humanoid | Self::Child | Self::Teen | Self::Elder | Self::Wolf => &[Stand, Sit, Lie],
+            Self::Horse => &[Stand, Lie],
+            Self::Bird => &[Stand, Sit],
         }
     }
-    pub fn default_action(self) -> Action {
-        if self == Self::Bird {
-            Action::Perch
-        } else {
-            Action::Idle
+
+    /// The human proportion profile of a human actor; `None` for animals. The
+    /// role names are the single source of truth for human sizes (the stage
+    /// clamp and the drawn figure both come from them).
+    pub fn human_role(self) -> Option<&'static crate::catalog::HumanRole> {
+        let name = match self {
+            Self::Humanoid => "adult",
+            Self::Child => "child",
+            Self::Teen => "teen",
+            Self::Elder => "elder",
+            _ => return None,
+        };
+        crate::catalog::human_role(name)
+    }
+
+    pub fn default_pose(self) -> ActorPose {
+        ActorPose::Stand
+    }
+
+    /// Local bounding box for the stage clamp, origin at the feet. A pose
+    /// changes how much floor an actor takes: a lying figure is long and low,
+    /// a sitting one is deeper than it is wide.
+    pub fn footprint(self, pose: ActorPose) -> crate::stage::Footprint {
+        use crate::stage::Footprint;
+        // Human roles other than the adult reference: the adult numbers are
+        // scaled by the role's own leg/torso proportions (the adult branch
+        // below stays the exact reference it always was).
+        if self.human_role().is_some() && self != Self::Humanoid {
+            let p = crate::rig::human_proportions(self);
+            return match pose {
+                ActorPose::Sit => Footprint::standing(0.30 * p.torso, p.top - 0.50 * p.leg, 0.45 * p.torso),
+                ActorPose::Lie => Footprint::standing(0.35 * p.torso, 0.45 * p.torso, 0.95 * (p.top / 1.74)),
+                _ => Footprint::standing(0.30 * p.torso, p.top, 0.25 * p.torso),
+            };
+        }
+        match (self, pose) {
+            (Self::Humanoid, ActorPose::Sit) => Footprint::standing(0.30, 1.05, 0.45),
+            (Self::Humanoid, ActorPose::Lie) => Footprint::standing(0.35, 0.45, 0.95),
+            (Self::Humanoid, ActorPose::Stand) => Footprint::standing(0.30, 1.74, 0.25),
+            (Self::Wolf, ActorPose::Sit) => Footprint::standing(0.20, 0.45, 0.40),
+            (Self::Wolf, ActorPose::Lie) => Footprint::standing(0.20, 0.25, 0.55),
+            (Self::Wolf, ActorPose::Stand) => Footprint::standing(0.20, 0.57, 0.55),
+            (Self::Horse, ActorPose::Lie) => Footprint::standing(0.35, 0.70, 0.95),
+            (Self::Horse, ActorPose::Stand) => Footprint::standing(0.35, 1.62, 0.95),
+            (Self::Bird, ActorPose::Sit) => Footprint::standing(0.20, 0.48, 0.25),
+            (Self::Bird, ActorPose::Stand) => Footprint::standing(0.25, 0.35, 0.25),
+            // A pose an actor does not have never reaches the document
+            // (`validate_pose` rejects it); this arm keeps the clamp total.
+            (actor, _) => actor.footprint(actor.default_pose()),
         }
     }
 }
@@ -1181,10 +1467,12 @@ impl RigRef {
             Self::Imported { .. } => None,
         }
     }
-    pub fn validate_action(&self, action: Action) -> Result<(), crate::error::CoreError> {
+    /// An imported rig has no poses (it renders in bind pose), so any pose is
+    /// accepted for it; a builtin actor accepts only its own.
+    pub fn validate_pose(&self, pose: ActorPose) -> Result<(), crate::error::CoreError> {
         if let Some(actor) = self.builtin_actor() {
-            if !actor.actions().contains(&action) {
-                return Err(crate::error::CoreError::UnsupportedAction { actor, action });
+            if !actor.poses().contains(&pose) {
+                return Err(crate::error::CoreError::UnsupportedPose { actor, pose });
             }
         }
         Ok(())
@@ -1207,7 +1495,12 @@ impl MotionKey {
 struct MotionKeyInput {
     frame: Frame,
     position: Vec3,
-    action: Action,
+    /// A pre-layout manifest carries `action` here; it is accepted and dropped
+    /// (the key falls back to the default pose).
+    #[serde(default)]
+    pose: ActorPose,
+    #[serde(default)]
+    _action: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     yaw: f32,
 }
@@ -1215,7 +1508,7 @@ struct MotionKeyInput {
 impl TryFrom<MotionKeyInput> for MotionKey {
     type Error = crate::error::CoreError;
     fn try_from(k: MotionKeyInput) -> Result<Self, Self::Error> {
-        let key = Self { frame: k.frame, position: k.position, action: k.action, yaw: k.yaw };
+        let key = Self { frame: k.frame, position: k.position, pose: k.pose, yaw: k.yaw };
         key.validate()?;
         Ok(key)
     }
@@ -1241,20 +1534,46 @@ mod background_a3_tests {
     use super::*;
 
     #[test]
-    fn legacy_background_reads_with_new_defaults() {
-        // A manifest from before A3: without bulge/fit — the new corrective A3 defaults.
+    fn a_legacy_arc_screen_reads_as_a_flat_one() {
+        // A curved-screen manifest: the flat screen takes the arc's horizontal
+        // length (2.0 rad x 6.0 m = 12 m); the bulge direction is dropped.
         let bg: Background = serde_json::from_str(
             r#"{"image":1,"arc_radians":2.0,"radius":6.0,"height":4.0,"center":[0.0,2.0,-5.0]}"#,
         )
         .unwrap();
-        assert_eq!(bg.bulge, Bulge::AwayFromCamera);
-        assert_eq!(bg.fit, BackgroundFit::Cover);
+        assert_eq!(bg.width, 12.0);
+        assert_eq!(bg.height, 4.0);
+        assert_eq!(bg.center, Vec3::new(0.0, 2.0, -5.0));
+        assert_eq!(bg.fit, BackgroundFit::Cover, "the uv mode survives");
         let explicit: Background = serde_json::from_str(
             r#"{"image":1,"arc_radians":2.0,"radius":6.0,"height":4.0,"center":[0.0,2.0,-5.0],"bulge":"toward_camera","fit":"stretch"}"#,
         )
         .unwrap();
-        assert_eq!(explicit.bulge, Bulge::TowardCamera);
         assert_eq!(explicit.fit, BackgroundFit::Stretch);
+        assert_eq!(explicit.width, 12.0);
+    }
+
+    #[test]
+    fn a_flat_screen_roundtrips_and_bad_geometry_is_rejected() {
+        let bg = Background { image: BackgroundSource::Image(AssetId(1)), width: 16.0, height: 8.0, center: Vec3::new(0.0, 2.0, -5.0), fit: BackgroundFit::Contain };
+        let json = serde_json::to_string(&bg).unwrap();
+        assert!(!json.contains("arc_radians"), "the new form is written: {json}");
+        let back: Background = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.width, 16.0);
+        assert_eq!(back.fit, BackgroundFit::Contain);
+        // Width/height must be positive and finite, and the center finite.
+        for bad in [
+            r#"{"image":1,"width":0.0,"height":4.0,"center":[0,0,0]}"#,
+            r#"{"image":1,"width":-2.0,"height":4.0,"center":[0,0,0]}"#,
+            r#"{"image":1,"width":4.0,"height":0.0,"center":[0,0,0]}"#,
+            r#"{"image":1,"width":4.0,"height":4.0,"center":[0,0,"NaN"]}"#,
+        ] {
+            assert!(serde_json::from_str::<Background>(bad).is_err(), "accepted invalid screen geometry: {bad}");
+        }
+        // No width and no legacy arc either: nothing to build a screen from.
+        assert!(serde_json::from_str::<Background>(r#"{"image":1,"height":4.0,"center":[0,0,0]}"#).is_err());
+        assert!(serde_json::from_str::<Background>(r#"{"image":1,"width":4.0,"center":[0,0,0]}"#).is_err());
+        assert!(serde_json::from_str::<Background>(r#"{"image":1,"width":4.0,"height":4.0}"#).is_err());
     }
 }
 

@@ -7,8 +7,9 @@
 //! on `y = 0`), dimensions come from the catalog table, interior sides are
 //! named `north/south/east/west` and are cut away per `open_sides`.
 
-use glam::Vec3;
+use glam::{Quat, Vec3};
 use phantom_core::catalog::{catalog_find, CatalogEntry, CatalogKind};
+use phantom_core::{plan, scatter_preset, ScatterField, MAX_SCATTER_INSTANCES};
 
 use crate::import::{MaterialRecord, MeshData, ModelData, PartData};
 
@@ -310,7 +311,10 @@ pub fn prop_model(name: &str) -> Option<ModelData> {
     Some(match entry.kind {
         CatalogKind::Primitive => primitive(entry),
         CatalogKind::Furniture => furniture(entry),
+        CatalogKind::Animal => animal(entry),
+        CatalogKind::Street => street_item(entry),
         CatalogKind::Interior => interior(entry),
+        CatalogKind::Exterior => exterior(entry),
     })
 }
 
@@ -421,8 +425,281 @@ fn furniture(entry: &CatalogEntry) -> ModelData {
             b.group("shade");
             b.add_cone(Vec3::new(0.0, s.y - 0.25, 0.0), s.x * 0.5, 0.25, 16);
         }
+        "door" => {
+            // Frame: two jambs and a lintel around a recessed panel.
+            b.group("frame");
+            let jamb = 0.06;
+            for x in [s.x * 0.5 - jamb * 0.5, -(s.x * 0.5 - jamb * 0.5)] {
+                b.add_upright(Vec3::new(x, 0.0, 0.0), Vec3::new(jamb, s.y, s.z));
+            }
+            b.add_upright(Vec3::new(0.0, s.y - jamb, 0.0), Vec3::new(s.x - 2.0 * jamb, jamb, s.z));
+            b.group("panel");
+            b.add_upright(Vec3::ZERO, Vec3::new(s.x - 2.0 * jamb, s.y - jamb, s.z * 0.5));
+        }
+        "window" => {
+            // Outer frame, cross mullion and a recessed glass pane.
+            b.group("frame");
+            let w = 0.06;
+            b.add_upright(Vec3::ZERO, Vec3::new(s.x, w, s.z));
+            b.add_upright(Vec3::new(0.0, s.y - w, 0.0), Vec3::new(s.x, w, s.z));
+            for x in [s.x * 0.5 - w * 0.5, -(s.x * 0.5 - w * 0.5)] {
+                b.add_upright(Vec3::new(x, w, 0.0), Vec3::new(w, s.y - 2.0 * w, s.z));
+            }
+            b.add_upright(Vec3::new(0.0, w, 0.0), Vec3::new(0.04, s.y - 2.0 * w, s.z * 0.7));
+            b.add_upright(Vec3::new(0.0, s.y * 0.5 - 0.02, 0.0), Vec3::new(s.x - 2.0 * w, 0.04, s.z * 0.7));
+            b.group("glass");
+            b.add_box(Vec3::new(0.0, s.y * 0.5, 0.0), Vec3::new(s.x * 0.5 - w, s.y * 0.5 - w, 0.01));
+        }
+        "stairs" => {
+            // Straight flight: 10 steps rising 0.17 and going 0.28 along +Z.
+            b.group("steps");
+            let (rise, going) = (s.y / 10.0, s.z / 10.0);
+            for i in 0..10 {
+                let z = -s.z * 0.5 + going * i as f32;
+                b.add_upright(Vec3::new(0.0, 0.0, z), Vec3::new(s.x, rise * (i + 1) as f32, going));
+            }
+        }
+        "carpet" => {
+            b.group("pile");
+            b.add_upright(Vec3::ZERO, s);
+        }
+        "picture" => {
+            b.group("frame");
+            b.add_upright(Vec3::ZERO, s);
+            b.group("canvas");
+            // Slightly recessed canvas on the +Z (front) face.
+            b.add_box(Vec3::new(0.0, s.y * 0.5, s.z * 0.5 - 0.004), Vec3::new(s.x * 0.5 - 0.04, s.y * 0.5 - 0.04, 0.004));
+        }
+        "mirror" => {
+            b.group("frame");
+            b.add_upright(Vec3::ZERO, s);
+            b.group("glass");
+            b.add_box(Vec3::new(0.0, s.y * 0.5, s.z * 0.5 - 0.003), Vec3::new(s.x * 0.5 - 0.04, s.y * 0.5 - 0.04, 0.003));
+        }
+        "bin" => {
+            b.group("body");
+            b.add_cylinder(Vec3::ZERO, s.x * 0.5, s.y, s.x * 0.5 - 0.02, 16);
+        }
+        "plant" => {
+            b.group("pot");
+            b.add_cylinder(Vec3::ZERO, 0.125, 0.25, 0.0, 14);
+            b.group("leaves");
+            b.add_sphere(Vec3::new(0.03, 0.54, 0.0), 0.17, 10, 6);
+            b.add_sphere(Vec3::new(-0.03, 0.49, 0.04), 0.17, 10, 6);
+        }
+        "cardboard" => {
+            b.group("box");
+            b.add_upright(Vec3::ZERO, s);
+            b.group("tape");
+            // A thin tape strip across the top.
+            b.add_box(Vec3::new(0.0, s.y - 0.001, 0.0), Vec3::new(0.03, 0.002, s.z * 0.5));
+        }
+        "crate" => {
+            b.group("body");
+            b.add_upright(Vec3::ZERO, s);
+            b.group("slats");
+            // Two thin slats on each of the two opposite ±X sides.
+            for x in [s.x * 0.5 - 0.002, -(s.x * 0.5 - 0.002)] {
+                for y in [s.y * 0.3, s.y * 0.7] {
+                    b.add_box(Vec3::new(x, y, 0.0), Vec3::new(0.006, 0.03, s.z * 0.46));
+                }
+            }
+        }
+        "barrel" => {
+            b.group("body");
+            b.add_cylinder(Vec3::ZERO, s.x * 0.5, s.y, 0.0, 18);
+            b.group("hoops");
+            // Hoop bands: short hollow cylinders slightly wider than the body.
+            for y in [s.y * 0.22, s.y * 0.78] {
+                b.add_cylinder(Vec3::new(0.0, y - 0.02, 0.0), s.x * 0.5 + 0.008, 0.04, s.x * 0.5 - 0.01, 18);
+            }
+        }
         _ => b.add_upright(Vec3::ZERO, s),
     }
+    b.finish(entry)
+}
+
+
+// --- animals ----------------------------------------------------------------
+
+/// Pose variant of an animal figure (the base name stands; the variants exist
+/// where they read in frame).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnimalVariant {
+    Stand,
+    Sit,
+    Lie,
+}
+
+/// Proportions of a quadruped figure, in meters. Boxes are axis-aligned, so
+/// the silhouette is built from a few well-placed parts: body, head with ears
+/// and a snout, four legs, a tail.
+struct Quadruped {
+    /// Body box: half width, height, half length.
+    body: Vec3,
+    /// Leg height (the body rides on it) and thickness.
+    leg_h: f32,
+    leg_t: f32,
+    /// Head box half size; sits at the front top of the body.
+    head: f32,
+    /// Snout length (0 — a flat face, like a cat).
+    snout: f32,
+    /// Ear size and shape: (half size, tall) — tall ears stand up (hare),
+    /// short ones are round (bear) or horns (goat/deer use antlers instead).
+    ear: (f32, f32),
+    /// Antlers: each side is a small vertical fork above the head.
+    antlers: bool,
+    /// Tail: length and thickness; hangs down from the rear (0 — no tail).
+    tail: (f32, f32),
+}
+
+fn quadruped(entry: &CatalogEntry) -> Option<(Quadruped, AnimalVariant)> {
+    let (base, variant) = if let Some(base) = entry.name.strip_suffix("_sitting") {
+        (base, AnimalVariant::Sit)
+    } else if let Some(base) = entry.name.strip_suffix("_lying") {
+        (base, AnimalVariant::Lie)
+    } else {
+        (entry.name, AnimalVariant::Stand)
+    };
+    let q = match base {
+        "cat" => Quadruped { body: Vec3::new(0.07, 0.12, 0.20), leg_h: 0.10, leg_t: 0.035, head: 0.07, snout: 0.0, ear: (0.02, 0.05), antlers: false, tail: (0.20, 0.02) },
+        "dog_big" => Quadruped { body: Vec3::new(0.12, 0.24, 0.38), leg_h: 0.28, leg_t: 0.07, head: 0.11, snout: 0.10, ear: (0.03, 0.07), antlers: false, tail: (0.25, 0.04) },
+        "dog_small" => Quadruped { body: Vec3::new(0.07, 0.13, 0.20), leg_h: 0.13, leg_t: 0.04, head: 0.07, snout: 0.05, ear: (0.025, 0.05), antlers: false, tail: (0.12, 0.025) },
+        "cow" => Quadruped { body: Vec3::new(0.24, 0.70, 0.85), leg_h: 0.75, leg_t: 0.12, head: 0.16, snout: 0.12, ear: (0.06, 0.05), antlers: false, tail: (0.55, 0.04) },
+        "pig" => Quadruped { body: Vec3::new(0.17, 0.35, 0.55), leg_h: 0.35, leg_t: 0.09, head: 0.13, snout: 0.07, ear: (0.04, 0.05), antlers: false, tail: (0.10, 0.02) },
+        "sheep" => Quadruped { body: Vec3::new(0.15, 0.32, 0.42), leg_h: 0.35, leg_t: 0.07, head: 0.09, snout: 0.06, ear: (0.04, 0.03), antlers: false, tail: (0.06, 0.03) },
+        "goat" => Quadruped { body: Vec3::new(0.14, 0.28, 0.38), leg_h: 0.32, leg_t: 0.06, head: 0.09, snout: 0.07, ear: (0.035, 0.03), antlers: true, tail: (0.08, 0.025) },
+        "fox" => Quadruped { body: Vec3::new(0.08, 0.13, 0.26), leg_h: 0.14, leg_t: 0.04, head: 0.07, snout: 0.07, ear: (0.025, 0.06), antlers: false, tail: (0.22, 0.045) },
+        "hare" => Quadruped { body: Vec3::new(0.06, 0.10, 0.16), leg_h: 0.09, leg_t: 0.03, head: 0.055, snout: 0.0, ear: (0.02, 0.10), antlers: false, tail: (0.04, 0.025) },
+        "deer" => Quadruped { body: Vec3::new(0.17, 0.50, 0.60), leg_h: 0.85, leg_t: 0.07, head: 0.11, snout: 0.09, ear: (0.04, 0.06), antlers: true, tail: (0.08, 0.03) },
+        "bear" => Quadruped { body: Vec3::new(0.26, 0.38, 0.70), leg_h: 0.32, leg_t: 0.14, head: 0.14, snout: 0.07, ear: (0.05, 0.04), antlers: false, tail: (0.0, 0.0) },
+        "mouse" => Quadruped { body: Vec3::new(0.02, 0.025, 0.035), leg_h: 0.015, leg_t: 0.008, head: 0.015, snout: 0.008, ear: (0.008, 0.008), antlers: false, tail: (0.05, 0.004) },
+        _ => return None,
+    };
+    Some((q, variant))
+}
+
+/// The quadruped figure. Lying: the body rests on the ground with the legs
+/// folded under it (short stubs stay visible at the sides) and the head held
+/// forward and low. Sitting (cat/dog): the front legs stay vertical, the rump
+/// drops to the ground and the chest rises — two boxes for the body.
+fn draw_quadruped(b: &mut PropBuilder, q: &Quadruped, variant: AnimalVariant, materials: &[&str]) {
+    let has_tail = materials.contains(&"tail");
+    let has_legs = materials.contains(&"legs");
+    b.group("body");
+    let (body_center_y, body_len) = match variant {
+        AnimalVariant::Lie => (q.body.y * 0.5 + 0.02, q.body.z),
+        AnimalVariant::Sit => (q.leg_h * 0.5 + q.body.y * 0.5, q.body.z * 0.6),
+        AnimalVariant::Stand => (q.leg_h + q.body.y * 0.5, q.body.z),
+    };
+    b.add_box(Vec3::new(0.0, body_center_y, 0.0), Vec3::new(q.body.x, q.body.y * 0.5, body_len));
+    if variant == AnimalVariant::Sit {
+        // Chest rises, rump sits: a second, higher front box.
+        b.add_box(
+            Vec3::new(0.0, q.leg_h + q.body.y * 0.45, body_len * 0.55),
+            Vec3::new(q.body.x * 0.85, q.body.y * 0.45, q.body.z * 0.45),
+        );
+    }
+    if has_legs {
+        b.group("legs");
+        let leg = |b: &mut PropBuilder, x: f32, z: f32, h: f32| {
+            b.add_box(Vec3::new(x, h * 0.5, z), Vec3::new(q.leg_t, h * 0.5, q.leg_t));
+        };
+        let (fx, fz) = (q.body.x - q.leg_t * 0.5, body_len - q.leg_t);
+        match variant {
+            AnimalVariant::Stand => {
+                for (x, z) in [(fx, fz), (-fx, fz), (fx, -fz), (-fx, -fz)] {
+                    leg(b, x, z, q.leg_h);
+                }
+            }
+            AnimalVariant::Sit => {
+                // Front legs vertical, hind legs folded under the rump.
+                for x in [fx, -fx] {
+                    leg(b, x, body_len + q.leg_t, q.leg_h);
+                    b.add_box(Vec3::new(x, q.leg_t, -body_len * 0.4), Vec3::new(q.leg_t, q.leg_t, body_len * 0.8));
+                }
+            }
+            AnimalVariant::Lie => {
+                // Folded: thin stubs along the belly.
+                for x in [fx, -fx] {
+                    b.add_box(Vec3::new(x, q.leg_t, 0.0), Vec3::new(q.leg_t, q.leg_t, body_len));
+                }
+            }
+        }
+    }
+    b.group("head");
+    let head_y = match variant {
+        AnimalVariant::Stand => body_center_y + q.body.y * 0.5 + q.head * 0.55,
+        AnimalVariant::Sit => q.leg_h + q.body.y * 0.9 + q.head * 0.8,
+        AnimalVariant::Lie => body_center_y + q.body.y * 0.3,
+    };
+    let head_z = body_len + q.head * 0.8;
+    b.add_box(Vec3::new(0.0, head_y, head_z), Vec3::splat(q.head));
+    if q.snout > 0.0 {
+        b.add_box(
+            Vec3::new(0.0, head_y - q.head * 0.35, head_z + q.head + q.snout * 0.5),
+            Vec3::new(q.head * 0.45, q.head * 0.35, q.snout * 0.5),
+        );
+    }
+    // Ears (or antlers for goat/deer) on top of the head.
+    let ear_top = head_y + q.head + q.ear.1 * 0.5;
+    for x in [q.head * 0.55, -q.head * 0.55] {
+        if q.antlers {
+            // A small fork: vertical stem + side branch.
+            b.add_box(Vec3::new(x, ear_top, head_z), Vec3::new(q.ear.0, q.ear.1 * 0.5, q.ear.0));
+            b.add_box(Vec3::new(x * 1.5, ear_top + q.ear.1 * 0.4, head_z), Vec3::new(q.ear.1 * 0.5, q.ear.0, q.ear.0));
+        } else {
+            b.add_box(Vec3::new(x, ear_top, head_z), Vec3::new(q.ear.0, q.ear.1 * 0.5, q.ear.0));
+        }
+    }
+    if has_tail && q.tail.0 > 0.0 {
+        b.group("tail");
+        let rear = -body_len;
+        if variant == AnimalVariant::Stand {
+            // The tail hangs down from the rear (axis-aligned boxes, so
+            // vertical) — and never below the floor.
+            let tail_y = (body_center_y + q.body.y * 0.3 - q.tail.0 * 0.3).max(q.tail.0 * 0.5);
+            b.add_box(Vec3::new(0.0, tail_y, rear - q.tail.1), Vec3::new(q.tail.1, q.tail.0 * 0.5, q.tail.1));
+        } else {
+            // Lying or sitting: the tail rests on the ground behind the body.
+            b.add_box(Vec3::new(0.0, q.tail.1, rear - q.tail.0 * 0.5), Vec3::new(q.tail.1, q.tail.1, q.tail.0 * 0.5));
+        }
+    }
+}
+
+/// A chicken: plump body, small head with a beak, tail feathers, two legs.
+/// Drawn at a nominal size (like the quadrupeds); the catalog table carries
+/// the measured result.
+fn draw_chicken(b: &mut PropBuilder) {
+    b.group("body");
+    let body = Vec3::new(0.088, 0.105, 0.105);
+    let body_y = 0.147;
+    b.add_box(Vec3::new(0.0, body_y, 0.0), body);
+    // Tail feathers: a box rising at the rear.
+    b.add_box(Vec3::new(0.0, body_y + body.y + 0.03, -body.z - 0.03), Vec3::new(body.x * 0.6, 0.05, 0.05));
+    b.group("head");
+    let head_r = 0.0385;
+    let head = Vec3::new(0.0, body_y + body.y + head_r * 0.6, body.z + head_r * 0.9);
+    b.add_box(head, Vec3::splat(head_r));
+    // Beak and comb.
+    b.add_box(head + Vec3::new(0.0, -head_r * 0.2, head_r + 0.02), Vec3::new(head_r * 0.35, head_r * 0.3, 0.025));
+    b.add_box(head + Vec3::new(0.0, head_r + 0.015, 0.0), Vec3::new(head_r * 0.4, 0.02, head_r * 0.5));
+    b.group("legs");
+    let leg_h = body_y - body.y;
+    for x in [0.029, -0.029] {
+        b.add_box(Vec3::new(x, leg_h * 0.5, 0.0), Vec3::new(0.012, leg_h * 0.5, 0.012));
+    }
+}
+
+/// Mesh for an animal entry: a quadruped (with pose variants) or the chicken.
+fn animal(entry: &CatalogEntry) -> ModelData {
+    let mut b = PropBuilder::new();
+    if entry.name == "chicken" {
+        draw_chicken(&mut b);
+        return b.finish(entry);
+    }
+    let (q, variant) = quadruped(entry).unwrap_or_else(|| panic!("no quadruped params for {}", entry.name));
+    draw_quadruped(&mut b, &q, variant, entry.materials);
     b.finish(entry)
 }
 
@@ -453,6 +730,271 @@ fn interior(entry: &CatalogEntry) -> ModelData {
         wall(&mut b, Vec3::new(s.x * 0.5, s.y * 0.5, 0.0), Vec3::new(t * 0.5, s.y * 0.5, s.z * 0.5));
     }
     b.finish(entry)
+}
+
+/// Street props: items that live outdoors, origin at base center.
+fn street_item(entry: &CatalogEntry) -> ModelData {
+    let mut b = PropBuilder::new();
+    let s = Vec3::from_array(entry.size);
+    match entry.name {
+        "pole" => {
+            b.group("body");
+            b.add_cylinder(Vec3::ZERO, s.x * 0.5, s.y, 0.0, 12);
+        }
+        "streetlight" => {
+            // Pole at −Z, arm reaching toward +Z with the lamp head at its end
+            // (the lit side is +Z).
+            b.group("pole");
+            b.add_cylinder(Vec3::new(0.0, 0.0, -0.28), 0.05, 4.35, 0.0, 12);
+            b.add_box(Vec3::new(0.0, 4.31, 0.22), Vec3::new(0.035, 0.035, 0.5));
+            b.group("head");
+            b.add_box(Vec3::new(0.0, s.y - 0.075, 0.72), Vec3::new(0.25, 0.075, 0.15));
+            b.group("lamp");
+            b.add_box(Vec3::new(0.0, s.y - 0.165, 0.72), Vec3::new(0.2, 0.015, 0.1));
+        }
+        "bench_outdoor" => {
+            // Two side frames carry the seat slats and the backrest.
+            b.group("frame");
+            for x in [s.x * 0.5 - 0.025, -(s.x * 0.5 - 0.025)] {
+                b.add_upright(Vec3::new(x, 0.0, 0.0), Vec3::new(0.05, 0.41, s.z));
+            }
+            b.group("seat");
+            for z in [-0.2f32, 0.0, 0.2] {
+                b.add_upright(Vec3::new(0.0, 0.41, z), Vec3::new(s.x - 0.04, 0.04, 0.16));
+            }
+            b.group("back");
+            b.add_upright(Vec3::new(0.0, 0.45, -s.z * 0.5 + 0.025), Vec3::new(s.x - 0.04, s.y - 0.45, 0.05));
+        }
+        "car" => {
+            // Wheels touch the ground, the body clears it by 0.15 m, the cabin
+            // sits slightly behind center (−Z), windows band its upper half.
+            b.group("wheels");
+            for x in [s.x * 0.5 - 0.125, -(s.x * 0.5 - 0.125)] {
+                for z in [1.45f32, -1.45] {
+                    b.add_upright(Vec3::new(x, 0.0, z), Vec3::new(0.25, 0.6, 0.6));
+                }
+            }
+            b.group("body");
+            b.add_box(Vec3::new(0.0, 0.45, 0.0), Vec3::new(0.85, 0.3, s.z * 0.5));
+            b.group("cabin");
+            b.add_box(Vec3::new(0.0, 1.125, -0.3), Vec3::new(0.75, 0.375, 1.1));
+            b.group("windows");
+            b.add_box(Vec3::new(0.0, 1.25, -0.3), Vec3::new(0.76, 0.2, 1.11));
+        }
+        "tree" => {
+            b.group("trunk");
+            b.add_cylinder(Vec3::ZERO, 0.12, 1.7, 0.0, 10);
+            b.group("canopy");
+            b.add_sphere(Vec3::new(0.0, 2.6, 0.0), 0.9, 12, 8);
+            b.add_sphere(Vec3::new(0.45, 2.45, 0.3), 0.55, 12, 6);
+            b.add_sphere(Vec3::new(-0.4, 2.3, -0.35), 0.6, 12, 6);
+        }
+        "tree_pine" => {
+            // A conifer reads as a silhouette by its STACK of cones: narrower
+            // and taller than the broadleaf, so a mixed forest is not one
+            // drawing repeated, which is what a scattered wood is judged by.
+            b.group("trunk");
+            b.add_cylinder(Vec3::ZERO, 0.11, 1.2, 0.0, 10);
+            b.group("canopy");
+            // 12 segments puts a vertex on each axis, so the girth is exact.
+            b.add_cone(Vec3::new(0.0, 0.9, 0.0), 0.9, 1.6, 12);
+            b.add_cone(Vec3::new(0.0, 1.8, 0.0), 0.68, 1.5, 12);
+            b.add_cone(Vec3::new(0.0, 2.6, 0.0), 0.45, 1.6, 12);
+        }
+        "bush" => {
+            b.group("canopy");
+            b.add_sphere(Vec3::new(0.15, 0.45, 0.12), 0.45, 10, 6);
+            b.add_sphere(Vec3::new(-0.15, 0.45, -0.12), 0.45, 10, 6);
+        }
+        "rock" => {
+            b.group("body");
+            // One low-segment sphere, squashed per axis to the declared size.
+            let c = Vec3::new(0.0, s.y * 0.5, 0.0);
+            let start = b.mesh.positions.len();
+            b.add_sphere(c, s.x * 0.5, 4, 6);
+            let squash = Vec3::new(1.0, s.y / s.x, s.z / s.x);
+            for p in &mut b.mesh.positions[start..] {
+                let v = c + (Vec3::from_array(*p) - c) * squash;
+                *p = v.to_array();
+            }
+        }
+        _ => b.add_upright(Vec3::ZERO, s),
+    }
+    b.finish(entry)
+}
+
+/// Outdoor ground: a slab whose top surface is exactly at `y = 0` (the slab
+/// hangs below, like interior floors) — props and cameras are placed on it.
+/// No walls, no ceiling.
+fn exterior(entry: &CatalogEntry) -> ModelData {
+    let mut b = PropBuilder::new();
+    let s = Vec3::from_array(entry.size);
+    let t = s.y; // slab thickness
+    b.group("ground");
+    b.add_box(Vec3::new(0.0, -t * 0.5, 0.0), Vec3::new(s.x * 0.5, t * 0.5, s.z * 0.5));
+    match entry.name {
+        "street_park" => {
+            // Walking path: 2 m wide, along Z, slightly above the ground top.
+            b.group("path");
+            b.add_box(Vec3::new(0.0, 0.03, 0.0), Vec3::new(1.0, 0.03, s.z * 0.5));
+        }
+        "street_crossing" => {
+            // Two crossing roads, 6 m wide, along X and along Z.
+            b.group("road");
+            b.add_box(Vec3::new(0.0, 0.02, 0.0), Vec3::new(s.x * 0.5, 0.02, 3.0));
+            b.add_box(Vec3::new(0.0, 0.02, 0.0), Vec3::new(3.0, 0.02, s.z * 0.5));
+            // Dashed center lines on both roads, a dash every 2 m.
+            b.group("marking");
+            let mut d = -s.x * 0.5 + 1.0;
+            while d <= s.x * 0.5 - 1.0 {
+                if d.abs() > 3.5 {
+                    b.add_box(Vec3::new(d, 0.045, 0.0), Vec3::new(0.5, 0.005, 0.075));
+                    b.add_box(Vec3::new(0.0, 0.045, d), Vec3::new(0.075, 0.005, 0.5));
+                }
+                d += 2.0;
+            }
+        }
+        _ => {}
+    }
+    b.finish(entry)
+}
+
+// --- generated fills (forest bands, hedge rows) --------------------------------
+
+/// The material groups a fill can draw: the union of its species' groups, in a
+/// stable order. A band is not one catalog entry, so its material table comes
+/// from what it plants — and `material_set` then hits `trunk`, `canopy`, `bush`
+/// and `rock` by name, exactly as it does on a single prop.
+pub fn scatter_materials(field: &ScatterField) -> Vec<String> {
+    let Some(preset) = scatter_preset(&field.preset) else {
+        return vec![];
+    };
+    let source = if preset.far.is_empty() { preset.near } else { preset.far };
+    let mut names: Vec<String> = Vec::new();
+    for species in source {
+        let Some(entry) = catalog_find(species.prop) else { continue };
+        for group in entry.materials {
+            if !names.iter().any(|n| n == *group) {
+                names.push((*group).to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Builds one mesh out of whole catalog drawings: a species is drawn once and
+/// merged in under a transform, so a scattered wood reuses the exact geometry
+/// the single-prop path produces instead of a second, worse drawing routine.
+struct FieldBuilder {
+    mesh: MeshData,
+    parts: Vec<PartData>,
+    /// Material name -> index in `materials`.
+    slots: std::collections::HashMap<String, usize>,
+    materials: Vec<MaterialRecord>,
+}
+
+impl FieldBuilder {
+    fn new(materials: Vec<String>) -> Self {
+        let slots = materials
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), i))
+            .collect();
+        let records = materials
+            .into_iter()
+            .map(|name| MaterialRecord {
+                name,
+                // Neutral: the forest reads before material_set, and green
+                // everywhere would fight the director's own grade.
+                base_color: [0.62, 0.60, 0.55, 1.0],
+                metallic: 0.0,
+                roughness: 0.8,
+                base_color_texture: None,
+                normal_map_texture: None,
+                roughness_texture: None,
+                metalness_texture: None,
+                invert_roughness: false,
+            })
+            .collect();
+        Self {
+            mesh: MeshData { positions: vec![], normals: vec![], uvs: vec![], indices: vec![] },
+            parts: vec![],
+            slots,
+            materials: records,
+        }
+    }
+
+    /// Copy one part of a drawing in, transformed. Only the vertices the part
+    /// references are copied — a tree is a few hundred vertices, and a band is
+    /// hundreds of trees, so dragging the whole drawing per instance would
+    /// inflate the mesh for nothing.
+    fn merge_part(&mut self, model: &ModelData, part: &PartData, at: Vec3, rot: Quat, scale: f32) {
+        debug_assert!(part.start as usize + part.count as usize <= model.mesh.indices.len());
+        let Some(material) = self.slots.get(&model.materials.get(part.material).map(|m| m.name.clone()).unwrap_or_default()) else {
+            return;
+        };
+        let material = *material;
+        let ibase = self.mesh.indices.len() as u32;
+        let start = (part.start as usize).min(model.mesh.indices.len());
+        let end = (part.start as usize + part.count as usize).min(model.mesh.indices.len());
+        let mut remap: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for &v in &model.mesh.indices[start..end] {
+            let mapped = *remap.entry(v).or_insert_with(|| {
+                let p = self.mesh.positions.len() as u32;
+                let local = Vec3::from_array(model.mesh.positions[v as usize]);
+                let n = Vec3::from_array(model.mesh.normals[v as usize]);
+                self.mesh.positions.push((at + rot * (local * scale)).to_array());
+                // Uniform scale keeps normals valid under rotation.
+                self.mesh.normals.push((rot * n).to_array());
+                self.mesh.uvs.push(model.mesh.uvs.get(v as usize).copied().unwrap_or([0.0, 0.0]));
+                p
+            });
+            // `mapped` is already an index into this mesh's positions.
+            self.mesh.indices.push(mapped);
+        }
+        let count = (self.mesh.indices.len() as u32 - ibase) as u32;
+        if count > 0 {
+            self.parts.push(PartData { material, start: ibase, count });
+        }
+    }
+
+    fn finish(self) -> ModelData {
+        ModelData { mesh: self.mesh, skin: None, materials: self.materials, parts: self.parts, diagnostics: vec![] }
+    }
+}
+
+/// Mesh for a generated fill: the plan is replayed here with the same pure
+/// function the generating command used, so the count the director was told and
+/// the geometry in the frame cannot disagree.
+///
+/// Only the far band is drawn. The near zone is editable scene objects — that
+/// is the whole split: what you shoot in is movable, what stands behind it is a
+/// silhouette and costs one mesh.
+pub fn scatter_field_model(field: &ScatterField) -> Option<ModelData> {
+    let preset = scatter_preset(&field.preset)?;
+    let placed = plan(preset, &field.shape, field.seed).ok()?;
+    let band = phantom_core::band_of(&placed);
+    if band.len() > MAX_SCATTER_INSTANCES {
+        return None;
+    }
+    let mut b = FieldBuilder::new(scatter_materials(field));
+    // Draw each species once and reuse it: a wood is the same dozen shapes
+    // placed many times, and building it that way keeps the cost per instance
+    // at a copy instead of a rebuild.
+    let mut drawings: std::collections::HashMap<&str, ModelData> = std::collections::HashMap::new();
+    for p in &band {
+        if !drawings.contains_key(p.prop) {
+            let Some(model) = prop_model(p.prop) else { continue };
+            drawings.insert(p.prop, model);
+        }
+        let Some(model) = drawings.get(p.prop) else { continue };
+        let at = Vec3::from_array(p.position);
+        let rot = Quat::from_rotation_y(p.yaw);
+        for part in &model.parts {
+            b.merge_part(model, part, at, rot, p.scale);
+        }
+    }
+    Some(b.finish())
 }
 
 #[cfg(test)]
@@ -502,8 +1044,11 @@ mod tests {
             let want = Vec3::from_array(entry.size);
             // An interior declares its FREE dimensions, so the mesh is larger by
             // the slab thickness; other props must match the table exactly.
+            // Exterior grounds hang their slab below y = 0 (its top is the
+            // placement surface), so their bottom sits at −0.24.
             let (slack, base) = match entry.kind {
                 CatalogKind::Interior => (2.0 * T, T),
+                CatalogKind::Exterior => (0.05, 0.24),
                 _ => (0.05, 0.0),
             };
             for axis in 0..3 {
@@ -513,14 +1058,68 @@ mod tests {
                 assert!(g <= w + limit, "{}: size along axis {axis} is {g}, above the table's {w}", entry.name);
             }
             assert!(lo.y.abs() <= base + 1e-3, "{}: mesh bottom at {:.3}, expected {base}", entry.name, lo.y);
-            // The interior floor lies on y = 0: items are placed on it, not inside it.
-            if entry.kind == CatalogKind::Interior {
+            // The interior floor and the exterior ground top lie on y = 0:
+            // items and cameras are placed on it, not inside it.
+            if matches!(entry.kind, CatalogKind::Interior | CatalogKind::Exterior) {
                 assert!(
                     model.mesh.positions.iter().any(|p| p[1].abs() < 1e-4),
                     "{}: the floor surface must be at y = 0",
                     entry.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_forest_band_replays_the_plan_it_was_given() {
+        let field = phantom_core::ScatterField {
+            preset: "forest".into(),
+            shape: phantom_core::ScatterShape::Area { size: [16.0, 16.0], density: 0.3, action: Some([[-3.0, -3.0], [3.0, 3.0]]) },
+            seed: 5,
+        };
+        let model = scatter_field_model(&field).unwrap();
+        let preset = phantom_core::scatter_preset("forest").unwrap();
+        let band = phantom_core::band_of(&phantom_core::plan(preset, &field.shape, field.seed).unwrap());
+        // One part per species part drawn: the mesh is the plan, not a guess.
+        let species: usize = band.iter().map(|p| p.prop).collect::<std::collections::HashSet<_>>().len();
+        assert!(band.len() >= species, "the band planted something");
+        // Materials: every part names a group the field declares, and nothing
+        // sits above the tallest tree the preset can draw.
+        for part in &model.parts {
+            assert!(part.material < model.materials.len(), "part names a declared group");
+        }
+        assert!(!model.materials.is_empty(), "trunk/canopy/bush/rock are addressable");
+        let top = model.mesh.positions.iter().map(|p| p[1]).fold(0.0f32, f32::max);
+        assert!(top > 1.0 && top <= phantom_core::band_top_y(preset) * 1.4 + 1e-2, "band top {top}");
+        // Every instance stands on the ground: nothing floats, nothing sinks.
+        assert!(model.mesh.positions.iter().all(|p| p[1] > -1e-3), "the band sits on y = 0");
+        // The merge copied every triangle of every instance and remapped its
+        // vertices: the count is exactly the species' geometry times the plan,
+        // and no index reaches past the vertex buffer.
+        let want: u32 = band
+            .iter()
+            .map(|p| prop_model(p.prop).map(|m| m.parts.iter().map(|part| part.count).sum::<u32>()).unwrap_or(0))
+            .sum();
+        assert!(want > 0, "the species have geometry");
+        let got: u32 = model.parts.iter().map(|part| part.count).sum();
+        assert_eq!(got, want, "the band is the plan, triangle for triangle");
+        assert_eq!(got as usize, model.mesh.indices.len(), "the parts partition the index buffer");
+        assert!(model.mesh.indices.iter().all(|&i| (i as usize) < model.mesh.positions.len()));
+        let (lo, hi) = bbox(&model);
+        assert!(hi.x - lo.x > 8.0 && hi.z - lo.z > 8.0, "the band covers the area: {:?}", hi - lo);
+    }
+
+    #[test]
+    fn crossing_has_roads_and_no_ceiling() {
+        let entry = catalog_find("street_crossing").unwrap();
+        let model = prop_model("street_crossing").unwrap();
+        let (lo, hi) = bbox(&model);
+        // No walls and no ceiling: the mesh stays a flat slab with road paint.
+        assert!(hi.y - lo.y <= 0.31, "bbox height {:.3} — nothing above the roads", hi.y - lo.y);
+        for name in ["road", "marking"] {
+            let material = entry.materials.iter().position(|m| *m == name).unwrap();
+            let count: u32 = model.parts.iter().filter(|p| p.material == material).map(|p| p.count).sum();
+            assert!(count > 0, "{name} group must have geometry");
         }
     }
 
@@ -540,3 +1139,4 @@ mod tests {
         assert!(prop_model("no-such-prop").is_none());
     }
 }
+

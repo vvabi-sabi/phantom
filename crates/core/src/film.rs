@@ -2,10 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::id::{SceneId, ShotId};
+use crate::id::{SceneId, CameraId};
 use crate::time::{Frame, FrameRange};
 
-/// Film clip: a reference to a scene range or to a scene shot.
+/// Film clip: a reference to a scene range, optionally pinned to a camera.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FilmClip {
     pub id: ClipId,
@@ -13,11 +13,12 @@ pub struct FilmClip {
     /// Scene frame range [start, end); when `shot = Some` it matches the
     /// shot's range (validated in the editing command).
     pub range: FrameRange,
-    /// Scene shot; `None` — a legacy reference to a scene range. Audio
-    /// maps through `range` in both cases: sound belongs to the scene and
-    /// is not duplicated.
-    #[serde(default)]
-    pub shot: Option<ShotId>,
+    /// Scene camera this clip is shot with; `None` — the scene's active camera.
+    /// Audio maps through `range` in both cases: sound belongs to the scene and
+    /// is not duplicated. The field was called `shot` before cameras became
+    /// scene entities, and old manifests still read.
+    #[serde(default, alias = "shot")]
+    pub camera: Option<CameraId>,
 }
 
 /// Film length in frames.
@@ -70,7 +71,7 @@ mod tests {
     use super::*;
 
     fn clip(id: u64, scene: u64, start: Frame, end: Frame) -> FilmClip {
-        FilmClip { id: ClipId(id), scene: SceneId(scene), range: FrameRange::new(start, end).unwrap(), shot: None }
+        FilmClip { id: ClipId(id), scene: SceneId(scene), range: FrameRange::new(start, end).unwrap(), camera: None }
     }
 
     #[test]

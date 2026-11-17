@@ -53,8 +53,6 @@ pub enum RenderError {
 pub struct RenderOptions {
     pub width: u32,
     pub height: u32,
-    /// "On twos" mode for the Phantom's pose.
-    pub on_twos: bool,
 }
 
 /// Rendered frame: RGBA8 (sRGB), rows tightly packed.
@@ -124,15 +122,14 @@ impl LiveSync {
     pub fn apply(
         &self,
         world: &mut World,
+        project: &phantom_core::Project,
         scene: &Scene,
         frame: Frame,
-        on_twos: bool,
-        control: Option<(phantom_core::PhantomId, glam::Vec3, f32, phantom_core::rig::Pose)>,
         onion_skin: bool,
-        shot: Option<phantom_core::ShotId>,
+        camera: Option<phantom_core::CameraId>,
     ) {
         if let Some(forge) = &self.forge {
-            apply_scene_frame(world, scene, forge, frame, on_twos, control, onion_skin, shot);
+            apply_scene_frame(world, project, scene, forge, frame, onion_skin, camera);
         }
     }
 }
@@ -164,7 +161,6 @@ impl Renderer {
         app.init_resource::<SceneCache>();
         app.init_resource::<DrawCache>();
         app.init_resource::<VideoCache>();
-        app.init_resource::<ClipCache>();
         app.finish();
         app.cleanup();
 
@@ -203,9 +199,9 @@ impl Renderer {
         project_dir: &Path,
         frame: Frame,
         opts: &RenderOptions,
-        shot: Option<phantom_core::ShotId>,
+        camera: Option<phantom_core::CameraId>,
     ) -> Result<RenderedFrame, RenderError> {
-        let forge = self.rebuild_scene(project, scene, project_dir, frame, opts, shot)?;
+        let forge = self.rebuild_scene(project, scene, project_dir, frame, opts, camera)?;
 
         // A new world builds mesh/material pipelines asynchronously. Issuing the
         // readback in that same update captured the transparent clear before the
@@ -274,12 +270,12 @@ impl Renderer {
         scene: &Scene,
         project_dir: &Path,
         frame: Frame,
-        opts: &RenderOptions,
-        shot: Option<phantom_core::ShotId>,
+        _opts: &RenderOptions,
+        camera: Option<phantom_core::CameraId>,
     ) -> Result<ForgeResult, RenderError> {
         let world = self.app.world_mut();
         let forge = forge_scene(world, project, scene, project_dir, &self.target)?;
-        apply_scene_frame(world, scene, &forge, frame, opts.on_twos, None, false, shot);
+        apply_scene_frame(world, project, scene, &forge, frame, false, camera);
         Ok(forge)
     }
 }
@@ -370,23 +366,10 @@ pub struct PhantomEntities {
     pub joints: Vec<Entity>,
     /// Bone rest locals (translation, rotation, scale) — the rig's pose.
     pub rest: Vec<(glam::Vec3, glam::Quat, glam::Vec3)>,
-    /// Bone → clip-track maps keyed by (asset, stack, retargeting profile):
-    /// the legacy clip (stack None) and each `clip_track` usage.
-    pub clip_maps: std::collections::HashMap<ClipKey, Vec<Option<usize>>>,
     /// Bone names (in `joints` order) — for attachments (B2).
     pub bone_names: Vec<String>,
     /// Bone parents (topological order).
     pub bone_parents: Vec<Option<usize>>,
-}
-
-/// Clip key: (asset, stack, retargeting profile); stack `None` — the longest
-/// one (legacy), profile `None` — direct bone-name matching.
-pub type ClipKey = (phantom_core::AssetId, Option<String>, Option<phantom_core::RetargetProfile>);
-
-/// Motion clips per asset.
-#[derive(Resource, Default)]
-pub struct ClipCache {
-    pub clips: std::collections::HashMap<ClipKey, std::sync::Arc<crate::import::ClipData>>,
 }
 
 /// Builds the scene structure in the world: lighting, background, camera,
@@ -425,7 +408,7 @@ pub fn forge_scene(
         spawn_floor(world, floor);
     }
 
-    // Background: arc screen with an image or video.
+    // Background: a flat screen with an image or video.
     if let Some(bg) = &scene.background {
         let source_asset = bg.image.asset();
         let is_video = matches!(bg.image, phantom_core::project::BackgroundSource::Video { .. });
@@ -452,7 +435,7 @@ pub fn forge_scene(
                 );
                 let tex = world.resource_mut::<Assets<Image>>().add(image);
                 let (iw, ih) = img_zones.dimensions();
-                let mesh_data = mesh_gen::arc_screen_mesh(bg, 48, Some(iw as f32 / ih.max(1) as f32));
+                let mesh_data = mesh_gen::screen_mesh(bg, Some(iw as f32 / ih.max(1) as f32));
                 let mesh = world.resource_mut::<Assets<Mesh>>().add(mesh_from_data(&mesh_data));
                 let material = world.resource_mut::<Assets<StandardMaterial>>().add(StandardMaterial {
                     base_color_texture: Some(tex.clone()),
@@ -476,7 +459,8 @@ pub fn forge_scene(
                 for row in 0..2 {
                     for col in 0..3 {
                         let z = zones[row * 3 + col];
-                        let x = (col as f32 - 1.0) * bg.radius * (bg.arc_radians / 2.0).sin() * 0.7;
+                        // The screen is flat: the zones spread over its width.
+                        let x = (col as f32 - 1.0) * bg.width * 0.35;
                         let y = bg.center.y + (row as f32 - 0.5) * bg.height * 0.5;
                         let e = world
                             .spawn((
@@ -484,7 +468,7 @@ pub fn forge_scene(
                                 PointLight {
                                     color: Color::linear_rgba(z[0], z[1], z[2], 1.0),
                                     intensity: zone_intensity,
-                                    range: bg.radius * 2.0,
+                                    range: (bg.width * 0.5).max(bg.height).max(1.0),
                                     shadows_enabled: false,
                                     ..default()
                                 },
@@ -516,7 +500,9 @@ pub fn forge_scene(
 
     // Camera (apply_scene_frame sets its transform). The FOV formula is shared
     // with the pure diagnostics: phantom_core::vertical_fov.
-    let fov = phantom_core::vertical_fov(scene.camera.focal_mm);
+    // The forge lens is a starting value; apply_scene_frame sets the real
+    // projection of the selected camera on every frame.
+    let fov = phantom_core::vertical_fov(scene.active_camera().camera.focal_mm);
     let camera = world
         .spawn((
             SceneEntity,
@@ -631,9 +617,9 @@ pub fn forge_scene(
 
     // Phantoms in rest pose.
     for phantom in scene.phantoms.values() {
-        for key in phantom.motion.iter().chain(phantom.takes.iter().flat_map(|t| &t.motion)) {
+        for key in &phantom.motion {
             key.validate()?;
-            phantom.rig.validate_action(key.action)?;
+            phantom.rig.validate_pose(key.pose)?;
         }
         match &phantom.rig {
             RigRef::Builtin | RigRef::BuiltinActor { .. } => {
@@ -656,54 +642,7 @@ pub fn forge_scene(
                     .parent()
                     .map(|dir| TextureRoot { model_dir: dir.to_path_buf(), project_root });
                 let uploaded = upload_model(world, &model, tex_root.as_ref());
-                let mut entities = spawn_skinned(world, &model, &uploaded, glam::Vec3::ZERO, None, phantom.outline_px, &phantom.material_patches);
-                // Motion clips: matched by bone name. A non-empty track replaces
-                // the legacy `clip`; an empty one keeps legacy behavior.
-                if let Some(skin) = &model.skin {
-                    let bone_names: Vec<String> = skin.bones.iter().map(|b| b.name.clone()).collect();
-                    let mut wanted: Vec<ClipKey> = Vec::new();
-                    if phantom.clip_track.is_empty() {
-                        if let Some(clip_asset) = phantom.clip {
-                            wanted.push((clip_asset, None, None));
-                        }
-                    } else {
-                        for u in &phantom.clip_track {
-                            wanted.push((u.asset, u.stack.clone(), u.retarget));
-                        }
-                    }
-                    for (clip_asset, stack, retarget) in wanted {
-                        let Some(clip_path) = project.assets.get(&clip_asset).map(|a| project_dir.join(&a.path)) else {
-                            continue;
-                        };
-                        let key = (clip_asset, stack.clone(), retarget);
-                        let clip = {
-                            let mut cache = world.resource_mut::<ClipCache>();
-                            if !cache.clips.contains_key(&key) {
-                                // A clip read error propagates as RenderError::Import
-                                // (GUI status / failed render job), not a panic.
-                                let loaded = match retarget {
-                                    Some(profile) => {
-                                        let (clip, diagnostics) =
-                                            crate::import::load_clip_retarget(&clip_path, profile, &bone_names, stack.as_deref())?;
-                                        for d in &diagnostics {
-                                            bevy::log::warn!("retargeting {}: {d}", clip_path.display());
-                                        }
-                                        clip
-                                    }
-                                    None => crate::import::load_clip(&clip_path, &bone_names, stack.as_deref())?,
-                                };
-                                cache.clips.insert(key.clone(), std::sync::Arc::new(loaded));
-                            }
-                            cache.clips.get(&key).expect("just inserted").clone()
-                        };
-                        let map: Vec<Option<usize>> = skin
-                            .bones
-                            .iter()
-                            .map(|b| clip.bones.iter().position(|n| n == &b.name))
-                            .collect();
-                        entities.clip_maps.insert(key, map);
-                    }
-                }
+                let entities = spawn_skinned(world, &model, &uploaded, glam::Vec3::ZERO, None, phantom.outline_px, &phantom.material_patches);
                 result.phantoms.insert(phantom.id, entities);
             }
         }
@@ -712,6 +651,20 @@ pub fn forge_scene(
     // Props: static (non-skinned) objects; a skinned model renders in bind
     // pose without a clip.
     for object in scene.objects.values() {
+        // A generated fill (a forest band, a hedge row): the mesh is the plan
+        // replayed, so the recipe in the document and the geometry here cannot
+        // disagree. It takes precedence over `builtin`, which only names the
+        // species family for the material groups.
+        if let Some(field) = &object.scatter {
+            let Some(model) = crate::props::scatter_field_model(field) else {
+                bevy::log::warn!("object {}: cannot replay fill {field:?}", object.name);
+                continue;
+            };
+            let uploaded = upload_model(world, &model, None);
+            let root = spawn_static(world, &uploaded, &object.material_patches);
+            result.objects.insert(object.id, root);
+            continue;
+        }
         // Catalog entry (K1): the mesh is built procedurally, no asset file needed.
         if let Some(prop) = &object.builtin {
             let Some(model) = crate::props::prop_model(prop) else {
@@ -976,17 +929,14 @@ fn spawn_floor(world: &mut World, floor: &phantom_core::SceneFloor) {
 }
 
 /// Applies frame state to the built scene: camera and Phantom poses.
-/// `control` is live control: (phantom, position, yaw in radians, pose) replaces
-/// evaluate for the selected Phantom.
 pub fn apply_scene_frame(
     world: &mut World,
+    project: &phantom_core::Project,
     scene: &Scene,
     forge: &ForgeResult,
     frame: Frame,
-    on_twos: bool,
-    control: Option<(phantom_core::PhantomId, glam::Vec3, f32, phantom_core::rig::Pose)>,
     onion_skin: bool,
-    shot: Option<phantom_core::ShotId>,
+    camera: Option<phantom_core::CameraId>,
 ) {
     apply_background_frame(world, forge, frame, &scene.ambient);
     apply_draw_layers(world, scene, forge, frame, onion_skin);
@@ -1021,7 +971,7 @@ pub fn apply_scene_frame(
     }
     for object in scene.objects.values() {
         let Some(root) = forge.objects.get(&object.id) else { continue };
-        let t = evaluate_object(object, &scene.range, frame, on_twos);
+        let t = evaluate_object(object, frame);
         if let Some(mut tr) = world.get_mut::<Transform>(*root) {
             tr.translation = t.position;
             tr.rotation = Quat::from_euler(EulerRot::YXZ, t.yaw, t.pitch, t.roll);
@@ -1029,8 +979,9 @@ pub fn apply_scene_frame(
         }
     }
     if let Some(cam) = forge.camera {
-        let cam_ref = scene.camera_for_shot(shot);
-        let pose = sample_camera(cam_ref, frame);
+        // One resolution for the render and the diagnostics: the attachment to
+        // a moving subject is applied here, not in the caller.
+        let pose = phantom_core::camera_pose(project, scene, camera, frame);
         if let Some(mut tr) = world.get_mut::<Transform>(cam) {
             tr.translation = pose.translation;
             // C1.1: horizon roll — the third YXZ component.
@@ -1049,94 +1000,17 @@ pub fn apply_scene_frame(
         Default::default();
     for phantom in scene.phantoms.values() {
         let Some(entities) = forge.phantoms.get(&phantom.id) else { continue };
-        let (root, yaw, bone_poses): (glam::Vec3, f32, Vec<(glam::Vec3, glam::Quat, glam::Vec3)>) = match &control {
-            Some((id, pos, yaw, pose))
-                if *id == phantom.id
-                    && phantom.rig.builtin_actor() == Some(phantom_core::project::BuiltinActor::Humanoid)
-                    && pose.bones.len() == entities.joints.len() =>
-            {
-                (*pos, *yaw, pose.bones.iter().map(|b| (b.translation, b.rotation, glam::Vec3::ONE)).collect())
+        // A builtin actor holds its pose; an imported rig has no named poses and
+        // renders in bind pose (the bones stay where forge_scene put them).
+        let pose: Vec<(glam::Vec3, glam::Quat, glam::Vec3)> = match &phantom.rig {
+            RigRef::Builtin | RigRef::BuiltinActor { .. } => {
+                let state = evaluate(phantom, frame);
+                state.skeleton.bones.iter().map(|b| (b.translation, b.rotation, glam::Vec3::ONE)).collect()
             }
-            _ => {
-                let state = evaluate(phantom, &scene.range, frame, on_twos);
-                match &phantom.rig {
-                    RigRef::Builtin | RigRef::BuiltinActor { .. } => {
-                        (state.root, state.yaw, state.pose.bones.iter().map(|b| (b.translation, b.rotation, glam::Vec3::ONE)).collect())
-                    }
-                    RigRef::Imported { .. } => {
-                        let cache = world.resource::<ClipCache>();
-                        if phantom.clip_track.is_empty() {
-                            // Legacy: one clip (the longest stack), looped over the whole scene.
-                            let clip_pose = phantom.clip.and_then(|asset| {
-                                let map = entities.clip_maps.get(&(asset, None, None))?;
-                                let clip = cache.clips.get(&(asset, None, None))?;
-                                let f = (frame.max(0) as u32 % clip.frames.max(1)) as usize;
-                                Some(sample_clip_pose(&entities.rest, map, clip, f as f32))
-                            });
-                            (state.root, state.yaw, clip_pose.unwrap_or_else(|| entities.rest.clone()))
-                        } else {
-                            // Clip track: the usage active at this frame; outside it —
-                            // bind pose (manual controller keys work as before).
-                            let active = phantom_core::active_clip_use(&phantom.clip_track, frame);
-                            let mut root = state.root;
-                            let pose = active.and_then(|u| {
-                                let key = (u.asset, u.stack.clone(), u.retarget);
-                                let map = entities.clip_maps.get(&key)?;
-                                let clip = cache.clips.get(&key)?;
-                                // Clip frame: (frame - start) * speed, clamped to the clip's
-                                // last frame (no looping — a single playthrough).
-                                let f = phantom_core::clip_frame_at(u, frame).clamp(0.0, (clip.frames.max(1) - 1) as f32);
-                                let mut pose = sample_clip_pose(&entities.rest, map, clip, f);
-                                // Blending: windows inside the usage range; the base pose is
-                                // rest at the track edges, and the neighbouring clip's pose at
-                                // butt-adjacent joints.
-                                let (w_in, w_out) = phantom_core::blend_weights(u, frame);
-                                if w_in < 1.0 {
-                                    let base = phantom_core::clips::contiguous_prev(&phantom.clip_track, u)
-                                        .and_then(|p| {
-                                            let k = (p.asset, p.stack.clone(), p.retarget);
-                                            let c = cache.clips.get(&k)?;
-                                            let m = entities.clip_maps.get(&k)?;
-                                            let pf = phantom_core::clip_frame_at(p, p.range.end - 1).clamp(0.0, (c.frames.max(1) - 1) as f32);
-                                            Some(sample_clip_pose(&entities.rest, m, c, pf))
-                                        })
-                                        .unwrap_or_else(|| entities.rest.clone());
-                                    pose = blend_clip_pose(&base, &pose, w_in);
-                                }
-                                if w_out < 1.0 {
-                                    let base = phantom_core::clips::contiguous_next(&phantom.clip_track, u)
-                                        .and_then(|n| {
-                                            let k = (n.asset, n.stack.clone(), n.retarget);
-                                            let c = cache.clips.get(&k)?;
-                                            let m = entities.clip_maps.get(&k)?;
-                                            Some(sample_clip_pose(&entities.rest, m, c, 0.0))
-                                        })
-                                        .unwrap_or_else(|| entities.rest.clone());
-                                    pose = blend_clip_pose(&pose, &base, 1.0 - w_out);
-                                }
-                                // Root motion: Clip — the clip's root-bone delta from the frame
-                                // the usage starts on; the controller is frozen at that start
-                                // frame (the two trajectories are not summed). The root bone's
-                                // translation in the pose is frozen at clip frame 0, otherwise
-                                // the displacement would count twice: both in the bone's local
-                                // pose and in the root entity's offset. Controller — the clip
-                                // pose is applied as sampled (the root track is not stripped)
-                                // and the controller owns the offset.
-                                if u.root_motion == phantom_core::RootMotion::Clip {
-                                    freeze_clip_root_translation(&mut pose, map, clip);
-                                    if let Some(delta) = root_motion_delta(map, clip, f) {
-                                        let base = evaluate(phantom, &scene.range, u.range.start, on_twos).root;
-                                        root = base + delta;
-                                    }
-                                }
-                                Some(pose)
-                            });
-                            (root, state.yaw, pose.unwrap_or_else(|| entities.rest.clone()))
-                        }
-                    }
-                }
-            }
+            RigRef::Imported { .. } => entities.rest.clone(),
         };
+        let state = evaluate(phantom, frame);
+        let (root, yaw, bone_poses) = (state.root, state.yaw, pose);
         if let Some(mut tr) = world.get_mut::<Transform>(entities.root) {
             tr.translation = root;
             tr.rotation = Quat::from_rotation_y(yaw);
@@ -1258,7 +1132,7 @@ fn apply_attachments(
             tr.translation = pos + rot * (attach.offset_pos * scale);
             tr.rotation = rot * offset_q;
             // The actor's scale is inherited; the key's own scale goes on top.
-            let own = phantom_core::evaluate_object(object, &scene.range, 0, false).scale;
+            let own = phantom_core::evaluate_object(object, 0).scale;
             tr.scale = own * scale;
         }
     }
@@ -1271,75 +1145,6 @@ fn apply_attachments(
             tr.translation = pos + rot * attach.offset_pos;
             tr.rotation = rot * offset_q;
         }
-    }
-}
-
-/// Bone pose from a clip at fractional frame `f` (linear interpolation between
-/// neighboring samples: lerp translations, nlerp rotations). Bones without a
-/// track stay in rest pose. `f` must already be clamped to [0, frames - 1].
-pub fn sample_clip_pose(
-    rest: &[(glam::Vec3, glam::Quat, glam::Vec3)],
-    map: &[Option<usize>],
-    clip: &crate::import::ClipData,
-    f: f32,
-) -> Vec<(glam::Vec3, glam::Quat, glam::Vec3)> {
-    let f = f.clamp(0.0, (clip.frames.max(1) - 1) as f32);
-    let i0 = f.floor() as usize;
-    let i1 = (i0 + 1).min((clip.frames.max(1) - 1) as usize);
-    let t = f - i0 as f32;
-    rest.iter()
-        .enumerate()
-        .map(|(bi, rest)| {
-            map.get(bi)
-                .and_then(|tr| {
-                    tr.map(|ti| {
-                        let a = clip.samples[ti][i0];
-                        let b = clip.samples[ti][i1];
-                        (a.0.lerp(b.0, t), a.1.lerp(b.1, t).normalize(), rest.2)
-                    })
-                })
-                .unwrap_or(*rest)
-        })
-        .collect()
-}
-
-/// Blend of two bone poses: lerp translations, nlerp rotations; scale comes from `to`.
-pub fn blend_clip_pose(
-    from: &[(glam::Vec3, glam::Quat, glam::Vec3)],
-    to: &[(glam::Vec3, glam::Quat, glam::Vec3)],
-    alpha: f32,
-) -> Vec<(glam::Vec3, glam::Quat, glam::Vec3)> {
-    from.iter()
-        .zip(to.iter())
-        .map(|(a, b)| (a.0.lerp(b.0, alpha), a.1.lerp(b.1, alpha).normalize(), b.2))
-        .collect()
-}
-
-/// Clip root-motion delta: the root bone's displacement (first skin bone) from
-/// clip frame 0 to frame `f`. `None` if the root bone has no track.
-pub fn root_motion_delta(map: &[Option<usize>], clip: &crate::import::ClipData, f: f32) -> Option<glam::Vec3> {
-    let ti = map.first().and_then(|t| *t)?;
-    let f = f.clamp(0.0, (clip.frames.max(1) - 1) as f32);
-    let i0 = f.floor() as usize;
-    let i1 = (i0 + 1).min((clip.frames.max(1) - 1) as usize);
-    let t = f - i0 as f32;
-    let at = clip.samples[ti][i0].0.lerp(clip.samples[ti][i1].0, t);
-    Some(at - clip.samples[ti][0].0)
-}
-
-/// Freezes the root bone's translation (first skin bone) in the pose at clip
-/// frame 0. In [`phantom_core::RootMotion::Clip`] mode the root displacement
-/// comes from [`root_motion_delta`] on the root entity; without the freeze the
-/// same displacement would count twice — both in the bone's local pose (the
-/// clip's absolute root track) and in the root offset.
-pub fn freeze_clip_root_translation(
-    pose: &mut [(glam::Vec3, glam::Quat, glam::Vec3)],
-    map: &[Option<usize>],
-    clip: &crate::import::ClipData,
-) {
-    let Some(ti) = map.first().and_then(|t| *t) else { return };
-    if let Some(root) = pose.first_mut() {
-        root.0 = clip.samples[ti][0].0;
     }
 }
 
@@ -1447,7 +1252,6 @@ fn spawn_skinned(
             root: root_entity,
             joints,
             rest,
-            clip_maps: Default::default(),
             bone_names: skin.bones.iter().map(|b| b.name.clone()).collect(),
             bone_parents: skin.bones.iter().map(|b| b.parent).collect(),
         }
@@ -1608,7 +1412,6 @@ fn quad_mesh(world: &mut World, fov: f32, aspect: f32) -> Handle<Mesh> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::Vec3;
     use phantom_core::*;
 
     /// Live path for 2D layers: forge + apply + a frame through the same
@@ -1647,7 +1450,7 @@ mod tests {
         let scene_doc = project.scenes[&scene].clone();
         let world = renderer.app.world_mut();
         let forge = forge_scene(world, &project, &scene_doc, Path::new("/tmp"), &target).unwrap();
-        apply_scene_frame(world, &scene_doc, &forge, 0, false, None, true, None);
+        apply_scene_frame(world, &project, &scene_doc, &forge, 0, true, None);
         for _ in 0..30 {
             renderer.app.update();
         }
@@ -1677,11 +1480,6 @@ mod tests {
 
 /// Camera position at a frame: linear interpolation of keys.
 /// The shared implementation is `Camera::sample` in core; it takes a camera
-/// (the scene's legacy one or a shot's) — choosing it is up to the caller.
-fn sample_camera(camera: &phantom_core::Camera, frame: Frame) -> phantom_core::project::CameraPose {
-    camera.sample(frame)
-}
-
 /// GPU assets of a model: the combined mesh (outline, legacy), part meshes
 /// with materials, and the shared inverse-bindposes.
 #[derive(Clone)]

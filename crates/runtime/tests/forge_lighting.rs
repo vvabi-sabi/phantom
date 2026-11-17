@@ -18,32 +18,21 @@ fn test_world() -> World {
 }
 
 fn test_scene(lighting: SceneLighting, floor: Option<SceneFloor>) -> Scene {
-    Scene {
-        id: SceneId(1),
-        name: "s".into(),
-        range: FrameRange::new(0, 24).unwrap(),
-        background: None,
-        camera: phantom_core::Camera::default(),
-        phantoms: Default::default(),
-        layers_2d: Vec::new(),
-        audio_tracks: Vec::new(),
-        lighting,
-        floor,
-        objects: Default::default(),
-        shots: Default::default(),
-        lights: vec![],
-        ambient: Default::default(),
-        sky: None,
-        grade: None,
-        fog: None,
-        vfx: vec![],
-    }
+    let mut scene = Scene::new(SceneId(1), "s", FrameRange::new(0, 24).unwrap());
+    scene.lighting = lighting;
+    scene.floor = floor;
+    scene
 }
 
 fn forge(world: &mut World, scene: &Scene) {
     let project = Project::new("t");
     let target = Handle::<Image>::default();
     forge_scene(world, &project, scene, std::path::Path::new("."), &target).unwrap();
+}
+
+fn apply(world: &mut World, scene: &Scene, forge: &phantom_runtime::render::ForgeResult, frame: i64) {
+    let project = Project::new("t");
+    apply_scene_frame(world, &project, scene, forge, frame, false, None);
 }
 
 #[test]
@@ -158,11 +147,11 @@ fn forge_spawns_document_lights_and_applies_keys_per_frame() {
     assert_eq!(world.query::<&DirectionalLight>().iter(&world).count(), 0, "stage lighting is disabled");
 
     // Before the key (frame 0): rest pose, enabled from the body.
-    apply_scene_frame(&mut world, &scene, &forge, 0, false, None, false, None);
+    apply(&mut world, &scene, &forge, 0);
     let lamp = forge.lights[&phantom_core::LightId(11)];
     assert_eq!(world.get::<Transform>(lamp).unwrap().translation, Vec3::ZERO);
     // At the key (frame 12): key pose, intensity overridden, spot disabled.
-    apply_scene_frame(&mut world, &scene, &forge, 12, false, None, false, None);
+    apply(&mut world, &scene, &forge, 12);
     let tr = world.get::<Transform>(lamp).unwrap();
     assert_eq!(tr.translation, Vec3::new(2.0, 3.0, -1.0));
     assert!((world.get::<PointLight>(lamp).unwrap().intensity - 1200.0).abs() < 1e-3);

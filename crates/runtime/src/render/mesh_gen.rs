@@ -57,30 +57,62 @@ impl MeshBuilder {
 }
 
 /// Built-in character: boxes rigidly bound to the bones of the humanoid skeleton.
-/// A stylized "robot"; the art model is replaced by an FBX import.
-pub fn builtin_phantom_model() -> ModelData {
+/// Map one box of the adult humanoid into a human role's proportions. The
+/// figure is three vertical regions — legs (below the waist), torso, head —
+/// and each scales by its own ratio from the role's profile, so a child is not
+/// just a small adult. The adult row is the identity: every box keeps its
+/// exact numbers.
+fn map_humanoid_box(center: Vec3, half: Vec3, p: &phantom_core::rig::HumanProportions) -> (Vec3, Vec3) {
+    const WAIST: f32 = 0.95;
+    const TORSO_TOP: f32 = 1.52;
+    let (center, half) = if center.y <= WAIST {
+        (Vec3::new(center.x * p.leg, center.y * p.leg, center.z * p.leg), half * p.leg)
+    } else if center.y <= TORSO_TOP {
+        let y = p.waist + (center.y - WAIST) * p.torso;
+        (Vec3::new(center.x * p.torso, y, center.z * p.torso), half * p.torso)
+    } else {
+        let y = p.torso_top + (center.y - TORSO_TOP) * p.head;
+        (Vec3::new(center.x * p.head, y, center.z * p.head), half * p.head)
+    };
+    (center, half)
+}
+
+/// A stylized "robot" person; the art model is replaced by an FBX import. The
+/// same drawing serves every human role — the boxes are mapped through the
+/// role's proportions (the adult keeps its exact numbers).
+pub fn builtin_humanoid_model(actor: BuiltinActor) -> ModelData {
+    let p = phantom_core::rig::human_proportions(actor);
     let mut b = MeshBuilder::new();
+    let mut box_ = |center: Vec3, half: Vec3, bone: usize| {
+        let (c, h) = map_humanoid_box(center, half, &p);
+        b.add_box(c, h, bone);
+    };
     // Pelvis.
-    b.add_box(Vec3::new(0.0, 1.01, 0.0), Vec3::new(0.14, 0.07, 0.09), 0);
+    box_(Vec3::new(0.0, 1.01, 0.0), Vec3::new(0.14, 0.07, 0.09), 0);
     // Torso.
-    b.add_box(Vec3::new(0.0, 1.30, 0.0), Vec3::new(0.17, 0.22, 0.10), 1);
+    box_(Vec3::new(0.0, 1.30, 0.0), Vec3::new(0.17, 0.22, 0.10), 1);
     // Head.
-    b.add_box(Vec3::new(0.0, 1.63, 0.0), Vec3::new(0.10, 0.11, 0.10), 2);
+    box_(Vec3::new(0.0, 1.63, 0.0), Vec3::new(0.10, 0.11, 0.10), 2);
     // Arms: upper arm + forearm, along X.
     for s in [1.0f32, -1.0] {
         let upper = if s > 0.0 { 3 } else { 5 };
         let lower = if s > 0.0 { 4 } else { 6 };
-        b.add_box(Vec3::new(s * 0.305, 1.45, 0.0), Vec3::new(0.125, 0.045, 0.045), upper);
-        b.add_box(Vec3::new(s * 0.555, 1.45, 0.0), Vec3::new(0.125, 0.04, 0.04), lower);
+        box_(Vec3::new(s * 0.305, 1.45, 0.0), Vec3::new(0.125, 0.045, 0.045), upper);
+        box_(Vec3::new(s * 0.555, 1.45, 0.0), Vec3::new(0.125, 0.04, 0.04), lower);
         // Thigh + shin + foot.
         let uleg = if s > 0.0 { 7 } else { 9 };
         let lleg = if s > 0.0 { 8 } else { 10 };
-        b.add_box(Vec3::new(s * 0.09, 0.70, 0.0), Vec3::new(0.055, 0.20, 0.055), uleg);
-        b.add_box(Vec3::new(s * 0.09, 0.275, 0.0), Vec3::new(0.05, 0.225, 0.05), lleg);
-        b.add_box(Vec3::new(s * 0.09, 0.03, 0.05), Vec3::new(0.05, 0.03, 0.10), lleg);
+        box_(Vec3::new(s * 0.09, 0.70, 0.0), Vec3::new(0.055, 0.20, 0.055), uleg);
+        box_(Vec3::new(s * 0.09, 0.275, 0.0), Vec3::new(0.05, 0.225, 0.05), lleg);
+        box_(Vec3::new(s * 0.09, 0.03, 0.05), Vec3::new(0.05, 0.03, 0.10), lleg);
     }
 
-    finish_model(b, BuiltinActor::Humanoid)
+    finish_model(b, actor)
+}
+
+/// The adult humanoid — kept as the named entry point of the default actor.
+pub fn builtin_phantom_model() -> ModelData {
+    builtin_humanoid_model(BuiltinActor::Humanoid)
 }
 
 fn finish_model(b: MeshBuilder, actor: BuiltinActor) -> ModelData {
@@ -117,8 +149,8 @@ fn finish_model(b: MeshBuilder, actor: BuiltinActor) -> ModelData {
 
 /// Original box-built low-poly actors, requiring no external assets.
 pub fn builtin_actor_model(actor: BuiltinActor) -> ModelData {
-    if actor == BuiltinActor::Humanoid {
-        return builtin_phantom_model();
+    if actor.human_role().is_some() {
+        return builtin_humanoid_model(actor);
     }
     let definitions = actor_bones(actor);
     let mut global: Vec<Vec3> = Vec::new();
@@ -163,58 +195,41 @@ pub fn builtin_actor_model(actor: BuiltinActor) -> ModelData {
     finish_model(b, actor)
 }
 
-/// Arc screen: an arc with UV uniform along arc length.
-/// Orientation — `bg.bulge` (corrective A3a): `toward_camera` gives
-/// `z = (cos θ − 1)·R` (the middle is CLOSER to the viewer than `center` —
-/// a screen-as-backdrop); `away_from_camera` (default) — `z = (1 − cos θ)·R`, edges
-/// closer to the viewer, so the screen wraps around the scene. UV mode —
-/// `bg.fit` (A3c): `stretch` — the previous stretching over the whole arc;
-/// `cover`/`contain` preserve the panorama proportions from `image_aspect`
-/// (texture width/height; None — stretch).
-pub fn arc_screen_mesh(bg: &Background, segments: u32, image_aspect: Option<f32>) -> MeshData {
-    use phantom_core::project::{BackgroundFit, Bulge};
-    // UV span along each axis. Physical screen aspect = arc length / height.
+/// Flat backdrop screen: a rectangle `width × height` centered on `bg.center`,
+/// facing the camera side (+Z). UV mode — `bg.fit`: `stretch` — the picture is
+/// stretched over the whole screen; `cover`/`contain` preserve the panorama
+/// proportions from `image_aspect` (texture width/height; None — stretch).
+pub fn screen_mesh(bg: &Background, image_aspect: Option<f32>) -> MeshData {
+    use phantom_core::project::BackgroundFit;
+    // UV span along each axis. Physical screen aspect = width / height.
     let (u_span, v_span) = match (bg.fit, image_aspect.filter(|a| a.is_finite() && *a > 0.0)) {
         (BackgroundFit::Stretch, _) | (_, None) => (1.0, 1.0),
         (BackgroundFit::Cover, Some(ai)) => {
-            let screen = (bg.arc_radians * bg.radius) / bg.height;
+            let screen = bg.width / bg.height;
             (if ai > screen { screen / ai } else { 1.0 }, if ai > screen { 1.0 } else { ai / screen })
         }
         (BackgroundFit::Contain, Some(ai)) => {
             // Whole image visible: the UV span goes OUTSIDE [0,1] along the wide
             // axis (screen edges sample the texture's clamped edges).
-            let screen = (bg.arc_radians * bg.radius) / bg.height;
+            let screen = bg.width / bg.height;
             (if ai > screen { 1.0 } else { screen / ai }, if ai > screen { ai / screen } else { 1.0 })
         }
     };
-    let z_sign = match bg.bulge {
-        Bulge::TowardCamera => -1.0,
-        Bulge::AwayFromCamera => 1.0,
-    };
+    let half_w = bg.width * 0.5;
+    let half_h = bg.height * 0.5;
     let mut mesh = MeshData { positions: vec![], normals: vec![], uvs: vec![], indices: vec![] };
-    for i in 0..=segments {
-        let t = i as f32 / segments as f32;
-        let theta = (t - 0.5) * bg.arc_radians;
-        // Arc middle (θ = 0) sits at `center`; edges are offset by (1 − cos θ)·R
-        // with the sign of the bulge orientation.
-        let x = theta.sin() * bg.radius;
-        let z = z_sign * (1.0 - theta.cos()) * bg.radius;
-        let u = 0.5 + (t - 0.5) * u_span;
-        let base = mesh.positions.len() as u32;
-        for (y, v) in [(0.0f32, 1.0f32), (bg.height, 0.0f32)] {
-            mesh.positions
-                .push((bg.center + Vec3::new(x, y - bg.height * 0.5, z)).to_array());
-            // Normal points from the center of curvature toward the viewer (for
-            // away_from_camera — toward the center of curvature; the material is
-            // unlit and double-sided, so the normal is kept consistent with the orientation).
-            mesh.normals.push(Vec3::new(-z_sign * theta.sin(), 0.0, -z_sign * theta.cos()).to_array());
-            mesh.uvs.push([u, 0.5 + (v - 0.5) * v_span]);
-        }
-        if i > 0 {
-            let a = base - 2;
-            mesh.indices.extend_from_slice(&[a, base, a + 1, a + 1, base, base + 1]);
-        }
+    for (x, y, u, v) in [
+        (-half_w, -half_h, 0.5 - 0.5 * u_span, 0.5 + 0.5 * v_span),
+        (half_w, -half_h, 0.5 + 0.5 * u_span, 0.5 + 0.5 * v_span),
+        (half_w, half_h, 0.5 + 0.5 * u_span, 0.5 - 0.5 * v_span),
+        (-half_w, half_h, 0.5 - 0.5 * u_span, 0.5 - 0.5 * v_span),
+    ] {
+        mesh.positions.push((bg.center + Vec3::new(x, y, 0.0)).to_array());
+        mesh.normals.push([0.0, 0.0, 1.0]);
+        mesh.uvs.push([u, v]);
     }
+    // Counter-clockwise seen from +Z (the camera side).
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
     mesh
 }
 
@@ -223,7 +238,7 @@ mod actor_tests {
     use super::*;
     #[test]
     fn bundled_meshes_have_valid_weights_bind_matrices_and_geometry() {
-        for actor in [BuiltinActor::Humanoid, BuiltinActor::Wolf, BuiltinActor::Horse, BuiltinActor::Bird] {
+        for &actor in BuiltinActor::ALL {
             let model = builtin_actor_model(actor);
             let mesh = &model.mesh;
             let skin = model.skin.as_ref().unwrap();
@@ -256,8 +271,8 @@ mod actor_tests {
                 assert!(weights.iter().all(|&w| w.is_finite() && w >= 0.));
                 assert!((weights.iter().sum::<f32>() - 1.).abs() < 1e-5);
             }
-            for &action in actor.actions() {
-                let pose = phantom_core::rig::sample_actor_action(actor, action, 0.37).unwrap();
+            for &held in actor.poses() {
+                let pose = phantom_core::rig::sample_actor_pose(actor, held).unwrap();
                 let mut transforms: Vec<Mat4> = Vec::new();
                 for (i, b) in skin.bones.iter().enumerate() {
                     let local = Mat4::from_rotation_translation(pose.bones[i].rotation, pose.bones[i].translation);
@@ -276,49 +291,45 @@ mod actor_tests {
 #[cfg(test)]
 mod screen_tests {
     use super::*;
-    use phantom_core::project::{BackgroundFit, BackgroundSource, Bulge};
     use glam::Vec3;
+    use phantom_core::project::{BackgroundFit, BackgroundSource};
     use phantom_core::AssetId;
 
-    fn bg(bulge: Bulge, fit: BackgroundFit) -> Background {
+    fn bg(fit: BackgroundFit) -> Background {
         Background {
             image: BackgroundSource::Image(AssetId(1)),
-            arc_radians: 2.0,
-            radius: 6.0,
+            // 12 x 4 m at z = -5: a 3.0 screen aspect, the same numbers the arc
+            // screen had (2.0 rad * 6.0 m of arc length).
+            width: 12.0,
             height: 4.0,
             center: Vec3::new(0.0, 2.0, -5.0),
-            bulge,
             fit,
         }
     }
 
-    fn edge_center_z(mesh: &MeshData) -> (f32, f32) {
-        // Top edge: odd vertices; the arc middle is the middle segment.
-        let top: Vec<[f32; 3]> = mesh.positions.iter().skip(1).step_by(2).copied().collect();
-        let mid = top[top.len() / 2];
-        let edge = top[0];
-        (edge[2], mid[2])
-    }
-
-    /// Orientation pin (corrective A3a): must not change silently.
+    /// The screen is flat: four corners, one plane, the documented size.
     #[test]
-    fn bulge_orientation_is_pinned() {
-        let toward = arc_screen_mesh(&bg(Bulge::TowardCamera, BackgroundFit::Stretch), 16, None);
-        let (te, tm) = edge_center_z(&toward);
-        assert!(te < tm, "toward_camera: edges FARTHER than the middle (z={te} < {tm}) — screen-as-backdrop");
-
-        let away = arc_screen_mesh(&bg(Bulge::AwayFromCamera, BackgroundFit::Stretch), 16, None);
-        let (ae, am) = edge_center_z(&away);
-        assert!(ae > am, "away_from_camera: edges CLOSER than the middle (z={ae} > {am}) — screen wraps the scene");
-        // The middle of both orientations is exactly at center.z.
-        assert!((am - -5.0).abs() < 1e-5 && (tm - -5.0).abs() < 1e-5);
+    fn the_screen_is_a_flat_rectangle_of_the_documented_size() {
+        let mesh = screen_mesh(&bg(BackgroundFit::Stretch), None);
+        assert_eq!(mesh.positions.len(), 4);
+        assert_eq!(mesh.indices, vec![0, 1, 2, 0, 2, 3]);
+        // Every corner sits on the screen plane z = center.z — no curvature.
+        assert!(mesh.positions.iter().all(|p| (p[2] + 5.0).abs() < 1e-6), "{:?}", mesh.positions);
+        let xs: Vec<f32> = mesh.positions.iter().map(|p| p[0]).collect();
+        let ys: Vec<f32> = mesh.positions.iter().map(|p| p[1]).collect();
+        assert_eq!(xs.iter().cloned().fold(f32::INFINITY, f32::min), -6.0);
+        assert_eq!(xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max), 6.0);
+        assert_eq!(ys.iter().cloned().fold(f32::INFINITY, f32::min), 0.0);
+        assert_eq!(ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max), 4.0);
+        // All normals face the camera side (+Z).
+        assert!(mesh.normals.iter().all(|n| n[2] > 0.0 && n[0] == 0.0 && n[1] == 0.0));
     }
 
     #[test]
     fn fit_modes_shape_uv_spans() {
-        // Screen: arc length 12 m, height 4 m → aspect 3.0; panorama 16:9 ≈ 1.78.
+        // Screen aspect 3.0; panorama 16:9 ≈ 1.78.
         let image = Some(16.0 / 9.0);
-        let stretch = arc_screen_mesh(&bg(Bulge::AwayFromCamera, BackgroundFit::Stretch), 8, image);
+        let stretch = screen_mesh(&bg(BackgroundFit::Stretch), image);
         let us: Vec<f32> = stretch.uvs.iter().map(|uv| uv[0]).collect();
         assert_eq!(us.iter().cloned().fold(0. / 0., f32::min), 0.0);
         assert_eq!(us.iter().cloned().fold(0. / 0., f32::max), 1.0);
@@ -328,9 +339,10 @@ mod screen_tests {
 
         // cover: a 1.78 image on a 3.0 screen — top/bottom cropped (v span < 1),
         // the full range horizontally.
-        let cover = arc_screen_mesh(&bg(Bulge::AwayFromCamera, BackgroundFit::Cover), 8, image);
+        let cover = screen_mesh(&bg(BackgroundFit::Cover), image);
         let cu: Vec<f32> = cover.uvs.iter().map(|uv| uv[0]).collect();
         assert_eq!(cu.iter().cloned().fold(0. / 0., f32::min), 0.0);
+        assert_eq!(cu.iter().cloned().fold(0. / 0., f32::max), 1.0);
         let cv: Vec<f32> = cover.uvs.iter().map(|uv| uv[1]).collect();
         let vmin = cv.iter().cloned().fold(0. / 0., f32::min);
         let vmax = cv.iter().cloned().fold(0. / 0., f32::max);
@@ -340,7 +352,7 @@ mod screen_tests {
 
         // contain: whole image visible — u goes outside [0,1] (side bars, the image
         // is narrower than the screen). A wide image — top/bottom bars (v).
-        let contain = arc_screen_mesh(&bg(Bulge::AwayFromCamera, BackgroundFit::Contain), 8, image);
+        let contain = screen_mesh(&bg(BackgroundFit::Contain), image);
         let ku: Vec<f32> = contain.uvs.iter().map(|uv| uv[0]).collect();
         let kmin = ku.iter().cloned().fold(0. / 0., f32::min);
         let kmax = ku.iter().cloned().fold(0. / 0., f32::max);
@@ -348,13 +360,12 @@ mod screen_tests {
         let kv: Vec<f32> = contain.uvs.iter().map(|uv| uv[1]).collect();
         assert_eq!(kv.iter().cloned().fold(0. / 0., f32::min), 0.0);
         assert_eq!(kv.iter().cloned().fold(0. / 0., f32::max), 1.0);
-        let contain_w = arc_screen_mesh(&bg(Bulge::AwayFromCamera, BackgroundFit::Contain), 8, Some(4.0));
+        let contain_w = screen_mesh(&bg(BackgroundFit::Contain), Some(4.0));
         let wv: Vec<f32> = contain_w.uvs.iter().map(|uv| uv[1]).collect();
         assert!(wv.iter().cloned().fold(0. / 0., f32::min) < 0.0, "contain wide image: v < 0");
 
         // Wide 4:1 panorama on a 3.0 screen: cover crops the sides.
-        let wide = Some(4.0);
-        let cover_w = arc_screen_mesh(&bg(Bulge::AwayFromCamera, BackgroundFit::Cover), 8, wide);
+        let cover_w = screen_mesh(&bg(BackgroundFit::Cover), Some(4.0));
         let wu: Vec<f32> = cover_w.uvs.iter().map(|uv| uv[0]).collect();
         let wspan = 3.0f32 / 4.0;
         let wmin = wu.iter().cloned().fold(0. / 0., f32::min);

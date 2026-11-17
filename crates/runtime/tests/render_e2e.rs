@@ -14,7 +14,7 @@ fn build_project(dir: &std::path::Path) -> (Project, SceneId) {
     let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([20, 60, 140, 255]));
     img.save(dir.join("assets/bg.png")).unwrap();
     let asset = history
-        .apply(&mut project, Command::RegisterAsset { kind: AssetKind::Image, path: "assets/bg.png".into() })
+        .apply(&mut project, Command::RegisterAsset { kind: AssetKind::Image, path: "assets/bg.png".into(), bounds: None })
         .unwrap()
         .asset
         .unwrap();
@@ -28,7 +28,10 @@ fn build_project(dir: &std::path::Path) -> (Project, SceneId) {
             &mut project,
             Command::SetBackground {
                 scene,
-                background: Background { image: BackgroundSource::Image(asset), arc_radians: 2.0, radius: 6.0, height: 4.0, center: Vec3::new(0.0, 2.0, -5.0), bulge: Default::default(), fit: Default::default() },
+                // A deliberately small flat backdrop: it covers the middle of the
+                // frame but not the corners, which is what the alpha checks below
+                // pin (a screen fitted with background_fit would cover everything).
+                background: Background { image: BackgroundSource::Image(asset), width: 8.0, height: 4.0, center: Vec3::new(0.0, 2.0, -5.0), fit: Default::default() },
             },
         )
         .unwrap();
@@ -37,14 +40,14 @@ fn build_project(dir: &std::path::Path) -> (Project, SceneId) {
         .unwrap()
         .phantom
         .unwrap();
-    for (frame, x, action) in [(0, 0.0, Action::Idle), (48, 2.0, Action::Walk)] {
+    for (frame, x, pose) in [(0, 0.0, ActorPose::Stand), (48, 2.0, ActorPose::Sit)] {
         history
             .apply(
                 &mut project,
                 Command::SetMotionKey {
                     scene,
                     phantom,
-                    key: MotionKey { yaw: 0.0, frame, position: Vec3::new(x, 0.0, 0.0), action },
+                    key: MotionKey { yaw: 0.0, frame, position: Vec3::new(x, 0.0, 0.0), pose },
                 },
             )
             .unwrap();
@@ -78,7 +81,7 @@ fn scene_to_frames() {
     let (project, scene_id) = build_project(&dir);
     storage::save_project(&dir, &project).unwrap();
 
-    let opts = RenderOptions { width: 320, height: 180, on_twos: false };
+    let opts = RenderOptions { width: 320, height: 180 };
     let mut renderer = Renderer::new(320, 180).expect("GPU renderer");
     let scene = &project.scenes[&scene_id];
 
@@ -148,13 +151,13 @@ fn imported_obj_changes_pixels_from_empty_baseline() {
         .unwrap()
         .scene
         .unwrap();
-    let opts = RenderOptions { width: 320, height: 180, on_twos: false };
+    let opts = RenderOptions { width: 320, height: 180 };
     // One renderer: several Bevy App/GPU devices in one process are not
     // supported; a repeated render_still is covered by the separate D3.4 test.
 
     project.scenes.get_mut(&scene_id).unwrap().sky = Some([0.0, 0.0, 0.0]);
     let asset = history
-        .apply(&mut project, Command::RegisterAsset { kind: AssetKind::ModelObj, path: "assets/triangle/triangle.obj".into() })
+        .apply(&mut project, Command::RegisterAsset { kind: AssetKind::ModelObj, path: "assets/triangle/triangle.obj".into(), bounds: None })
         .unwrap()
         .asset
         .unwrap();
@@ -212,7 +215,7 @@ fn builtin_catalog_prop_renders_without_any_asset_file() {
         target: None, base_color: Some([1.0, 0.0, 1.0, 1.0]), metallic: None,
         roughness: None, emissive: None, opacity: None, unlit: Some(true),
     });
-    let opts = RenderOptions { width: 320, height: 180, on_twos: false };
+    let opts = RenderOptions { width: 320, height: 180 };
     let mut renderer = Renderer::new(opts.width, opts.height).expect("GPU renderer");
     let frame = renderer.render_frame(&project, &project.scenes[&scene_id], &dir, 0, &opts, None).unwrap();
     let magenta = frame.rgba.chunks_exact(4).filter(|p| p[0] > 120 && p[2] > 80 && p[1] < 80).count();

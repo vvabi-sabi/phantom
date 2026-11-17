@@ -75,7 +75,7 @@ pub fn render_film_preview(
         return Err(ExportError::EmptyFilm);
     }
     std::fs::create_dir_all(out_dir)?;
-    let opts = RenderOptions { width, height, on_twos: false };
+    let opts = RenderOptions { width, height };
     let mut renderer = Renderer::new(width, height)?;
     let picked: Vec<Frame> = (start..end).step_by(step).collect();
     for (done, film_frame) in picked.iter().enumerate() {
@@ -87,7 +87,7 @@ pub fn render_film_preview(
             .scenes
             .get(&clip.scene)
             .ok_or(crate::render::RenderError::GpuUnavailable(format!("scene {} not found", clip.scene)))?;
-        let frame = renderer.render_frame(project, scene, project_dir, scene_frame, &opts, clip.shot)?;
+        let frame = renderer.render_frame(project, scene, project_dir, scene_frame, &opts, clip.camera)?;
         frame.save_png(&out_dir.join(format!("film_{film_frame:06}.png")))?;
         progress(done as Frame + 1, picked.len() as Frame);
     }
@@ -204,7 +204,7 @@ pub fn export_film(
     let mut stdin = child.stdin.take().expect("stdin piped");
 
     let mut renderer = Renderer::new(opts.width, opts.height)?;
-    let render_opts = RenderOptions { width: opts.width, height: opts.height, on_twos: false };
+    let render_opts = RenderOptions { width: opts.width, height: opts.height };
     let mut result: Result<(), ExportError> = Ok(());
     for film_frame in start..end {
         if cancel.load(Ordering::Relaxed) {
@@ -218,7 +218,7 @@ pub fn export_film(
             .ok_or(crate::render::RenderError::GpuUnavailable(format!("scene {} not found", clip.scene)))?;
         // A clip-shot renders with its shot camera; audio maps through the scene
         // range in mix_film — there is no double mix.
-        let frame = renderer.render_frame(project, scene, project_dir, scene_frame, &render_opts, clip.shot)?;
+        let frame = renderer.render_frame(project, scene, project_dir, scene_frame, &render_opts, clip.camera)?;
         if let Err(e) = stdin.write_all(&frame.rgba) {
             result = Err(ExportError::Io(e));
             break;

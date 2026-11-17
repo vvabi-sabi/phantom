@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
-use glam::{Mat4, Quat, Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
@@ -21,12 +21,6 @@ pub enum ImportError {
     TooManyInfluences(usize),
     #[error("unsupported file extension: {0}")]
     UnknownExtension(String),
-    #[error("the file has no animation stacks")]
-    NoClip,
-    #[error("no rig bone name was found in the clip — the skeletons are incompatible")]
-    NoMatchingBones,
-    #[error("animation stack not found: {0}")]
-    NoSuchStack(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("not a model file: {0}")]
@@ -58,6 +52,36 @@ pub struct ModelData {
     /// Non-fatal import diagnostics (unsupported features and the like).
     #[serde(default)]
     pub diagnostics: Vec<String>,
+}
+
+impl ModelData {
+    /// Axis-aligned bounding box of the bind-pose mesh, meters, relative to the
+    /// model origin — the stage clamp needs the real size of an imported prop.
+    /// `None` when the mesh has no finite vertex at all.
+    pub fn bounds(&self) -> Option<phantom_core::ModelBounds> {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for p in &self.mesh.positions {
+            if !p.iter().all(|v| v.is_finite()) {
+                continue;
+            }
+            for i in 0..3 {
+                min[i] = min[i].min(p[i]);
+                max[i] = max[i].max(p[i]);
+            }
+        }
+        if !min[0].is_finite() || !max[0].is_finite() {
+            return None;
+        }
+        Some(phantom_core::ModelBounds { min, max })
+    }
+
+    /// Bounds of a model file. A file that does not parse gives `None` — the
+    /// import has already reported why, and the entity falls back to its
+    /// origin point instead of failing the whole import.
+    pub fn bounds_of(path: &Path) -> Option<phantom_core::ModelBounds> {
+        load_model(path, false).ok().and_then(|m| m.bounds())
+    }
 }
 
 /// PBR material of a mesh part (Bevy StandardMaterial metallic/roughness model).
@@ -108,144 +132,6 @@ pub struct MeshData {
     pub indices: Vec<u32>,
 }
 
-/// Animation clip: bone local transforms sampled at 24 fps.
-#[derive(Clone, Debug)]
-pub struct ClipData {
-    pub fps: f32,
-    pub frames: u32,
-    /// Bone names in `samples` order.
-    pub bones: Vec<String>,
-    /// samples[bone][frame] = (translation, rotation), local.
-    pub samples: Vec<Vec<(Vec3, Quat)>>,
-    /// How many rig names were found in the clip (compatibility diagnostics).
-    pub matched: usize,
-}
-
-/// Load an FBX animation stack as a clip. `stack` is the stack name;
-/// `None` — the longest one (legacy behavior).
-/// Compatibility is checked against the rig bone names after normalization;
-/// a complete mismatch is an error, not a silently motionless model.
-pub fn load_clip(path: &Path, rig_bones: &[String], stack_name: Option<&str>) -> Result<ClipData, ImportError> {
-    let scene = load_anim_scene(path)?;
-    let node_names: Vec<String> = scene.nodes.iter().map(|n| n.element.name.to_string()).collect();
-    // Direct name match: a track is a rig bone found in the file.
-    let pairs: Vec<(String, String)> = rig_bones.iter().filter(|b| node_names.contains(b)).map(|b| (b.clone(), b.clone())).collect();
-    sample_pairs(&scene, stack_name, pairs)
-}
-
-/// Load a clip with profile-based retargeting: source bones are located in the
-/// file by the profile's role patterns, and samples are carried over onto the
-/// target rig's bone names. `ClipData.bones` tracks are TARGET-rig names (the
-/// bone→track map in the render is built by the shared code).
-///
-/// Unmatched roles on either side are non-fatal diagnostics (the second result
-/// element); the clip plays the matched subset. Zero coverage is
-/// `NoMatchingBones`, as with direct name matching. Limitation: rotations and
-/// translations transfer directly (assuming matching bone orientation); there
-/// is no rest-pose or scale correction.
-pub fn load_clip_retarget(
-    path: &Path,
-    profile: phantom_core::RetargetProfile,
-    target_bones: &[String],
-    stack_name: Option<&str>,
-) -> Result<(ClipData, Vec<String>), ImportError> {
-    let scene = load_anim_scene(path)?;
-    let node_names: Vec<String> = scene.nodes.iter().map(|n| n.element.name.to_string()).collect();
-    let map = phantom_core::retarget::build_map(profile, &node_names, target_bones);
-    if map.matched() == 0 {
-        return Err(ImportError::NoMatchingBones);
-    }
-    let pairs: Vec<(String, String)> = map
-        .mapped
-        .iter()
-        .map(|m| (node_names[m.source].clone(), target_bones[m.target].clone()))
-        .collect();
-    let clip = sample_pairs(&scene, stack_name, pairs)?;
-    Ok((clip, map.diagnostics()))
-}
-
-/// FBX scene for reading animation (no geometry, with axis/unit normalization).
-fn load_anim_scene(path: &Path) -> Result<ufbx::SceneRoot, ImportError> {
-    let opts = ufbx::LoadOpts {
-        target_axes: ufbx::CoordinateAxes::right_handed_y_up(),
-        target_unit_meters: 1.0,
-        space_conversion: ufbx::SpaceConversion::AdjustTransforms,
-        ignore_geometry: true,
-        ..Default::default()
-    };
-    ufbx::load_file(&path.to_string_lossy(), opts).map_err(|e| ImportError::Ufbx(format!("{e:?}")))
-}
-
-/// Sample the (file node name, clip track name) pairs at 24 fps.
-/// Stack order: the stack is picked before the coverage check (as in the legacy path).
-fn sample_pairs(
-    scene: &ufbx::Scene,
-    stack_name: Option<&str>,
-    pairs: Vec<(String, String)>,
-) -> Result<ClipData, ImportError> {
-    let stack = match stack_name {
-        Some(name) => scene
-            .anim_stacks
-            .iter()
-            .find(|s| s.element.name.as_ref() == name)
-            .ok_or_else(|| ImportError::NoSuchStack(name.to_string())),
-        None => scene
-            .anim_stacks
-            .iter()
-            .max_by(|a, b| (a.time_end - a.time_begin).partial_cmp(&(b.time_end - b.time_begin)).unwrap_or(std::cmp::Ordering::Equal))
-            .ok_or(ImportError::NoClip),
-    }?;
-    let stack = stack;
-    const FPS: f32 = 24.0;
-    let duration = (stack.time_end - stack.time_begin) as f32;
-    let frames = (duration * FPS).ceil().max(1.0) as u32;
-
-    // Source node name → node; the track is stored under the output name.
-    let mut matched = 0;
-    let mut bones = Vec::new();
-    let mut samples = Vec::new();
-    for (source_name, track_name) in pairs {
-        let node = scene.nodes.iter().find(|n| n.element.name.as_ref() == source_name.as_str());
-        let Some(node) = node else { continue };
-        matched += 1;
-        bones.push(track_name);
-        let mut track = Vec::with_capacity(frames as usize);
-        for f in 0..frames {
-            let t = stack.time_begin + f as f64 / FPS as f64;
-            let tr = node.evaluate_transform(&stack.anim, t);
-            track.push((v3(tr.translation), q4v(tr.rotation)));
-        }
-        samples.push(track);
-    }
-    if matched == 0 {
-        return Err(ImportError::NoMatchingBones);
-    }
-    Ok(ClipData { fps: FPS, frames, bones, samples, matched })
-}
-
-/// Cheap listing of FBX animation stacks: name and duration in seconds.
-/// For MCP `clip_list` / picking a stack by name; no sampling is done.
-pub fn list_stacks(path: &Path) -> Result<Vec<StackInfo>, ImportError> {
-    let opts = ufbx::LoadOpts { ignore_geometry: true, ..Default::default() };
-    let scene = ufbx::load_file(&path.to_string_lossy(), opts)
-        .map_err(|e| ImportError::Ufbx(format!("{e:?}")))?;
-    Ok(scene
-        .anim_stacks
-        .iter()
-        .map(|s| StackInfo { name: s.element.name.to_string(), duration_secs: (s.time_end - s.time_begin) as f32 })
-        .collect())
-}
-
-/// Description of an FBX animation stack.
-#[derive(Clone, Debug)]
-pub struct StackInfo {
-    pub name: String,
-    pub duration_secs: f32,
-}
-
-fn q4v(q: ufbx::Quat) -> Quat {
-    Quat::from_xyzw(q.x as f32, q.y as f32, q.z as f32, q.w as f32)
-}
 
 #[derive(Default)]
 struct SkinBuild {
@@ -284,8 +170,7 @@ pub struct SkinData {
 
 /// Load an OBJ or FBX. For FBX with `require_skin`, check that a skeleton exists.
 /// glTF/glb is deliberately rejected: the current ufbx decoder cannot read it.
-pub fn load_model(path: &Path, require_skin: bool) -> Result<ModelData, ImportError> {
-    let ext = path
+pub fn load_model(path: &Path, require_skin: bool) -> Result<ModelData, ImportError> {    let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
@@ -668,6 +553,10 @@ pub struct BundleImport {
     pub dependencies: Vec<PathBuf>,
     /// Non-fatal diagnostics (skipped/unsupported dependencies).
     pub diagnostics: Vec<String>,
+    /// Bounding box of the imported model, meters, in the model's own frame.
+    /// `None` — the file could not be parsed as a mesh (the renderer will say
+    /// why); such an entity is clamped by its origin point.
+    pub bounds: Option<phantom_core::ModelBounds>,
 }
 
 /// Maximum number of dependency files in a bundle.
@@ -726,7 +615,7 @@ pub fn import_model_bundle(project_dir: &Path, source: &Path) -> Result<BundleIm
 }
 
 fn import_bundle_inner(
-    _project_dir: &Path,
+    project_dir: &Path,
     source_abs: &Path,
     source_root: &Path,
     file_name: &std::ffi::OsStr,
@@ -852,7 +741,8 @@ fn import_bundle_inner(
         }
     }
 
-    Ok(BundleImport { model: model_rel, dependencies, diagnostics })
+    let bounds = ModelData::bounds_of(&project_dir.join(&model_rel));
+    Ok(BundleImport { model: model_rel, dependencies, diagnostics, bounds })
 }
 
 /// Check the texture dimensions; an unreadable format is a diagnostic and a

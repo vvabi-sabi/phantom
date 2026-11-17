@@ -3,8 +3,7 @@
 
 use bevy::prelude::*;
 use glam::{Quat, Vec3};
-use phantom_core::{Action, Attachment, BuiltinActor, Camera as _, FrameRange, MotionKey, ObjectId, Phantom, PhantomId, Project, RigRef, Scene, SceneFloor as _, SceneLighting, SceneObject, AssetId, SceneId, evaluate};
-use phantom_core::Camera as CoreCamera;
+use phantom_core::{ActorPose, Attachment, BuiltinActor, FrameRange, MotionKey, ObjectId, Phantom, PhantomId, Project, RigRef, Scene, SceneObject, AssetId, SceneId, evaluate};
 use phantom_runtime::render::{apply_scene_frame, forge_scene};
 
 fn test_world() -> World {
@@ -15,33 +14,13 @@ fn test_world() -> World {
     world.insert_resource(Assets::<phantom_runtime::render::outline::OutlineMaterial>::default());
     world.insert_resource(phantom_runtime::render::DrawCache::default());
     world.insert_resource(phantom_runtime::render::SceneCache::default());
-    world.insert_resource(phantom_runtime::render::ClipCache::default());
     world.insert_resource(phantom_runtime::render::VideoCache::default());
     world.insert_resource(Assets::<bevy::mesh::skinning::SkinnedMeshInverseBindposes>::default());
     world
 }
 
 fn scene_with_phantom() -> Scene {
-    let mut scene = Scene {
-        id: SceneId(1),
-        name: "s".into(),
-        range: FrameRange::new(0, 48).unwrap(),
-        background: None,
-        camera: CoreCamera::default(),
-        phantoms: Default::default(),
-        layers_2d: vec![],
-        audio_tracks: vec![],
-        lighting: SceneLighting::default(),
-        floor: None,
-        objects: Default::default(),
-        shots: Default::default(),
-        lights: vec![],
-        ambient: Default::default(),
-        sky: None,
-        grade: None,
-        fog: None,
-        vfx: vec![],
-    };
+    let mut scene = Scene::new(SceneId(1), "s", FrameRange::new(0, 48).unwrap());
     scene.lighting.key.enabled = false;
     scene.lighting.fill.enabled = false;
     scene.lighting.rim.enabled = false;
@@ -49,17 +28,13 @@ fn scene_with_phantom() -> Scene {
         id: PhantomId(2),
         name: "hero".into(),
         rig: RigRef::BuiltinActor { actor: BuiltinActor::Humanoid },
-        motion: vec![MotionKey { frame: 0, position: Vec3::new(1.0, 0.0, -2.0), action: Action::Idle, yaw: 0.0 }],
-        clip: None,
-        clip_track: vec![],
-        takes: vec![],
-        active_take: None,
+        motion: vec![MotionKey { frame: 0, position: Vec3::new(1.0, 0.0, -2.0), pose: ActorPose::Stand, yaw: 0.0 }],
         outline_px: 2.0,
         scale: 1.0,
         material_patches: vec![],
     };
     // Frame 24: the actor moved ahead — the attachment must follow.
-    p.motion.push(MotionKey { frame: 24, position: Vec3::new(3.0, 0.0, -2.0), action: Action::Idle, yaw: 0.0 });
+    p.motion.push(MotionKey { frame: 24, position: Vec3::new(3.0, 0.0, -2.0), pose: ActorPose::Stand, yaw: 0.0 });
     scene.phantoms.insert(p.id, p);
     scene
 }
@@ -85,6 +60,7 @@ fn attached_object_follows_bone_across_frames() {
                 offset_roll: 0.0,
             }),
             material_patches: vec![],
+        scatter: None,
         },
     );
     let project = Project::new("t");
@@ -99,8 +75,8 @@ fn attached_object_follows_bone_across_frames() {
 
     let expect = |frame: i64| {
         let phantom = &scene.phantoms[&PhantomId(2)];
-        let state = evaluate(phantom, &scene.range, frame, false);
-        let locals: Vec<(Vec3, Quat)> = state.pose.bones.iter().map(|b| (b.translation, b.rotation)).collect();
+        let state = evaluate(phantom, frame);
+        let locals: Vec<(Vec3, Quat)> = state.skeleton.bones.iter().map(|b| (b.translation, b.rotation)).collect();
         let defs = phantom_core::rig::actor_bones(BuiltinActor::Humanoid);
         let parents: Vec<Option<usize>> = defs.iter().map(|b| b.parent).collect();
         let world_bones = phantom_core::rig::accumulate_bones(&parents, &locals);
@@ -110,10 +86,10 @@ fn attached_object_follows_bone_across_frames() {
         (state.root + root_q * bt) + (root_q * br) * Vec3::new(0.0, -0.1, 0.0)
     };
 
-    apply_scene_frame(&mut world, &scene, &forge, 0, false, None, false, None);
+    apply_scene_frame(&mut world, &Project::new("t"), &scene, &forge, 0, false, None);
     let t0 = world.get::<Transform>(probe).unwrap().translation;
     assert!((t0 - expect(0)).length() < 1e-4, "frame 0: {t0} != {}", expect(0));
-    apply_scene_frame(&mut world, &scene, &forge, 24, false, None, false, None);
+    apply_scene_frame(&mut world, &Project::new("t"), &scene, &forge, 24, false, None);
     let t24 = world.get::<Transform>(probe).unwrap().translation;
     assert!((t24 - expect(24)).length() < 1e-4, "the attachment follows the actor");
     // The actor moved +2 along x; idle bone sway adds centimeters on top.
@@ -131,7 +107,7 @@ fn phantom_scale_lands_on_root() {
     let project = Project::new("t");
     let target = Handle::<Image>::default();
     let forge = forge_scene(&mut world, &project, &scene, std::path::Path::new("."), &target).unwrap();
-    apply_scene_frame(&mut world, &scene, &forge, 0, false, None, false, None);
+    apply_scene_frame(&mut world, &Project::new("t"), &scene, &forge, 0, false, None);
     let root = forge.phantoms[&PhantomId(2)].root;
     assert_eq!(world.get::<Transform>(root).unwrap().scale, Vec3::splat(2.0));
 }

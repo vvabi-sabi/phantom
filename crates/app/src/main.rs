@@ -51,7 +51,7 @@ enum Cmd {
     Import {
         project: PathBuf,
         files: Vec<PathBuf>,
-        /// Explicit asset kind: model-obj|model-fbx|motion-fbx|image|audio|video
+        /// Explicit asset kind: model-obj|model-fbx|image|audio|video
         /// (by default taken from the file extension; with bundle import it applies
         /// to every file).
         #[arg(long)]
@@ -60,11 +60,10 @@ enum Cmd {
     /// Version, build features and limits (D8) — machine-readable analog of
     /// MCP studio_capabilities for the CLI user.
     Capabilities,
-    /// Set the background on the arc screen.
-    /// The default geometry (arc 2.0, radius 6, height 4) covers the frame only
-    /// for focal < ~28 mm; MCP background_fit computes the needed arc, and the
-    /// rule is: horizontal coverage ≈ 2·asin(sin(arc/2)·R/dist) rad must exceed
-    /// the camera's hfov (hfov = 2·atan(18/focal·(9/16)) at 16:9).
+    /// Set the background on the flat screen (a rectangle facing the camera
+    /// side through `center`). The default 24×8 m stands at z = −5 and covers
+    /// the frame for the default camera; MCP background_fit computes the width
+    /// and height that close the frame from the cameras actually used.
     SetBackground {
         project: PathBuf,
         #[arg(long)]
@@ -74,18 +73,15 @@ enum Cmd {
         /// Background is a video (image by default).
         #[arg(long)]
         video: bool,
-        #[arg(long, default_value_t = 2.0)]
-        arc: f32,
-        #[arg(long, default_value_t = 6.0)]
-        radius: f32,
-        #[arg(long, default_value_t = 4.0)]
+        /// Screen width in meters.
+        #[arg(long, default_value_t = 24.0)]
+        width: f32,
+        /// Screen height in meters.
+        #[arg(long, default_value_t = 8.0)]
         height: f32,
-        #[arg(long, default_value = "0,2,-5")]
+        /// Screen center "x,y,z" in meters; the screen faces +Z.
+        #[arg(long, default_value = "0,4,-5")]
         center: String,
-        /// Arc orientation: away_from_camera (screen wraps around the scene, default)
-        /// or toward_camera (flat backdrop, pre-A3 behavior).
-        #[arg(long, default_value = "away_from_camera")]
-        bulge: String,
         /// Panorama UV mode: cover (cropped, default), contain (whole
         /// picture, clamp bands), stretch (stretched, pre-A3 behavior).
         #[arg(long, default_value = "cover")]
@@ -116,9 +112,9 @@ enum Cmd {
         /// Root yaw about +Y in radians (zero faces +Z).
         #[arg(long, default_value_t = 0.0)]
         yaw: f32,
-        /// Action from the actor catalog (idle|walk|jump|sit|lie|sneak|trot|gallop|fly|perch).
-        #[arg(long, default_value = "idle")]
-        action: String,
+        /// Held pose (stand|sit|lie); a species that cannot hold it is an error.
+        #[arg(long, default_value = "stand")]
+        pose: String,
     },
     /// Simple prop catalog: names, metric dimensions, origin,
     /// material groups (K1). Without --query prints the whole section.
@@ -131,6 +127,8 @@ enum Cmd {
         query: Option<String>,
     },
     /// Place a catalog item (K1): the mesh is built procedurally, no file needed.
+    /// A furnished room (a room_dining-like entry) arrives as one package: the
+    /// shell plus every piece of its furniture as its own object, one undo step.
     PropAdd {
         project: PathBuf,
         #[arg(long)]
@@ -146,6 +144,115 @@ enum Cmd {
         /// Scale "sx,sy,sz".
         #[arg(long, default_value = "1,1,1")]
         scale: String,
+    },
+    /// Fill an area or a line from a preset in one atomic step (one undo):
+    /// forest, grove, undergrowth, hedge, street_row, pole_row. Inside
+    /// --action the fill places movable props; the ring beyond it becomes one
+    /// band object whose mesh replays the same seed.
+    Scatter {
+        project: PathBuf,
+        #[arg(long)]
+        scene: u64,
+        /// Fill preset: forest | grove | undergrowth | hedge | street_row | pole_row.
+        preset: String,
+        /// World rectangle "x0,z0,x1,z1" (or "x0,z0:x1,z1") in meters.
+        #[arg(long)]
+        area: Option<String>,
+        /// Object id of a ground plate (street_yard/street_park/street_crossing).
+        #[arg(long)]
+        plate: Option<u64>,
+        /// Keep this margin (m) clear of the plate edge.
+        #[arg(long)]
+        inset: Option<f32>,
+        /// The zone the scene is shot in (editable props): "x0,z0,x1,z1".
+        #[arg(long)]
+        action: Option<String>,
+        /// Props per square meter; the preset's own default by default.
+        #[arg(long)]
+        density: Option<f32>,
+        /// Line presets: segment endpoints "x,z".
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        step: Option<f32>,
+        /// Determinism seed; a random one is drawn and printed when omitted.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Name prefix; without it — the scene name.
+        #[arg(long)]
+        prefix: Option<String>,
+    },
+    /// Place a grid of catalog props in one atomic step (one undo): rows along
+    /// +Z, cols along +X. The step defaults to the prop's own size times --gap.
+    PropGrid {
+        project: PathBuf,
+        #[arg(long)]
+        scene: u64,
+        /// Catalog entry name: chair, stool, box, room_kitchen, ...
+        prop: String,
+        #[arg(long, default_value_t = 1)]
+        rows: u32,
+        #[arg(long, default_value_t = 1)]
+        cols: u32,
+        /// Position of the first object "x,y,z" in meters.
+        #[arg(long, default_value = "0,0,0")]
+        origin: String,
+        /// Explicit spacing "dx,dz" in meters; without it — the prop's size times --gap.
+        #[arg(long)]
+        step: Option<String>,
+        #[arg(long, default_value_t = 1.2)]
+        gap: f32,
+        /// Name prefix; without it — the prop name.
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long, default_value_t = 0.0)]
+        yaw: f32,
+        /// Scale "sx,sy,sz".
+        #[arg(long, default_value = "1,1,1")]
+        scale: String,
+    },
+    /// Review sheet: several views of the staging, or a strip of frames, tiled
+    /// into one PNG. Requires a GPU.
+    Look {
+        project: PathBuf,
+        #[arg(long)]
+        scene: u64,
+        /// angles (default) | frames.
+        #[arg(long, default_value = "angles")]
+        mode: String,
+        /// Where to write the sheet PNG.
+        #[arg(long, default_value = "look.png")]
+        out: PathBuf,
+        /// Actor/object names to frame (repeatable), or phantom:<id>/object:<id>.
+        #[arg(long = "target")]
+        targets: Vec<String>,
+        /// angles: view names (repeatable): front|back|left|right|top|three_quarter.
+        #[arg(long = "view")]
+        views: Vec<String>,
+        /// Metres from the target to the eye; without it — auto-framed.
+        #[arg(long)]
+        distance: Option<f32>,
+        /// angles: the frame to review.
+        #[arg(long)]
+        frame: Option<i64>,
+        /// frames: camera whose lens and pose to use (id); the active camera by default.
+        #[arg(long)]
+        camera: Option<u64>,
+        /// frames: explicit comma-separated frames.
+        #[arg(long)]
+        frames: Option<String>,
+        /// frames: every Nth frame of the range.
+        #[arg(long)]
+        every: Option<u32>,
+        /// frames: how many evenly spaced frames (default 5, max 12).
+        #[arg(long)]
+        count: Option<u32>,
+        #[arg(long, default_value_t = 480)]
+        width: u32,
+        #[arg(long, default_value_t = 270)]
+        height: u32,
     },
     /// Add a static object (prop) from a model asset (ModelObj/ModelFbx).
     AddObject {
@@ -179,11 +286,14 @@ enum Cmd {
         #[arg(long, default_value = "1,1,1")]
         scale: String,
     },
-    /// Configure the camera (one static key).
+    /// Configure a camera key at frame 0 (the scene's active camera by default).
     SetCamera {
         project: PathBuf,
         #[arg(long)]
         scene: u64,
+        /// Camera id to key; the scene's active camera by default.
+        #[arg(long)]
+        camera: Option<u64>,
         #[arg(long, default_value = "0,1.4,4")]
         pos: String,
         #[arg(long, default_value_t = 0.0)]
@@ -202,6 +312,61 @@ enum Cmd {
         /// Smoothing toward the next key: linear|ease_in|ease_out|ease_in_out.
         #[arg(long, default_value = "linear")]
         ease: String,
+    },
+    /// Add a named camera (it becomes the scene's active camera). Without
+    /// --frames the camera covers the whole scene. Alias: add-camera.
+    #[command(visible_alias = "add-camera")]
+    CameraAdd {
+        project: PathBuf,
+        #[arg(long)]
+        scene: u64,
+        /// Camera name; "Camera N" by default.
+        #[arg(long)]
+        name: Option<String>,
+        /// Frame range "start-end" (half-open); the whole scene by default.
+        #[arg(long)]
+        frames: Option<String>,
+    },
+    /// Remove a camera; film clips onto it go away in the same step. Camera 0
+    /// cannot be removed.
+    CameraRemove {
+        project: PathBuf,
+        #[arg(long)]
+        scene: u64,
+        /// Camera id to remove.
+        #[arg(long)]
+        camera: u64,
+    },
+    /// Pick the scene's active camera (the viewport's and a render's default).
+    CameraSelect {
+        project: PathBuf,
+        #[arg(long)]
+        scene: u64,
+        /// Camera id to activate.
+        #[arg(long)]
+        camera: u64,
+    },
+    /// Attach a camera to a subject: track (stand and turn to it) or follow
+    /// (travel and turn with it). Without --subject the target is cleared.
+    CameraTarget {
+        project: PathBuf,
+        #[arg(long)]
+        scene: u64,
+        /// Camera id; the scene's active camera by default.
+        #[arg(long)]
+        camera: Option<u64>,
+        /// track (stand and turn) | follow (travel with the subject).
+        #[arg(long)]
+        mode: Option<String>,
+        /// Subject "phantom:<id>" or "object:<id>".
+        #[arg(long)]
+        subject: Option<String>,
+    },
+    /// List the scene's cameras; the active one is marked with "*".
+    CameraList {
+        project: PathBuf,
+        #[arg(long)]
+        scene: u64,
     },
     /// Configure the scene's stage lighting (key/fill/rim).
     SetLighting {
@@ -228,6 +393,30 @@ enum Cmd {
         #[arg(long)]
         off: bool,
     },
+    /// Set the scene stage (layout mode): the box actors and props are confined
+    /// to. Anything already staged that no longer fits is clamped in the same
+    /// step and reported.
+    SetStage {
+        project: PathBuf,
+        #[arg(long)]
+        scene: u64,
+        /// Stage preset: small (10x10x4 m) | medium (30x20x8) | large (80x60x20).
+        #[arg(long)]
+        preset: Option<String>,
+        /// Explicit size "width x depth x height" in meters, e.g. 12x8x4
+        /// (with a preset it overrides those axes).
+        #[arg(long)]
+        size: Option<String>,
+        /// Center of the box on the floor plane "x,z"; the current center by default.
+        #[arg(long)]
+        center: Option<String>,
+    },
+    /// Print the scene stage.
+    Stage {
+        project: PathBuf,
+        #[arg(long)]
+        scene: u64,
+    },
     /// Render the film to MP4 (H.264 + AAC 48 kHz stereo audio when the
     /// project has audio tracks; without tracks — silent).
     RenderFilm {
@@ -250,7 +439,7 @@ enum Cmd {
         #[arg(long, default_value_t = -1.0)]
         target_peak_db: f32,
         /// Contact sheet (K0.4): instead of MP4 — a PNG of every --every-th film
-        /// frame into the --out directory (shot camera, as in export).
+        /// frame into the --out directory (camera, as in export).
         #[arg(long)]
         preview: bool,
         /// Frame step for --preview (6 by default).
@@ -292,37 +481,18 @@ enum Cmd {
         #[arg(long)]
         fade_out_secs: Option<f64>,
     },
-    /// Add a clip to the film (at the end): a scene range or a shot (--shot;
-    /// without --frames the shot range is used).
-    FilmAdd { project: PathBuf, #[arg(long)] scene: u64, #[arg(long)] frames: Option<String>, #[arg(long)] shot: Option<u64> },
-    /// Assign a motion clip to an imported rig. Without --frames —
-    /// legacy (longest stack, looped over the whole scene); with --frames
-    /// "start,end" — add a use to the clip track.
-    SetClip {
+    /// Add a clip to the film (at the end): a scene range or a camera clip
+    /// (--camera; without --frames the camera's range is used).
+    FilmAdd {
         project: PathBuf,
         #[arg(long)]
         scene: u64,
-        #[arg(long)]
-        phantom: u64,
-        #[arg(long)]
-        asset: u64,
+        /// Frame range "start-end" (half-open); the camera's range by default.
         #[arg(long)]
         frames: Option<String>,
+        /// Camera whose range and lens the clip uses.
         #[arg(long)]
-        stack: Option<String>,
-        #[arg(long, default_value_t = 1.0)]
-        speed: f32,
-        #[arg(long, default_value_t = 0.0)]
-        blend_in: f32,
-        #[arg(long, default_value_t = 0.0)]
-        blend_out: f32,
-        /// Clip's root motion instead of the controller.
-        #[arg(long, default_value_t = false)]
-        root_motion_clip: bool,
-        /// Retargeting profile (humanoid|quadruped); without it — direct
-        /// bone-name matching. Only together with --frames.
-        #[arg(long)]
-        retarget: Option<String>,
+        camera: Option<u64>,
     },
     /// Add an audio track to a scene (or to the film without --scene).
     TrackAdd { project: PathBuf, name: String, #[arg(long)] scene: Option<u64> },
@@ -362,20 +532,17 @@ enum Cmd {
         scene: u64,
         #[arg(long)]
         out: PathBuf,
-        /// Scene shot: its camera and range (if --frames is not given).
+        /// Camera to render with (id); the scene's active camera by default.
         #[arg(long)]
-        shot: Option<u64>,
+        camera: Option<u64>,
         /// Frame range "start-end" (upper bound EXCLUSIVE:
-        /// 0-1 — frame 0 only); by default the whole scene (or shot).
+        /// 0-1 — frame 0 only); by default the whole scene (or camera).
         #[arg(long)]
         frames: Option<String>,
         #[arg(long, default_value_t = 1280)]
         width: u32,
         #[arg(long, default_value_t = 720)]
         height: u32,
-        /// "On twos" mode for the Phantom pose.
-        #[arg(long)]
-        twos: bool,
         /// Cheap contact sheet (B7): every --every-th frame at 480x270,
         /// when the size is not given explicitly.
         #[arg(long)]
@@ -420,7 +587,6 @@ fn main() -> Result<()> {
             let forced_kind = match kind.as_deref() {
                 Some("model-obj") => Some(AssetKind::ModelObj),
                 Some("model-fbx") => Some(AssetKind::ModelFbx),
-                Some("motion-fbx") => Some(AssetKind::MotionFbx),
                 Some("image") => Some(AssetKind::Image),
                 Some("audio") => Some(AssetKind::Audio),
                 Some("video") => Some(AssetKind::Video),
@@ -455,18 +621,17 @@ fn main() -> Result<()> {
                 };
                 let result = (|| -> Result<()> {
                     // Models — bundle import with MTL and textures inside the project;
-                    // kind only affects registration: motion-fbx is the same fbx bundle.
-                    let rel = if matches!(kind, AssetKind::ModelObj | AssetKind::ModelFbx | AssetKind::MotionFbx) {
+                    let (rel, bounds) = if matches!(kind, AssetKind::ModelObj | AssetKind::ModelFbx) {
                         let bundle = phantom_runtime::import::import_model_bundle(&project, file)?;
                         for d in &bundle.diagnostics {
                             eprintln!("import: {d}");
                         }
-                        bundle.model
+                        (bundle.model, bundle.bounds)
                     } else {
-                        storage::import_file(&project, file)?
+                        (storage::import_file(&project, file)?, None)
                     };
                     with_project(&project, |p, h| {
-                        h.apply(p, Command::RegisterAsset { kind, path: rel.clone() })
+                        h.apply(p, Command::RegisterAsset { kind, path: rel.clone(), bounds })
                             .map(|o| println!("asset {} {}", o.asset.unwrap(), rel.display()))
                             .map_err(anyhow::Error::from)
                     })?;
@@ -481,12 +646,7 @@ fn main() -> Result<()> {
                 bail!("import: {failed}/{} files not imported", files.len());
             }
         }
-        Cmd::SetBackground { project, scene, asset, video, arc, radius, height, center, bulge, fit } => {
-            let bulge = match bulge.as_str() {
-                "away_from_camera" => phantom_core::project::Bulge::AwayFromCamera,
-                "toward_camera" => phantom_core::project::Bulge::TowardCamera,
-                other => anyhow::bail!("bulge: away_from_camera|toward_camera, got {other}"),
-            };
+        Cmd::SetBackground { project, scene, asset, video, width, height, center, fit } => {
             let fit = match fit.as_str() {
                 "cover" => phantom_core::project::BackgroundFit::Cover,
                 "contain" => phantom_core::project::BackgroundFit::Contain,
@@ -500,11 +660,9 @@ fn main() -> Result<()> {
                         scene: SceneId(scene),
                         background: Background {
                             image: if video { BackgroundSource::Video { video: AssetId(asset) } } else { BackgroundSource::Image(AssetId(asset)) },
-                            arc_radians: arc,
-                            radius,
+                            width,
                             height,
                             center: parse_vec3(&center)?,
-                            bulge,
                             fit,
                         },
                     },
@@ -520,15 +678,15 @@ fn main() -> Result<()> {
                     .map_err(anyhow::Error::from)
             })?;
         }
-        Cmd::SetKey { project, scene, phantom, frame, pos, action, yaw } => {
-            let action = builtin::parse_action(&action).map_err(anyhow::Error::msg)?;
+        Cmd::SetKey { project, scene, phantom, frame, pos, pose, yaw } => {
+            let pose = builtin::parse_pose(&pose).map_err(anyhow::Error::msg)?;
             with_project(&project, |p, h| {
                 h.apply(
                     p,
                     Command::SetMotionKey {
                         scene: SceneId(scene),
                         phantom: PhantomId(phantom),
-                        key: MotionKey { yaw, frame, position: parse_vec3(&pos)?, action },
+                        key: MotionKey { yaw, frame, position: parse_vec3(&pos)?, pose },
                     },
                 )?;
                 Ok(())
@@ -540,6 +698,9 @@ fn main() -> Result<()> {
                 Some("primitive") => Some(phantom_core::catalog::CatalogKind::Primitive),
                 Some("furniture") => Some(phantom_core::catalog::CatalogKind::Furniture),
                 Some("interior") => Some(phantom_core::catalog::CatalogKind::Interior),
+                Some("animal") => Some(phantom_core::catalog::CatalogKind::Animal),
+                Some("street") => Some(phantom_core::catalog::CatalogKind::Street),
+                Some("exterior") => Some(phantom_core::catalog::CatalogKind::Exterior),
                 other => bail!("kind: primitive|furniture|interior, got {other:?}"),
             };
             let entries = phantom_core::catalog::catalog_query(kind, query.as_deref());
@@ -564,6 +725,169 @@ fn main() -> Result<()> {
                     .map_err(anyhow::Error::from)
             })?;
         }
+        Cmd::PropGrid { project, scene, prop, rows, cols, origin, step, gap, prefix, yaw, scale } => {
+            let origin = parse_vec3(&origin)?;
+            let step = match step {
+                Some(s) => {
+                    let v = parse_vec3(&s)?;
+                    Some([v.x, v.z])
+                }
+                None => None,
+            };
+            let scale = parse_vec3(&scale)?;
+            with_project(&project, |p, h| {
+                let entry = phantom_core::catalog::catalog_find(&prop)
+                    .ok_or_else(|| anyhow::anyhow!("unknown catalog entry: {prop} (see catalog)"))?;
+                if !entry.furniture.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "{prop} comes furnished — place it once with prop-add (it arrives as one package); a grid is for single props"
+                    ));
+                }
+                let [dx, dz] = step.unwrap_or([entry.size[0] * scale.x * gap, entry.size[2] * scale.z * gap]);
+                let base = prefix.clone().unwrap_or_else(|| prop.clone());
+                let mut commands = Vec::new();
+                for row in 0..rows {
+                    for col in 0..cols {
+                        let key = ObjectKey {
+                            frame: 0,
+                            position: glam::Vec3::new(
+                                origin.x + col as f32 * dx,
+                                origin.y,
+                                origin.z + row as f32 * dz,
+                            ),
+                            yaw: yaw.to_radians(),
+                            pitch: 0.0,
+                            roll: 0.0,
+                            scale,
+                        };
+                        commands.push(Command::AddBuiltinObject {
+                            scene: SceneId(scene),
+                            name: format!("{} {}", base.trim(), commands.len() + 1),
+                            prop: prop.clone(),
+                            key: Some(key),
+                        });
+                    }
+                }
+                let out = h.apply(p, Command::Batch(commands))?;
+                println!("grid {}x{} done", rows, cols);
+                for c in &out.clamped {
+                    println!("clamped object {} frame {}: {:?} -> {:?}", c.id, c.frame, c.from, c.to);
+                }
+                Ok(())
+            })?;
+        }
+        Cmd::Look { project, scene, mode, out, targets, views, distance, frame, camera, frames, every, count, width, height } => {
+            let frames = match frames {
+                Some(list) => Some(
+                    list.split(',')
+                        .map(|v| v.trim().parse::<i64>().context("--frames is a comma-separated list of frames"))
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+                None => None,
+            };
+            let views: Vec<crate::session::ViewSpec> = if views.is_empty() {
+                Vec::new()
+            } else {
+                views.into_iter().map(crate::session::ViewSpec::Name).collect()
+            };
+            let mut session = crate::session::Session::new();
+            session.project = Some(storage::load_project(&project)?);
+            session.dir = Some(project.clone());
+            let value = session.execute(crate::session::Op::Look {
+                scene,
+                mode: Some(mode),
+                target: if targets.is_empty() { None } else { Some(targets) },
+                views: Some(views),
+                distance,
+                frame,
+                camera,
+                frames,
+                every,
+                count,
+                view: None,
+                width: Some(width),
+                height: Some(height),
+            })?;
+            use base64::Engine as _;
+            let encoded = value["png_base64"].as_str().context("look returned no PNG")?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .context("look returned a broken PNG")?;
+            std::fs::write(&out, bytes).with_context(|| format!("writing {}", out.display()))?;
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "sheet": value["sheet"], "tiles": value["tiles"], "findings": value["findings"],
+            }))?);
+            println!("sheet -> {}", out.display());
+        }
+        Cmd::Scatter { project, scene, preset, area, plate, inset, action, density, from, to, step, seed, prefix } => {
+            // The same Session Op the MCP tool calls: one implementation of
+            // "what a fill is", so CLI and agent can never disagree.
+            // Corners may be separated from each other by ":" (reads as
+            // "from:to", which is how a rectangle is said out loud); within a
+            // corner it is a comma. Both spellings mean the same box.
+            let rect = |s: &Option<String>| -> Result<Option<[f32; 4]>> {
+                match s {
+                    None => Ok(None),
+                    Some(v) => {
+                        let flat = v.replace(':', ",");
+                        let n: Vec<f32> = flat
+                            .split(',')
+                            .filter(|x| !x.trim().is_empty())
+                            .map(|x| x.trim().parse::<f32>().with_context(|| format!("parsing \"{v}\"")))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        if n.len() != 4 {
+                            return Err(anyhow::anyhow!("expected \"x0,z0,x1,z1\" (or \"x0,z0:x1,z1\"), got \"{v}\""));
+                        }
+                        Ok(Some([n[0], n[1], n[2], n[3]]))
+                    }
+                }
+            };
+            // Exactly two numbers: padding with a dummy 0 and reading x/z would
+            // slide the caller's z into the y slot and silently place the row on
+            // the origin instead of where it was asked for.
+            let point = |s: &Option<String>| -> Result<Option<[f32; 2]>> {
+                match s {
+                    None => Ok(None),
+                    Some(v) => {
+                        let n: Vec<f32> = v
+                            .split(',')
+                            .map(|x| x.trim().parse::<f32>().with_context(|| format!("parsing \"{v}\"")))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        if n.len() != 2 {
+                            return Err(anyhow::anyhow!("expected \"x,z\", got \"{v}\""));
+                        }
+                        Ok(Some([n[0], n[1]]))
+                    }
+                }
+            };
+            let mut session = crate::session::Session::new();
+            session.project = Some(storage::load_project(&project)?);
+            session.dir = Some(project.clone());
+            let value = session.execute(crate::session::Op::Scatter {
+                scene,
+                preset,
+                area: rect(&area)?,
+                plate,
+                inset,
+                action: rect(&action)?,
+                density,
+                from: point(&from)?,
+                to: point(&to)?,
+                step,
+                seed,
+                prefix,
+            })?;
+            // A fill mutates the document, so it has to reach the disk like
+            // every other mutation command (unlike `look`, which only reads).
+            storage::save_project(&project, session.project.as_ref().expect("project was loaded"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "objects": value["objects"], "count": value["objects"].as_array().map(|v| v.len()).unwrap_or(0),
+                    "band": value["band"], "seed": value["seed"], "clamped": value["clamped"],
+                }))?
+            );
+        }
         Cmd::AddObject { project, scene, name, asset } => {
             with_project(&project, |p, h| {
                 h.apply(p, Command::AddObject { scene: SceneId(scene), name, asset: AssetId(asset) })
@@ -584,10 +908,11 @@ fn main() -> Result<()> {
                 Ok(())
             })?;
         }
-        Cmd::SetCamera { project, scene, pos, yaw, pitch, focal, roll, look_at, ease } => {
+        Cmd::SetCamera { project, scene, camera, pos, yaw, pitch, focal, roll, look_at, ease } => {
             let ease = parse_ease(&ease)?;
             let look_at = look_at.as_deref().map(parse_vec3).transpose()?;
             with_project(&project, |p, h| {
+                let camera = resolve_active_camera(p, SceneId(scene), camera)?;
                 let key = TransformKey {
                     frame: 0,
                     translation: parse_vec3(&pos)?,
@@ -598,16 +923,61 @@ fn main() -> Result<()> {
                     focal_mm: Some(focal),
                     ease,
                 };
-                h.apply(
-                    p,
-                    Command::SetCameraKeys {
-                        scene: SceneId(scene),
-                        keys: vec![key],
-                    },
-                )?;
-                h.apply(p, Command::SetCameraFocal { scene: SceneId(scene), focal_mm: focal })?;
+                h.apply(p, Command::SetCameraKey { scene: SceneId(scene), camera, key })?;
+                h.apply(p, Command::SetCameraLens { scene: SceneId(scene), camera, focal_mm: focal })?;
                 Ok(())
             })?;
+        }
+        Cmd::CameraAdd { project, scene, name, frames } => {
+            let range = frames.as_deref().map(parse_range).transpose()?;
+            with_project(&project, |p, h| {
+                let name = name.unwrap_or_else(|| {
+                    let n = p.scenes.get(&SceneId(scene)).map(|s| s.cameras.len() + 1).unwrap_or(1);
+                    format!("Camera {n}")
+                });
+                h.apply(p, Command::AddCamera { scene: SceneId(scene), name, range })
+                    .map(|o| println!("camera {}", o.camera.unwrap()))
+                    .map_err(anyhow::Error::from)
+            })?;
+        }
+        Cmd::CameraRemove { project, scene, camera } => {
+            with_project(&project, |p, h| {
+                h.apply(p, Command::RemoveCamera { scene: SceneId(scene), camera: CameraId(camera) })?;
+                Ok(())
+            })?;
+        }
+        Cmd::CameraSelect { project, scene, camera } => {
+            with_project(&project, |p, h| {
+                h.apply(p, Command::ActivateCamera { scene: SceneId(scene), camera: CameraId(camera) })?;
+                Ok(())
+            })?;
+        }
+        Cmd::CameraTarget { project, scene, camera, mode, subject } => {
+            let target = match subject.as_deref() {
+                None => None,
+                Some(raw) => {
+                    let mode = match mode.as_deref() {
+                        Some("track") => CameraTargetMode::Track,
+                        Some("follow") => CameraTargetMode::Follow,
+                        Some(other) => bail!("camera-target mode: track|follow, got {other}"),
+                        None => bail!("camera-target: --mode is required with --subject"),
+                    };
+                    Some(CameraTarget { mode, subject: parse_camera_subject(raw)? })
+                }
+            };
+            with_project(&project, |p, h| {
+                let camera = resolve_active_camera(p, SceneId(scene), camera)?;
+                h.apply(p, Command::SetCameraTarget { scene: SceneId(scene), camera, target })?;
+                Ok(())
+            })?;
+        }
+        Cmd::CameraList { project, scene } => {
+            let project_doc = storage::load_project(&project)?;
+            let s = project_doc.scenes.get(&SceneId(scene)).ok_or(CoreError::SceneNotFound(SceneId(scene)))?;
+            for camera in s.cameras.values() {
+                let marker = if camera.id == s.active_camera { "*" } else { " " };
+                println!("{marker} {} {} [{}, {})", camera.id, camera.name, camera.range.start, camera.range.end);
+            }
         }
         Cmd::SetLighting { project, scene, key, fill, rim } => {
             with_project(&project, |p, h| {
@@ -639,6 +1009,92 @@ fn main() -> Result<()> {
                 h.apply(p, Command::SetFloor { scene: SceneId(scene), floor })?;
                 Ok(())
             })?;
+        }
+        Cmd::SetStage { project, scene, preset, size, center } => {
+            let (width, height, depth) = match size {
+                Some(s) => {
+                    let v: Vec<f32> = s
+                        .split(['x', 'X', ','])
+                        .map(|p| p.trim().parse::<f32>().context("size is \"width x depth x height\", e.g. 12x8x4"))
+                        .collect::<Result<Vec<_>>>()?;
+                    if v.len() != 3 {
+                        anyhow::bail!("size is \"width x depth x height\", e.g. 12x8x4");
+                    }
+                    (Some(v[0]), Some(v[2]), Some(v[1]))
+                }
+                None => (None, None, None),
+            };
+            let center = match center {
+                Some(c) => {
+                    let v: Vec<f32> = c
+                        .split(',')
+                        .map(|p| p.trim().parse::<f32>().context("center is \"x,z\""))
+                        .collect::<Result<Vec<_>>>()?;
+                    if v.len() != 2 {
+                        anyhow::bail!("center is \"x,z\"");
+                    }
+                    Some([v[0], v[1]])
+                }
+                None => None,
+            };
+            with_project(&project, |p, h| {
+                let current = p.scenes.get(&SceneId(scene)).ok_or(CoreError::SceneNotFound(SceneId(scene)))?.stage;
+                let named = match preset.as_deref() {
+                    Some(name) => Some(StagePreset::parse(name).context("preset: small|medium|large")?),
+                    None => None,
+                };
+                let size = match (named, width, height, depth) {
+                    (Some(preset), w, h, d) => {
+                        let base = preset.size();
+                        StageSize::new(w.unwrap_or(base.width), h.unwrap_or(base.height), d.unwrap_or(base.depth))
+                    }
+                    (None, Some(w), Some(h), Some(d)) => StageSize::new(w, h, d),
+                    (None, ..) => anyhow::bail!("set-stage needs --preset or --size"),
+                };
+                let preset = match (named, width, height, depth) {
+                    (Some(p), None, None, None) => Some(p),
+                    _ => None,
+                };
+                let stage = Stage { preset, size, center: center.unwrap_or(current.center) };
+                let out = h.apply(p, Command::SetStage { scene: SceneId(scene), stage })?;
+                for c in &out.clamped {
+                    println!(
+                        "clamped {} {} frame {}: {:?} -> {:?}",
+                        match c.kind {
+                            ClampKind::Phantom => "phantom",
+                            ClampKind::Object => "object",
+                        },
+                        c.id,
+                        c.frame,
+                        c.from,
+                        c.to
+                    );
+                }
+                println!(
+                    "stage: preset {} size {}x{}x{} center {},{} ({} clamped)",
+                    preset.map(|p| p.name()).unwrap_or("custom"),
+                    size.width,
+                    size.height,
+                    size.depth,
+                    stage.center[0],
+                    stage.center[1],
+                    out.clamped.len()
+                );
+                Ok(())
+            })?;
+        }
+        Cmd::Stage { project, scene } => {
+            let project_doc = storage::load_project(&project)?;
+            let s = project_doc.scenes.get(&SceneId(scene)).ok_or(CoreError::SceneNotFound(SceneId(scene)))?;
+            println!(
+                "stage: preset {} size {}x{}x{} center {},{}",
+                s.stage.preset.map(|p| p.name()).unwrap_or("custom"),
+                s.stage.size.width,
+                s.stage.size.height,
+                s.stage.size.depth,
+                s.stage.center[0],
+                s.stage.center[1]
+            );
         }
         Cmd::RenderFilm { project, out, frames, width, height, force, normalize, target_peak_db, preview, every } => {
             let project_doc = storage::load_project(&project)?;
@@ -674,58 +1130,23 @@ fn main() -> Result<()> {
             println!("film -> {}", path.display());
             }
         }
-        Cmd::FilmAdd { project, scene, frames, shot } => {
+        Cmd::FilmAdd { project, scene, frames, camera } => {
             let range = match frames {
                 Some(f) => parse_range(&f)?,
                 None => {
-                    let shot_id = shot.ok_or_else(|| anyhow::anyhow!("film-add: --shot is required without --frames"))?;
+                    let camera_id = camera.ok_or_else(|| anyhow::anyhow!("film-add: --camera is required without --frames"))?;
                     let doc = storage::load_project(&project)?;
                     doc.scenes
                         .get(&SceneId(scene))
-                        .and_then(|s| s.shots.get(&ShotId(shot_id)))
-                        .map(|sh| sh.range)
-                        .ok_or(CoreError::ShotNotFound(ShotId(shot_id)))?
+                        .and_then(|s| s.cameras.get(&CameraId(camera_id)))
+                        .map(|c| c.range)
+                        .ok_or(CoreError::CameraNotFound(CameraId(camera_id)))?
                 }
             };
             with_project(&project, |p, h| {
-                h.apply(p, Command::AddFilmClip { scene: SceneId(scene), range, shot: shot.map(ShotId) })
+                h.apply(p, Command::AddFilmClip { scene: SceneId(scene), range, camera: camera.map(CameraId) })
                     .map(|o| println!("clip {}", o.clip.unwrap()))
                     .map_err(anyhow::Error::from)
-            })?;
-        }
-        Cmd::SetClip { project, scene, phantom, asset, frames, stack, speed, blend_in, blend_out, root_motion_clip, retarget } => {
-            with_project(&project, |p, h| {
-                match frames {
-                    Some(frames) => {
-                        let range = parse_range(&frames)?;
-                        let retarget = match retarget.as_deref() {
-                            None => None,
-                            Some("humanoid") => Some(phantom_core::RetargetProfile::Humanoid),
-                            Some("quadruped") => Some(phantom_core::RetargetProfile::Quadruped),
-                            Some(other) => bail!("unknown retargeting profile: {other} (humanoid|quadruped)"),
-                        };
-                        let clip_use = phantom_core::ClipUse {
-                            id: phantom_core::ClipUseId(0), // assigned by the command
-                            asset: AssetId(asset),
-                            stack,
-                            range,
-                            speed,
-                            blend_in,
-                            blend_out,
-                            root_motion: if root_motion_clip { phantom_core::RootMotion::Clip } else { phantom_core::RootMotion::Controller },
-                            retarget,
-                        };
-                        h.apply(p, Command::AddClipUse { scene: SceneId(scene), phantom: PhantomId(phantom), clip_use })
-                            .map(|o| println!("clip_use {}", o.clip_use.unwrap()))?;
-                    }
-                    None => {
-                        if retarget.is_some() {
-                            bail!("--retarget is supported only with --frames (clip track)");
-                        }
-                        h.apply(p, Command::SetPhantomClip { scene: SceneId(scene), phantom: PhantomId(phantom), clip: Some(AssetId(asset)) })?;
-                    }
-                }
-                Ok(())
             })?;
         }
         Cmd::TrackAdd { project, name, scene } => {
@@ -818,21 +1239,26 @@ fn main() -> Result<()> {
                 .map_err(anyhow::Error::from)
             })?;
         }
-        Cmd::Render { project, scene, out, shot, frames, width, height, twos, preview, every } => {
+        Cmd::Render { project, scene, out, camera, frames, width, height, preview, every } => {
             let project_doc = storage::load_project(&project)?;
             let scene_doc = project_doc
                 .scenes
                 .get(&SceneId(scene))
                 .with_context(|| format!("scene {scene} not found"))?;
-            let shot_id = shot.map(ShotId);
-            if let Some(id) = shot_id {
-                if !scene_doc.shots.contains_key(&id) {
-                    return Err(CoreError::ShotNotFound(id)).with_context(|| format!("shot {id}"));
+            let camera_id = match camera {
+                Some(id) => {
+                    if !scene_doc.cameras.contains_key(&CameraId(id)) {
+                        return Err(CoreError::CameraNotFound(CameraId(id))).with_context(|| format!("camera {id}"));
+                    }
+                    CameraId(id)
                 }
-            }
+                // No --camera: render through the scene's active camera, as the
+                // viewport does.
+                None => scene_doc.active_camera,
+            };
             let range = match frames {
                 Some(f) => parse_range(&f)?,
-                None => scene_doc.range_for_shot(shot_id),
+                None => scene_doc.range_for(Some(camera_id)),
             };
             std::fs::create_dir_all(&out)?;
             // Preview (B7): 480x270 and every N-th frame; explicit --width/--height
@@ -840,13 +1266,13 @@ fn main() -> Result<()> {
             let (width, height) = if preview && width == 1280 && height == 720 { (480, 270) } else { (width, height) };
             let step = if preview { every.max(1) as i64 } else { 1 };
             let frames: Vec<Frame> = (range.start..range.end).step_by(step as usize).collect();
-            let opts = RenderOptions { width, height, on_twos: twos };
+            let opts = RenderOptions { width, height };
             let mut renderer = Renderer::new(width, height)
                 .context("cannot create the GPU renderer")?;
             let started = std::time::Instant::now();
             for (done, frame) in frames.iter().enumerate() {
                 let rendered =
-                    renderer.render_frame(&project_doc, scene_doc, &project, *frame, &opts, shot_id)?;
+                    renderer.render_frame(&project_doc, scene_doc, &project, *frame, &opts, Some(camera_id))?;
                 let path = out.join(format!("frame_{frame:06}.png"));
                 rendered.save_png(&path)?;
                 // D5: progress with ETA, not just "47/48".
@@ -873,6 +1299,27 @@ fn with_project(
 
 fn parse_range(s: &str) -> Result<FrameRange> {    let (a, b) = s.split_once('-').context("range of the form start-end")?;
     Ok(FrameRange::new(a.trim().parse()?, b.trim().parse()?)?)
+}
+
+/// The camera a command refers to: an explicit id, or the scene's active camera.
+fn resolve_active_camera(p: &Project, scene: SceneId, camera: Option<u64>) -> Result<CameraId> {
+    match camera {
+        Some(id) => Ok(CameraId(id)),
+        None => Ok(p.scenes.get(&scene).ok_or(CoreError::SceneNotFound(scene))?.active_camera),
+    }
+}
+
+/// A camera subject on the command line: "phantom:<id>" or "object:<id>".
+fn parse_camera_subject(s: &str) -> Result<CameraSubject> {
+    let (kind, id) = s
+        .split_once(':')
+        .context("subject is \"phantom:<id>\" or \"object:<id>\"")?;
+    let id: u64 = id.trim().parse().context("subject id is a number")?;
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "phantom" => Ok(CameraSubject::Phantom(PhantomId(id))),
+        "object" => Ok(CameraSubject::Object(ObjectId(id))),
+        other => bail!("subject kind: phantom|object, got {other}"),
+    }
 }
 
 /// "r,g,b" — linear RGB color.

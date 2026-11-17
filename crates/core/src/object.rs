@@ -5,7 +5,7 @@ use glam::Vec3;
 
 use crate::pose::shortest_angle_lerp;
 use crate::project::{ObjectKey, SceneObject};
-use crate::time::{Frame, FrameRange};
+use crate::time::Frame;
 
 /// Computed object transform at a frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -28,15 +28,7 @@ impl Default for ObjectTransform {
 /// Position and scale interpolate linearly, angles along the shortest arc;
 /// the value is held before the first and after the last key. An empty
 /// track — the original transform (zero position, unit scale).
-///
-/// `on_twos` — the same "on twos" rule as Phantoms: the frame is quantized
-/// to even frames from the scene start before sampling.
-pub fn evaluate_object(object: &SceneObject, scene: &FrameRange, frame: Frame, on_twos: bool) -> ObjectTransform {
-    let frame = if on_twos {
-        crate::time::on_twos(frame, scene.start)
-    } else {
-        frame
-    };
+pub fn evaluate_object(object: &SceneObject, frame: Frame) -> ObjectTransform {
     sample_keys(&object.keys, frame)
 }
 
@@ -75,7 +67,7 @@ mod tests {
     }
 
     fn object(keys: Vec<ObjectKey>) -> SceneObject {
-        SceneObject { id: ObjectId(1), name: "o".into(), asset: AssetId(1), builtin: None, keys , attach: None, material_patches: Vec::new() }
+        SceneObject { id: ObjectId(1), name: "o".into(), asset: AssetId(1), builtin: None, keys , attach: None, material_patches: Vec::new(), scatter: None }
     }
 
     #[test]
@@ -104,15 +96,9 @@ mod tests {
     }
 
     #[test]
-    fn twos_quantize_like_phantoms() {
+    fn interpolation_is_free_between_keys() {
         let obj = object(vec![key(0, 0.0, 0.0), key(24, 2.4, 0.0)]);
-        let scene = FrameRange::new(0, 48).unwrap();
-        let a = evaluate_object(&obj, &scene, 10, true);
-        let b = evaluate_object(&obj, &scene, 11, true);
-        assert_eq!(a, b, "on twos adjacent odd/even frames match");
-        let c = evaluate_object(&obj, &scene, 12, true);
-        assert_ne!(a, c);
-        // Without twos — free interpolation.
-        assert_ne!(evaluate_object(&obj, &scene, 10, false), evaluate_object(&obj, &scene, 11, false));
+        assert_ne!(evaluate_object(&obj, 10), evaluate_object(&obj, 11));
+        assert!(evaluate_object(&obj, 12).position.x > evaluate_object(&obj, 11).position.x);
     }
 }

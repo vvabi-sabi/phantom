@@ -19,7 +19,6 @@ define_id!(SceneId);
 define_id!(PhantomId);
 define_id!(AssetId);
 define_id!(ObjectId);
-define_id!(ShotId);
-define_id!(ClipUseId);
+define_id!(CameraId);
 define_id!(LightId);
 define_id!(VfxId);

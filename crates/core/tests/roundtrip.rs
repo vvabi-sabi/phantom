@@ -11,6 +11,7 @@ fn sample_project() -> (Project, History, SceneId, PhantomId) {
             Command::RegisterAsset {
                 kind: AssetKind::Image,
                 path: "assets/bg.png".into(),
+                bounds: None,
             },
         )
         .unwrap()
@@ -31,11 +32,9 @@ fn sample_project() -> (Project, History, SceneId, PhantomId) {
                 scene,
                 background: Background {
                     image: BackgroundSource::Image(asset),
-                    arc_radians: 2.0,
-                    radius: 6.0,
+                    width: 12.0,
                     height: 4.0,
                     center: Vec3::new(0.0, 2.0, -5.0),
-                    bulge: Default::default(),
                     fit: Default::default(),
                 },
             },
@@ -52,7 +51,7 @@ fn sample_project() -> (Project, History, SceneId, PhantomId) {
             Command::SetMotionKey {
                 scene,
                 phantom,
-                key: MotionKey { yaw: 0.0, frame: 0, position: Vec3::ZERO, action: Action::Idle },
+                key: MotionKey { yaw: 0.0, frame: 0, position: Vec3::ZERO, pose: ActorPose::Stand },
             },
         )
         .unwrap();
@@ -62,7 +61,7 @@ fn sample_project() -> (Project, History, SceneId, PhantomId) {
             Command::SetMotionKey {
                 scene,
                 phantom,
-                key: MotionKey { yaw: 0.0, frame: 48, position: Vec3::new(2.0, 0.0, 0.0), action: Action::Walk },
+                key: MotionKey { yaw: 0.0, frame: 48, position: Vec3::new(2.0, 0.0, 0.0), pose: ActorPose::Stand },
             },
         )
         .unwrap();
@@ -90,7 +89,7 @@ fn undo_restores_document() {
             Command::SetMotionKey {
                 scene,
                 phantom,
-                key: MotionKey { yaw: 0.0, frame: 24, position: Vec3::ONE, action: Action::Jump },
+                key: MotionKey { yaw: 0.0, frame: 24, position: Vec3::ONE, pose: ActorPose::Stand },
             },
         )
         .unwrap();
@@ -113,7 +112,7 @@ fn invalid_commands_do_not_mutate() {
             Command::SetMotionKey {
                 scene,
                 phantom,
-                key: MotionKey { yaw: 0.0, frame: 5, position: Vec3::NAN, action: Action::Idle },
+                key: MotionKey { yaw: 0.0, frame: 5, position: Vec3::NAN, pose: ActorPose::Stand },
             },
         )
         .is_err());
@@ -124,7 +123,7 @@ fn invalid_commands_do_not_mutate() {
             Command::SetMotionKey {
                 scene,
                 phantom: PhantomId(999),
-                key: MotionKey { yaw: 0.0, frame: 5, position: Vec3::ZERO, action: Action::Idle },
+                key: MotionKey { yaw: 0.0, frame: 5, position: Vec3::ZERO, pose: ActorPose::Stand },
             },
         )
         .is_err());
@@ -143,10 +142,9 @@ fn invalid_commands_do_not_mutate() {
                 scene,
                 background: Background {
                     image: BackgroundSource::Image(AssetId(999)),
-                    arc_radians: 1.0,
-                    radius: 1.0,
+                    width: 1.0,
                     height: 1.0,
-                    center: Vec3::ZERO, bulge: Default::default(), fit: Default::default() },
+                    center: Vec3::ZERO, fit: Default::default() },
             },
         )
         .is_err());
@@ -165,7 +163,7 @@ fn replace_motion_is_atomic_and_single_undo() {
         .copied()
         .collect();
     for f in 12..24 {
-        motion.push(MotionKey { yaw: 0.0, frame: f, position: Vec3::new(f as f32 * 0.1, 0.0, 0.0), action: Action::Walk });
+        motion.push(MotionKey { yaw: 0.0, frame: f, position: Vec3::new(f as f32 * 0.1, 0.0, 0.0), pose: ActorPose::Stand });
     }
     history
         .apply(&mut project, Command::ReplaceMotion { scene, phantom, motion })
@@ -236,63 +234,10 @@ fn undo_redo_keeps_ids_stable() {
             Command::SetMotionKey {
                 scene,
                 phantom,
-                key: MotionKey { yaw: 0.0, frame: 96, position: Vec3::ZERO, action: Action::Idle },
+                key: MotionKey { yaw: 0.0, frame: 96, position: Vec3::ZERO, pose: ActorPose::Stand },
             },
         )
         .unwrap();
-}
-
-#[test]
-fn takes_override_manual_in_range_only() {
-    let (mut project, mut history, scene, phantom) = sample_project();
-    // Take: [10, 20) moves left (manual keys move right).
-    let motion: Vec<MotionKey> = (10..20)
-        .map(|f| MotionKey { yaw: 0.0, frame: f, position: Vec3::new(-(f as f32), 0.0, 0.0), action: Action::Walk })
-        .collect();
-    let take = history
-        .apply(&mut project, Command::AddTake {
-            scene,
-            phantom,
-            name: "Take 1".into(),
-            range: FrameRange::new(10, 20).unwrap(),
-            motion,
-        })
-        .unwrap()
-        .take
-        .unwrap();
-    {
-        let scene_doc = &project.scenes[&scene];
-        let p = &scene_doc.phantoms[&phantom];
-        // Inside the take — its track; outside — the manual one.
-        assert!(evaluate(p, &scene_doc.range, 15, false).root.x < 0.0, "inside the take");
-        assert!(evaluate(p, &scene_doc.range, 48, false).root.x > 0.0, "outside — manual track");
-    }
-    // Deactivating restores the manual performance.
-    history.apply(&mut project, Command::SetActiveTake { scene, phantom, take: None }).unwrap();
-    let range = project.scenes[&scene].range;
-    let p = &project.scenes[&scene].phantoms[&phantom];
-    assert!(evaluate(p, &range, 15, false).root.x >= 0.0);
-    // A take is one undo step; re-recording does not destroy the previous take.
-    history.apply(&mut project, Command::SetActiveTake { scene, phantom, take: Some(take) }).unwrap();
-    let take2 = history
-        .apply(&mut project, Command::AddTake {
-            scene,
-            phantom,
-            name: "Take 2".into(),
-            range: FrameRange::new(10, 20).unwrap(),
-            motion: vec![MotionKey { yaw: 0.0, frame: 10, position: Vec3::ZERO, action: Action::Idle }],
-        })
-        .unwrap()
-        .take
-        .unwrap();
-    assert_eq!(project.scenes[&scene].phantoms[&phantom].takes.len(), 2);
-    assert_eq!(project.scenes[&scene].phantoms[&phantom].active_take, Some(take2));
-    // Removing the active take clears the selection.
-    history.apply(&mut project, Command::RemoveTake { scene, phantom, take: take2 }).unwrap();
-    assert_eq!(project.scenes[&scene].phantoms[&phantom].takes.len(), 1);
-    assert_eq!(project.scenes[&scene].phantoms[&phantom].active_take, None);
-    assert!(history.undo(&mut project));
-    assert_eq!(project.scenes[&scene].phantoms[&phantom].takes.len(), 2);
 }
 
 #[test]
@@ -300,21 +245,21 @@ fn evaluate_on_sample_project() {
     let (project, _h, scene_id, phantom_id) = sample_project();
     let scene = &project.scenes[&scene_id];
     let phantom = &scene.phantoms[&phantom_id];
-    let p0 = evaluate(phantom, &scene.range, 0, false);
-    assert_eq!(p0.action, Action::Idle);
-    let p48 = evaluate(phantom, &scene.range, 48, false);
-    assert_eq!(p48.action, Action::Walk);
+    let p0 = evaluate(phantom, 0);
+    assert_eq!(p0.pose, ActorPose::Stand);
+    let p48 = evaluate(phantom, 48);
+    assert_eq!(p48.pose, ActorPose::Stand);
     assert!((p48.root.x - 2.0).abs() < 1e-4);
-    // Walk bones deviate from rest.
+    // The held pose differs from the rest T-pose (the arms hang down).
     let rest = phantom_core::rig::Pose::rest();
     let dev: f32 = p48
-        .pose
+        .skeleton
         .bones
         .iter()
         .zip(rest.bones.iter())
         .map(|(a, b)| (a.rotation - b.rotation).length())
         .sum();
-    assert!(dev > 0.01, "walk must differ from the rest pose");
+    assert!(dev > 0.01, "the standing pose must differ from the rest T-pose");
 }
 
 #[test]

@@ -46,7 +46,14 @@ pub fn load_project(dir: &Path) -> Result<Project, StorageError> {
     if version > SCHEMA_VERSION {
         return Err(StorageError::NewerSchema { found: version });
     }
-    let project: Project = serde_json::from_str(&text)?;
+    let mut project: Project = serde_json::from_str(&text)?;
+    // Old manifests carry one camera per scene (`camera`, and `shots` for named
+    // ones); the document's shape is a camera map with camera 0 always present.
+    // Normalizing at the single load choke point means every surface — GUI,
+    // CLI, MCP and the bridge — sees the same document.
+    for scene in project.scenes.values_mut() {
+        scene.normalize_legacy();
+    }
     // Asset references must not escape the project root.
     for asset in project.assets.values() {
         check_relative(&asset.path)?;

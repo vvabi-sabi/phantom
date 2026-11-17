@@ -12,7 +12,7 @@ fn setup() -> (Project, History, SceneId, AssetId) {
         .scene
         .unwrap();
     let asset = history
-        .apply(&mut project, Command::RegisterAsset { kind: AssetKind::ModelObj, path: "assets/rock/rock.obj".into() })
+        .apply(&mut project, Command::RegisterAsset { kind: AssetKind::ModelObj, path: "assets/rock/rock.obj".into(), bounds: None })
         .unwrap()
         .asset
         .unwrap();
@@ -32,7 +32,7 @@ fn add_object_validates_asset_kind_and_scene() {
 
     // A non-model asset is rejected.
     let img = history
-        .apply(&mut project, Command::RegisterAsset { kind: AssetKind::Image, path: "assets/bg.png".into() })
+        .apply(&mut project, Command::RegisterAsset { kind: AssetKind::Image, path: "assets/bg.png".into(), bounds: None })
         .unwrap()
         .asset
         .unwrap();
@@ -148,8 +148,53 @@ fn object_serde_round_trip_with_optional_fields() {
 
     let mut keys = vec![key(0), key(24)];
     keys[1].position = Vec3::new(2.0, 0.0, 0.0);
-    let obj = SceneObject { id: ObjectId(3), name: "o".into(), asset: AssetId(1), builtin: None, keys , attach: None, material_patches: Vec::new() };
+    let obj = SceneObject { id: ObjectId(3), name: "o".into(), asset: AssetId(1), builtin: None, keys , attach: None, material_patches: Vec::new(), scatter: None };
     let back: SceneObject = serde_json::from_str(&serde_json::to_string(&obj).unwrap()).unwrap();
     assert_eq!(back.keys.len(), 2);
     assert_eq!(back.keys[1].position, Vec3::new(2.0, 0.0, 0.0));
+}
+
+#[test]
+fn a_furnished_room_arrives_as_one_undoable_package() {
+    let (mut project, mut history, scene, _) = setup();
+    let shell = ObjectKey { frame: 0, position: Vec3::new(0.0, 0.0, 0.0), yaw: 90f32.to_radians(), pitch: 0.0, roll: 0.0, scale: Vec3::ONE };
+    let out = history
+        .apply(&mut project, Command::AddBuiltinObject { scene, name: "Kitchen".into(), prop: "room_dining".into(), key: Some(shell) })
+        .unwrap();
+    let objects: Vec<&SceneObject> = project.scenes[&scene].objects.values().collect();
+    // The shell plus its furniture, all from one command, in one undo step.
+    assert!(objects.len() > 1, "a furnished room places its furniture too");
+    assert_eq!(objects.iter().filter(|o| o.builtin.as_deref() == Some("room_dining")).count(), 1);
+    // Furniture follows the shell's turn: an offset along +z lands along +x at yaw 90.
+    let seat = objects.iter().find(|o| o.builtin.as_deref() == Some("chair")).expect("the set has seats");
+    assert!(seat.keys[0].position.x.abs() > 0.1, "the piece is placed in the room's own frame: {:?}", seat.keys[0].position);
+    // Undo removes the whole package, not just the shell.
+    assert!(history.undo(&mut project), "the step is undoable");
+    assert!(project.scenes[&scene].objects.is_empty(), "one undo step removes the room and its furniture");
+    // Nothing is pushed around: a clamp that moves a piece by less than a
+    // millimeter is float noise in the rotation, not a correction.
+    let moved = out.clamped.iter().filter(|c| (Vec3::from_array(c.from) - Vec3::from_array(c.to)).length() > 1e-3).count();
+    assert_eq!(moved, 0, "the room fits the default stage: {:?}", out.clamped);
+}
+
+#[test]
+fn a_scatter_field_is_stored_as_a_recipe_and_replays_identically() {
+    let (mut project, mut history, scene, _) = setup();
+    let field = ScatterField {
+        preset: "forest".into(),
+        shape: ScatterShape::Area { size: [16.0, 16.0], density: 0.3, action: Some([[-3.0, -3.0], [3.0, 3.0]]) },
+        seed: 5,
+    };
+    let out = history
+        .apply(&mut project, Command::AddScatterField { scene, name: "Wood".into(), field: field.clone(), key: Some(key(0)) })
+        .unwrap();
+    let stored = &project.scenes[&scene].objects[&out.object.unwrap()];
+    // The document keeps the recipe, not baked geometry: the plan is replayed.
+    assert_eq!(stored.scatter.as_ref(), Some(&field));
+    let replay = plan(scatter_preset("forest").unwrap(), &field.shape, field.seed).unwrap();
+    assert_eq!(replay, plan(scatter_preset("forest").unwrap(), &field.shape, field.seed).unwrap());
+    assert!(replay.iter().any(|p| !p.near), "the band exists to be drawn");
+    // An unknown preset is refused, so no document can hold an unrenderable field.
+    let bad = ScatterField { preset: "tundra".into(), ..field };
+    assert!(history.apply(&mut project, Command::AddScatterField { scene, name: "x".into(), field: bad, key: None }).is_err());
 }

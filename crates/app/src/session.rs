@@ -47,8 +47,8 @@ pub enum SessionError {
     ConflictingRig,
     #[error("{0}")]
     BadInput(String),
-    #[error("bridge is busy with a live recording")]
-    BridgeBusy,
+    #[error("look: no actor or object matches {needle:?}")]
+    LookTargetNotFound { needle: String, names: Vec<String> },
     #[error("operation {operation} is not available through the bridge: {reason}")]
     BridgeUnavailable { operation: &'static str, reason: &'static str },
     #[error("{0}")]
@@ -79,7 +79,7 @@ impl SessionError {
             Self::ProjectSwitchRejected { .. } => "project_switch_rejected",
             Self::OutsideAllowedRoots(_) => "path_forbidden",
             Self::ConflictingRig | Self::BadInput(_) => "invalid_input",
-            Self::BridgeBusy => "busy",
+            Self::LookTargetNotFound { .. } => "not_found",
             Self::BridgeUnavailable { .. } => "bridge_unavailable",
             Self::Render(e) => render_error_code(e),
             Self::BatchInvalid { .. } => "invalid_input",
@@ -106,7 +106,7 @@ impl SessionError {
             Self::OutsideAllowedRoots(path) => json!({ "path": path }),
             Self::ConflictingRig => json!({ "fields": ["rig_asset", "rig_actor"] }),
             Self::BadInput(reason) => json!({ "reason": reason }),
-            Self::BridgeBusy => json!({ "activity": "live_recording" }),
+            Self::LookTargetNotFound { needle, names } => json!({ "needle": needle, "names": names }),
             Self::BridgeUnavailable { operation, reason } => {
                 json!({ "operation": operation, "reason": reason })
             }
@@ -140,40 +140,42 @@ fn core_error_code(error: &CoreError) -> &'static str {
         | CoreError::LayerNotFound(_)
         | CoreError::ClipNotFound(_)
         | CoreError::TrackNotFound(_)
-        | CoreError::TakeNotFound(_)
-        | CoreError::ShotNotFound(_)
-        | CoreError::ClipUseNotFound(_)
+        | CoreError::CameraNotFound(_)
         | CoreError::AudioClipNotFound(_)
         | CoreError::LightNotFound(_)
         | CoreError::UnknownProp(_) => "not_found",
         CoreError::WrongAssetKind(_) => "wrong_asset_kind",
-        CoreError::UnsupportedAction { .. } => "unsupported_action",
-        CoreError::ClipUseOverlap(_) => "conflict",
+        CoreError::CameraFacesAway { .. } => "camera_faces_away",
+        CoreError::CameraSubjectMissing { .. } => "camera_subject_missing",
+        CoreError::UnsupportedPose { .. } => "unsupported_pose",
         CoreError::InvalidRange { .. }
         | CoreError::NonFinite(_)
+        | CoreError::InvalidStage(_)
+        | CoreError::InvalidBackground(_)
         | CoreError::EmptyName
         | CoreError::InvalidStroke
         | CoreError::ClipOutOfScene
-        | CoreError::NotImportedRig
-        | CoreError::ShotOutOfScene
-        | CoreError::ShotRangeMismatch
-        | CoreError::InvalidClipUseParam(_)
+        | CoreError::CameraOutOfScene
+        | CoreError::CameraRangeMismatch
         | CoreError::InvalidAudioClipParam(_)
         | CoreError::InvalidLightParam(_)
+        | CoreError::InvalidScatter(_)
         | CoreError::InvalidBatch(_) => "invalid_input",
     }
 }
 
 fn core_error_details(error: &CoreError) -> Value {
     match error {
-        CoreError::UnsupportedAction { actor, action } => {
-            json!({ "actor": format!("{actor:?}").to_lowercase(), "action": format!("{action:?}").to_lowercase() })
+        CoreError::UnsupportedPose { actor, pose } => {
+            json!({ "actor": format!("{actor:?}").to_lowercase(), "pose": format!("{pose:?}").to_lowercase() })
         }
         CoreError::SceneNotFound(id) => json!({ "entity": "scene", "id": id.0 }),
         CoreError::PhantomNotFound(id) => json!({ "entity": "phantom", "id": id.0 }),
         CoreError::ObjectNotFound(id) => json!({ "entity": "object", "id": id.0 }),
         CoreError::AssetNotFound(id) => json!({ "entity": "asset", "id": id.0 }),
         CoreError::UnknownProp(name) => json!({ "entity": "catalog_entry", "name": name, "hint": "catalog_query" }),
+        // A fill that will not fit says what to lower; the message carries it.
+        CoreError::InvalidScatter(why) => json!({ "entity": "scatter", "why": why, "hint": "scatter_presets" }),
         CoreError::InvalidRange { start, end } => json!({ "start": start, "end": end }),
         CoreError::NonFinite(field) => json!({ "field": field }),
         CoreError::EmptyName => json!({ "field": "name" }),
@@ -183,17 +185,18 @@ fn core_error_details(error: &CoreError) -> Value {
         CoreError::ClipNotFound(id) => json!({ "entity": "film_clip", "id": id.0 }),
         CoreError::ClipOutOfScene => json!({ "constraint": "clip_inside_scene" }),
         CoreError::TrackNotFound(id) => json!({ "entity": "audio_track", "id": id.0 }),
-        CoreError::TakeNotFound(id) => json!({ "entity": "take", "id": id.0 }),
-        CoreError::NotImportedRig => json!({ "required_rig": "imported" }),
-        CoreError::ShotNotFound(id) => json!({ "entity": "shot", "id": id.0 }),
-        CoreError::ShotOutOfScene => json!({ "constraint": "shot_inside_scene" }),
-        CoreError::ShotRangeMismatch => json!({ "constraint": "clip_range_equals_shot_range" }),
-        CoreError::ClipUseNotFound(id) => json!({ "entity": "clip_use", "id": id.0 }),
-        CoreError::ClipUseOverlap(id) => json!({ "conflicting_clip_use": id.0 }),
-        CoreError::InvalidClipUseParam(field) => json!({ "field": field }),
+        CoreError::CameraNotFound(id) => json!({ "entity": "camera", "id": id.0 }),
+        CoreError::CameraFacesAway { camera, frame, fraction, minimum } => json!({
+            "camera": camera.0, "frame": frame, "scene_fraction": fraction, "minimum": minimum,
+        }),
+        CoreError::CameraSubjectMissing { camera } => json!({ "entity": "camera", "id": camera.0 }),
+        CoreError::CameraOutOfScene => json!({ "constraint": "shot_inside_scene" }),
+        CoreError::CameraRangeMismatch => json!({ "constraint": "clip_range_equals_shot_range" }),
         CoreError::InvalidAudioClipParam(field) => json!({ "field": field }),
         CoreError::InvalidLightParam(field) => json!({ "field": field }),
         CoreError::InvalidBatch(reason) => json!({ "reason": reason }),
+        CoreError::InvalidStage(field) => json!({ "field": field }),
+        CoreError::InvalidBackground(field) => json!({ "field": field }),
         CoreError::AudioClipNotFound(id) => json!({ "entity": "audio_clip", "id": id.0 }),
         CoreError::LightNotFound(id) => json!({ "entity": "light", "id": id.0 }),
     }
@@ -234,9 +237,6 @@ fn import_error_code(error: &phantom_runtime::import::ImportError) -> &'static s
         ImportError::NoSkin => "no_skin",
         ImportError::TooManyInfluences(_) => "too_many_influences",
         ImportError::UnknownExtension(_) => "unsupported_format",
-        ImportError::NoClip => "no_clip",
-        ImportError::NoMatchingBones => "incompatible_rig",
-        ImportError::NoSuchStack(_) => "not_found",
         ImportError::TooManyDeps(_) => "import_limit_exceeded",
         ImportError::BundleTooLarge(_) => "import_limit_exceeded",
         ImportError::TextureTooLarge { .. } => "import_limit_exceeded",
@@ -251,9 +251,6 @@ fn import_error_details(error: &phantom_runtime::import::ImportError) -> Value {
         ImportError::NoSkin => json!({ "required": "skin" }),
         ImportError::TooManyInfluences(found) => json!({ "found": found, "maximum": 4 }),
         ImportError::UnknownExtension(extension) => json!({ "extension": extension }),
-        ImportError::NoClip => json!({ "required": "animation_stack" }),
-        ImportError::NoMatchingBones => json!({ "cause": "no_matching_bone_names" }),
-        ImportError::NoSuchStack(stack) => json!({ "entity": "animation_stack", "name": stack }),
         ImportError::Io(e) => io_error_details(e),
         ImportError::NotAFile(path) | ImportError::PathEscape(path) => json!({ "path": path }),
         ImportError::TooManyDeps(found) => {
@@ -323,7 +320,7 @@ pub enum Op {
     SceneAdd { name: String, start: Frame, end: Frame },
     AssetImport {
         file: PathBuf,
-        /// Explicit asset type: model-obj|model-fbx|motion-fbx|image|audio|video.
+        /// Explicit asset type: model-obj|model-fbx|image|audio|video.
         /// `None` (and a missing field in legacy JSON) — autodetect by
         /// extension, as before. Affects only the registered AssetKind:
         /// obj/fbx still go through bundle import.
@@ -336,20 +333,15 @@ pub enum Op {
         /// The background is a video (an image by default).
         #[serde(default)]
         video: bool,
-        /// Screen geometry; serde defaults are the previous hardcoded values,
-        /// so old bridge JSON without these fields still parses.
-        #[serde(default = "default_bg_arc")]
-        arc: f32,
-        #[serde(default = "default_bg_radius")]
-        radius: f32,
+        /// Flat screen geometry; the serde defaults are a backdrop wide enough
+        /// for the default camera, so old bridge JSON without these fields
+        /// still parses.
+        #[serde(default = "default_bg_width")]
+        width: f32,
         #[serde(default = "default_bg_height")]
         height: f32,
         #[serde(default = "default_bg_center")]
         center: [f32; 3],
-        /// Bulge direction of the arc ("toward_camera"|"away_from_camera");
-        /// None — the document default (away_from_camera, corrective A3).
-        #[serde(default)]
-        bulge: Option<phantom_core::project::Bulge>,
         /// Panorama UV mode ("cover"|"contain"|"stretch"); None — the document
         /// default (cover, corrective A3).
         #[serde(default)]
@@ -363,11 +355,38 @@ pub enum Op {
     CatalogQuery { #[serde(default)] kind: Option<String>, #[serde(default)] query: Option<String> },
     /// Place a catalog item (K1): the mesh is procedural, no file needed.
     PropAdd { scene: u64, name: String, prop: String, #[serde(default)] pos: Option<[f32; 3]>, #[serde(default)] yaw: f32, #[serde(default)] pitch: f32, #[serde(default)] roll: f32, #[serde(default)] scale: Option<[f32; 3]> },
-    KeySet { scene: u64, phantom: u64, frame: Frame, pos: [f32; 3], action: Action, #[serde(default)] yaw: f32 },
-    CameraSet { scene: u64, frame: Frame, pos: [f32; 3], yaw: f32, pitch: f32, focal_mm: f32 },
-    /// Camera key with extended fields (C1): roll/look_at/focus/ease.
-    /// `shot: None` — the scene's legacy camera.
-    CameraKeySet { scene: u64, #[serde(default)] shot: Option<u64>, key: TransformKey },
+    KeySet { scene: u64, phantom: u64, frame: Frame, pos: [f32; 3], pose: ActorPose, #[serde(default)] yaw: f32 },
+    /// Add a named camera (the range defaults to the whole scene); it becomes
+    /// the scene's active camera.
+    CameraAdd { scene: u64, name: String, #[serde(default)] start: Option<Frame>, #[serde(default)] end: Option<Frame> },
+    /// Remove a camera; film clips referencing it go away in the same step.
+    CameraRemove { scene: u64, camera: u64 },
+    /// Pick the camera the viewport shows and a render without one uses.
+    CameraSelect { scene: u64, camera: u64 },
+    /// Change a camera's range; film clips onto it get the new range.
+    CameraRangeSet { scene: u64, camera: u64, start: Frame, end: Frame },
+    /// Add or replace a camera key (roll/look_at/focus/ease included).
+    /// `camera` omitted — the scene's active camera.
+    CameraKeySet { scene: u64, #[serde(default)] camera: Option<u64>, key: TransformKey },
+    /// Remove a camera key at a frame (the last key cannot be removed).
+    CameraKeyRemove { scene: u64, camera: u64, frame: Frame },
+    /// The camera's base lens in mm.
+    CameraLensSet { scene: u64, camera: u64, focal_mm: f32 },
+    /// Focus on one key (a zoom inside the camera's range).
+    CameraFocalKeySet { scene: u64, camera: u64, frame: Frame, focal_mm: f32 },
+    /// Attach the camera to a moving subject: mode `track` (stands and turns to
+    /// it) or `follow` (attached, travels and turns with it). `clear: true`
+    /// detaches. `subject` is "phantom:<id>" or "object:<id>".
+    CameraTargetSet {
+        scene: u64,
+        camera: u64,
+        #[serde(default)]
+        mode: Option<String>,
+        #[serde(default)]
+        subject: Option<String>,
+        #[serde(default)]
+        clear: bool,
+    },
     ObjectAdd { scene: u64, name: String, asset: u64 },
     ObjectRemove { scene: u64, object: u64 },
     ObjectKeySet { scene: u64, object: u64, frame: Frame, pos: [f32; 3], #[serde(default)] yaw: f32, #[serde(default)] pitch: f32, #[serde(default)] roll: f32, #[serde(default = "unit_scale")] scale: [f32; 3] },
@@ -401,18 +420,24 @@ pub enum Op {
     MaterialList { scene: u64, phantom: Option<u64>, object: Option<u64> },
     FloorSet { scene: u64, floor: Option<SceneFloor> },
     FloorGet { scene: u64 },
+    /// Scene stage (layout mode): a preset, or an explicit size, or both.
+    /// `center` defaults to the stage's current center.
+    StageSet {
+        scene: u64,
+        #[serde(default)]
+        preset: Option<String>,
+        #[serde(default)]
+        width: Option<f32>,
+        #[serde(default)]
+        height: Option<f32>,
+        #[serde(default)]
+        depth: Option<f32>,
+        #[serde(default)]
+        center: Option<[f32; 2]>,
+    },
+    StageGet { scene: u64 },
     BrushStroke { scene: u64, frame: Frame, points: Vec<[f32; 2]>, color: [f32; 4], width: f32, erase: bool },
-    FilmAdd { scene: u64, start: Frame, end: Frame, #[serde(default)] shot: Option<u64> },
-    ShotAdd { scene: u64, name: String, start: Frame, end: Frame },
-    ShotRemove { scene: u64, shot: u64 },
-    ShotRangeSet { scene: u64, shot: u64, start: Frame, end: Frame },
-    ShotCameraKeySet { scene: u64, shot: u64, frame: Frame, pos: [f32; 3], #[serde(default)] yaw: f32, #[serde(default)] pitch: f32 },
-    /// Shot camera key with extended fields (C1): roll/look_at/focus/ease.
-    ShotCameraKeySetKey { scene: u64, shot: u64, key: TransformKey },
-    /// Shot focal-length key (C1.2) — a zoom inside the shot.
-    ShotFocalKeySet { scene: u64, shot: u64, frame: Frame, focal_mm: f32 },
-    ShotCameraKeyRemove { scene: u64, shot: u64, frame: Frame },
-    ShotFocalSet { scene: u64, shot: u64, focal_mm: f32 },
+    FilmAdd { scene: u64, start: Frame, end: Frame, #[serde(default)] camera: Option<u64> },
     FilmMove { clip: u64, index: usize },
     FilmTrim { clip: u64, start: Frame, end: Frame },
     FilmRemove { clip: u64 },
@@ -422,56 +447,12 @@ pub enum Op {
     MotionReplace {
         scene: u64,
         phantom: u64,
-        motion: Vec<(Frame, [f32; 3], Action)>,
+        motion: Vec<(Frame, [f32; 3], ActorPose)>,
         /// Optional yaw per key, parallel to `motion` (serde default —
         /// old JSON made of triples still reads with yaw = 0).
         #[serde(default)]
         yaws: Option<Vec<f32>>,
     },
-    TakeAdd {
-        scene: u64,
-        phantom: u64,
-        name: String,
-        start: Frame,
-        end: Frame,
-        motion: Vec<(Frame, [f32; 3], Action)>,
-        /// Optional yaw per key, parallel to `motion` (serde default —
-        /// old JSON made of triples still reads with yaw = 0).
-        #[serde(default)]
-        yaws: Option<Vec<f32>>,
-    },
-    PhantomClipSet {
-        scene: u64,
-        phantom: u64,
-        clip: Option<u64>,
-        /// Extended form (the clip track): a range inside the scene,
-        /// speed, blending, stack. Without start/end — legacy SetPhantomClip.
-        #[serde(default)]
-        start: Option<Frame>,
-        #[serde(default)]
-        end: Option<Frame>,
-        #[serde(default)]
-        speed: Option<f32>,
-        #[serde(default)]
-        blend_in: Option<f32>,
-        #[serde(default)]
-        blend_out: Option<f32>,
-        #[serde(default)]
-        stack: Option<String>,
-        /// "clip" — the clip's root motion; otherwise the controller (by default).
-        #[serde(default)]
-        root_motion: Option<String>,
-        /// "humanoid"|"quadruped" — retargeting profile; otherwise direct
-        /// bone-name matching (by default). Track form only.
-        #[serde(default)]
-        retarget: Option<String>,
-    },
-    /// Remove a clip use from a Phantom's track.
-    ClipUseRemove { scene: u64, phantom: u64, clip_use: u64 },
-    /// List the animation stacks of a clip asset (name, duration).
-    ClipList { asset: u64 },
-    TakeActive { scene: u64, phantom: u64, take: Option<u64> },
-    TakeRemove { scene: u64, phantom: u64, take: u64 },
     AudioTrackAdd { scene: Option<u64>, name: String },
     AudioClipAdd { track: u64, asset: u64, start: Frame, offset_samples: u64, len_samples: u64, #[serde(default)] fade_in_samples: u64, #[serde(default)] fade_out_samples: u64 },
     /// Point patch of a clip's fragment/fades (None — do not change).
@@ -489,7 +470,7 @@ pub enum Op {
     HistoryRedo,
     /// Undo/redo stack depths and the names of the last operations.
     HistoryList,
-    RenderScene { scene: u64, out: PathBuf, width: u32, height: u32, frames: Option<(Frame, Frame)>, #[serde(default)] shot: Option<u64>, #[serde(default)] twos: bool },
+    RenderScene { scene: u64, out: PathBuf, width: u32, height: u32, frames: Option<(Frame, Frame)>, #[serde(default)] camera: Option<u64> },
     RenderFilm { out: PathBuf, width: u32, height: u32, #[serde(default)] frames: Option<(Frame, Frame)>, #[serde(default)] normalize: bool, #[serde(default)] target_peak_db: Option<f32> },
     JobStatus { job: u64 },
     JobWait { job: u64, timeout_secs: f64 },
@@ -497,8 +478,8 @@ pub enum Op {
     /// Full serde snapshot of one scene (phantoms, objects, shots, layers,
     /// audio tracks, background, camera).
     SceneGet { scene: u64 },
-    /// Full snapshot of a shot plus the revision of its parent scene.
-    ShotGet { scene: u64, shot: u64 },
+    /// Full snapshot of a camera plus the revision of its parent scene.
+    CameraGet { scene: u64, camera: u64 },
     /// Canonical asset, whether the file exists, and cheap usage references.
     AssetGet { asset: u64 },
     /// The full edit sequence and its mapped length.
@@ -510,19 +491,116 @@ pub enum Op {
     /// Render a single frame to PNG in-process (needs a GPU); the result is base64.
     /// `report: true` adds clean frame metrics (luma/empty_coverage) and the
     /// scene digest — the agent's "eyes" without a window (corrective C3.2).
-    RenderStill { scene: u64, frame: Frame, width: u32, height: u32, #[serde(default)] shot: Option<u64>, #[serde(default)] report: bool },
-    /// Shot report (corrective_2 K0.2): render a sample of the shot's frames and
-    /// metrics per frame — the agent's eyes on the whole shot, not one frame.
-    ShotReport { scene: u64, shot: u64, #[serde(default)] every: Option<u32>, #[serde(default)] width: Option<u32>, #[serde(default)] height: Option<u32> },
+    RenderStill { scene: u64, frame: Frame, width: u32, height: u32, #[serde(default)] camera: Option<u64>, #[serde(default)] report: bool },
+    /// Camera report (corrective_2 K0.2): render a sample of the camera's
+    /// frames and metrics per frame — the agent's eyes on the whole camera range.
+    CameraReport { scene: u64, camera: u64, #[serde(default)] every: Option<u32>, #[serde(default)] width: Option<u32>, #[serde(default)] height: Option<u32> },
+    /// Review sheet: several directions around the staged scene at one frame
+    /// (`angles`), or a strip of frames through one camera (`frames`). One
+    /// contact-sheet image plus per-tile metrics. Requires a GPU.
+    Look {
+        scene: u64,
+        #[serde(default)]
+        mode: Option<String>,
+        #[serde(default)]
+        target: Option<Vec<String>>,
+        #[serde(default)]
+        views: Option<Vec<ViewSpec>>,
+        #[serde(default)]
+        distance: Option<f32>,
+        #[serde(default)]
+        frame: Option<Frame>,
+        #[serde(default)]
+        camera: Option<u64>,
+        #[serde(default)]
+        frames: Option<Vec<Frame>>,
+        #[serde(default)]
+        every: Option<u32>,
+        #[serde(default)]
+        count: Option<u32>,
+        #[serde(default)]
+        view: Option<ViewSpec>,
+        #[serde(default)]
+        width: Option<u32>,
+        #[serde(default)]
+        height: Option<u32>,
+    },
+    /// A row/grid of catalog props placed in one atomic step (one undo): the
+    /// step is derived from the prop's own size unless given explicitly.
+    PropGrid {
+        scene: u64,
+        prop: String,
+        #[serde(default)]
+        prefix: Option<String>,
+        rows: u32,
+        cols: u32,
+        origin: [f32; 3],
+        #[serde(default)]
+        step: Option<[f32; 2]>,
+        #[serde(default)]
+        gap: Option<f32>,
+        #[serde(default)]
+        yaw: f32,
+        #[serde(default)]
+        pitch: f32,
+        #[serde(default)]
+        roll: f32,
+        #[serde(default)]
+        scale: Option<[f32; 3]>,
+    },
+    /// Fill an area or a line from a preset (forest, grove, undergrowth, hedge,
+    /// street_row, pole_row) in one atomic step. Inside `action` the fill places
+    /// editable props; the ring beyond it becomes ONE band object. Zones are
+    /// given as a world rectangle or off a ground plate, never guessed.
+    Scatter {
+        scene: u64,
+        preset: String,
+        /// World rectangle "x0,z0,x1,z1" (mutually exclusive with `plate`).
+        #[serde(default)]
+        area: Option<[f32; 4]>,
+        /// Object id of a ground plate (street_yard/park/crossing) to fill.
+        #[serde(default)]
+        plate: Option<u64>,
+        /// Keep this margin (m) clear of the plate's edge.
+        #[serde(default)]
+        inset: Option<f32>,
+        /// The zone the scene is shot in: world rectangle, editable props.
+        #[serde(default)]
+        action: Option<[f32; 4]>,
+        /// Props per square meter; the preset's own default by default.
+        #[serde(default)]
+        density: Option<f32>,
+        /// Line presets: segment endpoints in world coordinates.
+        #[serde(default)]
+        from: Option<[f32; 2]>,
+        #[serde(default)]
+        to: Option<[f32; 2]>,
+        #[serde(default)]
+        step: Option<f32>,
+        /// Determinism seed; a random one is drawn and reported when omitted.
+        #[serde(default)]
+        seed: Option<u64>,
+        #[serde(default)]
+        prefix: Option<String>,
+    },
+    /// One object whose mesh is a replayed scatter plan (the far band of a
+    /// fill). Split from `scatter` so the batch composes plain ops.
+    ScatterBand {
+        scene: u64,
+        name: String,
+        field: phantom_core::ScatterField,
+        pos: [f32; 3],
+        yaw: f32,
+    },
     /// Clean document validation (no render/GPU): screen invariants, FOV
     /// coverage, motion gaps, audio and edit ranges, asset files.
     /// `None` — the whole project.
     Validate { scene: Option<u64> },
     /// Frame coverage by the background screen and phantom/object visibility at a frame.
     /// Pure geometry; angles in the response are degrees, aspect is width/height.
-    CameraCoverage { scene: u64, frame: Option<Frame>, shot: Option<u64>, aspect: Option<f64> },
+    CameraCoverage { scene: u64, frame: Option<Frame>, #[serde(default)] camera: Option<u64>, aspect: Option<f64> },
     /// Fit the screen geometry to the camera with a margin (degrees).
-    BackgroundFit { scene: u64, frame: Option<Frame>, shot: Option<u64>, margin_deg: Option<f64>, aspect: Option<f64> },
+    BackgroundFit { scene: u64, frame: Option<Frame>, #[serde(default)] camera: Option<u64>, margin_deg: Option<f64>, aspect: Option<f64> },
     /// Audio report (corrective C3.4/A4): track/clip durations against the
     /// video, RMS/peak of the fragments actually used (ffmpeg),
     /// warnings. `None` — the whole project.
@@ -549,24 +627,26 @@ impl Op {
         use Op::*;
         match self {
             ProjectNew { .. } | ProjectOpen { .. } | LockRelease { .. } | ProjectSave => OpClass::Lifecycle,
-            ProjectRecent | StateGet | BuiltinCatalog | CatalogQuery { .. } | LightingGet { .. } | FloorGet { .. } | ClipList { .. }
-            | HistoryList | SceneGet { .. } | ShotGet { .. } | AssetGet { .. } | FilmGet | AssetList
+            ProjectRecent | StateGet | BuiltinCatalog | CatalogQuery { .. } | LightingGet { .. } | FloorGet { .. }
+            | StageGet { .. }
+            | HistoryList | SceneGet { .. } | CameraGet { .. } | AssetGet { .. } | FilmGet | AssetList
             | Validate { .. } | CameraCoverage { .. } | BackgroundFit { .. } | AudioReport { .. } | MaterialList { .. } => OpClass::Query,
             RenderScene { .. } | RenderFilm { .. } | JobStatus { .. } | JobWait { .. } | JobCancel { .. }
-            | JobList | RenderStill { .. } | ShotReport { .. } => OpClass::Job,
+            | JobList | RenderStill { .. } | CameraReport { .. } | Look { .. } => OpClass::Job,
             SceneAdd { .. } | AssetImport { .. } | BackgroundSet { .. } | BackgroundClear { .. }
-            | SceneRangeSet { .. } | PhantomAdd { .. } | KeySet { .. } | CameraSet { .. } | CameraKeySet { .. } | PropAdd { .. }
+            | SceneRangeSet { .. } | PhantomAdd { .. } | KeySet { .. } | CameraKeySet { .. } | PropAdd { .. }
             | ObjectAdd { .. } | ObjectRemove { .. } | ObjectKeySet { .. } | ObjectKeyRemove { .. }
             | LightingSet { .. } | FloorSet { .. } | BrushStroke { .. } | FilmAdd { .. }
+            | StageSet { .. }
             | LightAdd { .. } | LightRemove { .. } | LightKeySet { .. } | LightKeyRemove { .. }
             | AmbientSet { .. } | SkySet { .. } | ObjectAttach { .. } | LightAttach { .. } | PhantomScaleSet { .. }
             | MaterialSet { .. } | GradeSet { .. } | FogSet { .. } | VfxAdd { .. } | VfxRemove { .. } | VfxKeySet { .. } | VfxKeyRemove { .. }
-            | ShotAdd { .. } | ShotRemove { .. } | ShotRangeSet { .. } | ShotCameraKeySet { .. }
-            | ShotCameraKeySetKey { .. } | ShotFocalKeySet { .. }
-            | ShotCameraKeyRemove { .. } | ShotFocalSet { .. } | FilmMove { .. } | FilmTrim { .. }
+            | CameraAdd { .. } | CameraRemove { .. } | CameraSelect { .. } | CameraRangeSet { .. }
+            | CameraKeyRemove { .. } | CameraLensSet { .. } | CameraFocalKeySet { .. } | CameraTargetSet { .. }
+            | FilmMove { .. } | FilmTrim { .. }
             | FilmRemove { .. } | PhantomRemove { .. } | MotionKeyRemove { .. } | MotionReplace { .. }
-            | TakeAdd { .. } | PhantomClipSet { .. } | ClipUseRemove { .. } | TakeActive { .. }
-            | TakeRemove { .. } | AudioTrackAdd { .. } | AudioClipAdd { .. } | AudioClipUpdate { .. } | TrackVolumeSet { .. }
+            | PropGrid { .. } | Scatter { .. } | ScatterBand { .. }
+            | AudioTrackAdd { .. } | AudioClipAdd { .. } | AudioClipUpdate { .. } | TrackVolumeSet { .. }
             | TrackMuteSet { .. } | AudioClipRemove { .. } | AudioTrackRemove { .. }
             | LayerAdd2D { .. } | ExposureRemove { .. } | HistoryUndo | HistoryRedo
             | Batch { .. } => OpClass::DocumentMutation,
@@ -648,14 +728,14 @@ fn default_true() -> bool {
 
 /// Frame aspect ratio for clean diagnostics: finite, > 0;
 /// 16:9 by default.
-/// Frames for the shot report (K0.2): without `every` — up to 5 evenly spaced
+/// Frames for the camera report (K0.2): without `every` — up to 5 evenly spaced
 /// points of the range, with `every` — every Nth frame; a hard cap of 12 frames
-/// so the report stays cheap and does not turn into a render of the whole shot.
-fn shot_report_frames(range: FrameRange, every: Option<u32>) -> Result<Vec<Frame>, SessionError> {
+/// so the report stays cheap and does not turn into a render of the whole range.
+fn camera_report_frames(range: FrameRange, every: Option<u32>) -> Result<Vec<Frame>, SessionError> {
     const MAX_FRAMES: usize = 12;
     let len = range.end - range.start;
     if len <= 0 {
-        return Err(SessionError::BadInput("shot range is empty".into()));
+        return Err(SessionError::BadInput("camera range is empty".into()));
     }
     let frames: Vec<Frame> = match every {
         Some(0) => return Err(SessionError::BadInput("every must be > 0".into())),
@@ -674,24 +754,22 @@ fn checked_aspect(aspect: Option<f64>) -> Result<f32, SessionError> {
     Ok(aspect as f32)
 }
 
-// Previous hardcoded background screen geometry — serde defaults
-// for the extended background_set (parity with the CLI set-background).
-fn default_bg_arc() -> f32 {
-    2.0
-}
-fn default_bg_radius() -> f32 {
-    6.0
+// Default flat backdrop geometry — serde defaults for background_set
+// (parity with the CLI set-background): wide and tall enough for the default
+// camera, standing on the floor at z = −5.
+fn default_bg_width() -> f32 {
+    24.0
 }
 fn default_bg_height() -> f32 {
-    4.0
+    8.0
 }
 fn default_bg_center() -> [f32; 3] {
-    [0.0, 2.0, -5.0]
+    [0.0, 4.0, -5.0]
 }
 
 /// Build controller keys from motion triples plus a parallel yaws vector.
 fn build_motion_keys(
-    motion: Vec<(Frame, [f32; 3], Action)>,
+    motion: Vec<(Frame, [f32; 3], ActorPose)>,
     yaws: Option<Vec<f32>>,
     op: &str,
 ) -> Result<Vec<MotionKey>, SessionError> {
@@ -707,11 +785,11 @@ fn build_motion_keys(
     let mut yaws = yaws.map(Vec::into_iter);
     Ok(motion
         .into_iter()
-        .map(|(frame, pos, action)| MotionKey {
+        .map(|(frame, pos, pose)| MotionKey {
             yaw: yaws.as_mut().and_then(|y| y.next()).unwrap_or(0.0),
             frame,
             position: pos.into(),
-            action,
+            pose,
         })
         .collect())
 }
@@ -721,11 +799,67 @@ fn parse_asset_kind(s: &str) -> Result<AssetKind, SessionError> {
     match s {
         "model-obj" => Ok(AssetKind::ModelObj),
         "model-fbx" => Ok(AssetKind::ModelFbx),
-        "motion-fbx" => Ok(AssetKind::MotionFbx),
         "image" => Ok(AssetKind::Image),
         "audio" => Ok(AssetKind::Audio),
         "video" => Ok(AssetKind::Video),
         other => Err(SessionError::BadInput(format!("unsupported asset type: {other}"))),
+    }
+}
+
+/// The camera an operation refers to: an explicit id, or the scene's active
+/// camera when the caller names none.
+fn resolve_camera(scene: &Scene, camera: Option<u64>) -> Result<CameraId, SessionError> {
+    match camera {
+        Some(id) => {
+            let id = CameraId(id);
+            if !scene.cameras.contains_key(&id) {
+                return Err(CoreError::CameraNotFound(id).into());
+            }
+            Ok(id)
+        }
+        None => Ok(scene.active_camera),
+    }
+}
+
+/// Substitute a review camera into a clone of the scene: the sheet renders
+/// through the ordinary camera path, and the review camera never reaches the
+/// document (or the undo history).
+fn set_review_camera(document: &mut Scene, id: CameraId, camera: Camera) {
+    let range = document.range;
+    let entry = document.cameras.entry(id).or_insert_with(|| SceneCamera::new(id, "review", range));
+    entry.camera = camera;
+    entry.target = None;
+}
+
+/// A camera subject on the wire: "phantom:<id>", "object:<id>", or a bare
+/// number that is looked up among the scene's phantoms first, then objects.
+pub(crate) fn parse_camera_subject(project: &Project, subject: Option<&str>) -> Result<CameraSubject, SessionError> {
+    let raw = subject.ok_or_else(|| SessionError::BadInput("camera_target_set: subject is required".into()))?;
+    let raw = raw.trim();
+    let (kind, id) = match raw.split_once(':') {
+        Some((kind, id)) => (Some(kind.trim().to_ascii_lowercase()), id.trim()),
+        None => (None, raw),
+    };
+    let id: u64 = id
+        .parse()
+        .map_err(|_| SessionError::BadInput(format!("camera_target_set: subject is \"phantom:<id>\" or \"object:<id>\", got {raw}")))?;
+    let scene_has = |scene: &Scene, subject: CameraSubject| match subject {
+        CameraSubject::Phantom(id) => scene.phantoms.contains_key(&id),
+        CameraSubject::Object(id) => scene.objects.contains_key(&id),
+    };
+    // A bare number: obey whichever id exists in the scene, so a caller does not
+    // need the `phantom:`/`object:` prefix for the common cases.
+    let named = |subject: CameraSubject| match subject {
+        CameraSubject::Phantom(id) if !project.scenes.values().any(|s| scene_has(s, subject)) => {
+            CameraSubject::Object(ObjectId(id.0))
+        }
+        other => other,
+    };
+    match kind.as_deref() {
+        Some("phantom") => Ok(CameraSubject::Phantom(PhantomId(id))),
+        Some("object") => Ok(CameraSubject::Object(ObjectId(id))),
+        Some(other) => Err(SessionError::BadInput(format!("camera_target_set: subject kind is phantom|object, got {other}"))),
+        None => Ok(named(CameraSubject::Phantom(PhantomId(id)))),
     }
 }
 
@@ -738,16 +872,43 @@ fn rig_kind(rig: &RigRef) -> String {
     }
 }
 
-/// "humanoid"|"quadruped" → retargeting profile; None — direct name matching.
-fn parse_retarget(v: Option<&str>) -> Result<Option<RetargetProfile>, SessionError> {
-    match v {
-        None => Ok(None),
-        Some("humanoid") => Ok(Some(RetargetProfile::Humanoid)),
-        Some("quadruped") => Ok(Some(RetargetProfile::Quadruped)),
-        Some(other) => Err(SessionError::BadInput(format!("retarget: unknown profile {other:?} (humanoid|quadruped)"))),
-    }
+/// Scene stage from the wire fields: a preset, an explicit size, or both (the
+/// preset fills the axes the caller left out). Without a preset all three
+/// dimensions are required, so a half-specified stage never reaches the
+/// document.
+fn build_stage(
+    preset: Option<&str>,
+    width: Option<f32>,
+    height: Option<f32>,
+    depth: Option<f32>,
+    center: [f32; 2],
+) -> Result<Stage, SessionError> {
+    let named = match preset {
+        Some(name) => Some(
+            StagePreset::parse(name)
+                .ok_or_else(|| SessionError::BadInput(format!("preset: small|medium|large, got {name}")))?,
+        ),
+        None => None,
+    };
+    let size = match (named, width, height, depth) {
+        (Some(p), w, h, d) => {
+            let base = p.size();
+            StageSize::new(w.unwrap_or(base.width), h.unwrap_or(base.height), d.unwrap_or(base.depth))
+        }
+        (None, Some(w), Some(h), Some(d)) => StageSize::new(w, h, d),
+        (None, ..) => {
+            return Err(SessionError::BadInput(
+                "stage_set needs a preset or width + height + depth".to_string(),
+            ))
+        }
+    };
+    // The preset label survives only while the size really is the preset's.
+    let preset = match (named, width, height, depth) {
+        (Some(p), None, None, None) => Some(p),
+        _ => None,
+    };
+    Ok(Stage { preset, size, center })
 }
-
 /// Child CLI `render` arguments for a scene export job.
 fn scene_render_args(
     dir: &Path,
@@ -755,25 +916,21 @@ fn scene_render_args(
     scene: u64,
     width: u32,
     height: u32,
-    shot: Option<u64>,
+    camera: Option<u64>,
     frames: Option<(Frame, Frame)>,
-    twos: bool,
 ) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = vec![
         "render".into(), dir.into(), "--scene".into(), scene.to_string().into(),
         "--out".into(), out.into(), "--width".into(), width.to_string().into(),
         "--height".into(), height.to_string().into(),
     ];
-    if let Some(sh) = shot {
-        args.push("--shot".into());
-        args.push(sh.to_string().into());
+    if let Some(cam) = camera {
+        args.push("--camera".into());
+        args.push(cam.to_string().into());
     }
     if let Some((s, e)) = frames {
         args.push("--frames".into());
         args.push(format!("{s}-{e}").into());
-    }
-    if twos {
-        args.push("--twos".into());
     }
     args
 }
@@ -887,6 +1044,10 @@ pub struct Session {
     next_job: u64,
     lock_guard: Option<LockGuard>,
     state_path: PathBuf,
+    /// Stage clamps the last document mutation performed. The acknowledgement
+    /// gate turns them into `clamped: true` + `clamps: [...]`, so an agent
+    /// always learns that its coordinate was corrected (layout mode).
+    last_clamps: Vec<Clamp>,
 }
 
 impl Session {
@@ -905,12 +1066,15 @@ impl Session {
             next_job: 1,
             lock_guard: None,
             state_path,
+            last_clamps: Vec::new(),
         }
     }
 
     fn cmd(&mut self, c: Command) -> Result<CommandOutput, SessionError> {
         let project = self.project.as_mut().ok_or(SessionError::NoProject)?;
-        Ok(self.history.apply(project, c)?)
+        let out = self.history.apply(project, c)?;
+        self.last_clamps = out.clamped.clone();
+        Ok(out)
     }
 
     fn dir(&self) -> Result<&Path, SessionError> {
@@ -982,6 +1146,7 @@ impl Session {
     pub fn execute(&mut self, op: Op) -> Result<Value, SessionError> {
         let class = op.class();
         let ack_op = op.clone();
+        self.last_clamps.clear();
         let mut value = self.execute_inner(op)?;
         if class == OpClass::DocumentMutation {
             let project = self.project.as_ref().ok_or(SessionError::NoProject)?;
@@ -989,10 +1154,15 @@ impl Session {
             if !value.is_object() {
                 value = json!({ "result": value });
             }
+            let clamps = std::mem::take(&mut self.last_clamps);
             let object = value.as_object_mut().expect("normalized object");
             object.insert("revision".into(), json!(project.revision));
             object.insert("next_id".into(), json!(project.next_id()));
             object.insert("entity".into(), entity);
+            if !clamps.is_empty() {
+                object.insert("clamped".into(), json!(true));
+                object.insert("clamps".into(), json!(clamps));
+            }
         }
         Ok(value)
     }
@@ -1026,15 +1196,32 @@ impl Session {
             MotionReplace { scene: sid, phantom, .. } => scene(*sid).and_then(|s| s.phantoms.get(&PhantomId(*phantom))).map(|p| json!({
                 "kind":"motion", "scene":sid, "phantom":phantom, "keys":p.motion
             })).unwrap_or(Value::Null),
-            CameraSet { scene: id, .. } => scene(*id).map(|s| json!({"kind":"camera", "scene":id, "camera":s.camera})).unwrap_or(Value::Null),
-            CameraKeySet { scene: id, shot, .. } => scene(*id).and_then(|s| match shot {
-                Some(shot) => s.shots.get(&ShotId(*shot)).map(|sh| json!({"kind":"shot_camera", "scene":id, "shot":shot, "camera":sh.camera})),
-                None => Some(json!({"kind":"camera", "scene":id, "camera":s.camera})),
-            }).unwrap_or(Value::Null),
+            CameraAdd { scene: sid, .. } => result["camera"].as_u64().and_then(|id| scene(*sid)?.cameras.get(&CameraId(id))).map(|c| json!({
+                "kind":"camera", "scene":sid, "id":c.id.0, "name":c.name, "range":c.range, "camera":c.camera, "target":c.target,
+            })).unwrap_or(Value::Null),
+            CameraRemove { scene, camera } => json!({"kind":"camera", "scene":scene, "id":camera, "removed":true}),
+            CameraSelect { scene: sid, .. } => scene(*sid).map(|s| json!({"kind":"active_camera", "scene":sid, "id":s.active_camera.0})).unwrap_or(Value::Null),
+            CameraKeySet { scene: sid, camera, .. } => {
+                let id = camera.unwrap_or_else(|| scene(*sid).map(|s| s.active_camera.0).unwrap_or(0));
+                scene(*sid).and_then(|s| s.cameras.get(&CameraId(id))).map(|c| json!({
+                    "kind":"camera", "scene":sid, "id":c.id.0, "name":c.name, "range":c.range, "camera":c.camera, "target":c.target,
+                })).unwrap_or(Value::Null)
+            }
             ObjectAdd { scene: sid, .. } | PropAdd { scene: sid, .. } => result["object"].as_u64().and_then(|id| scene(*sid)?.objects.get(&ObjectId(id))).map(|o| json!({
                 "kind":"object", "scene":sid, "id":o.id.0, "name":o.name, "asset":o.asset.0, "keys":o.keys
             })).unwrap_or(Value::Null),
             ObjectRemove { scene, object } => json!({"kind":"object", "scene":scene, "id":object, "removed":true}),
+            PropGrid { scene: sid, .. } => result["objects"].as_array().map(|ids| json!({
+                "kind":"prop_grid", "scene":sid, "ids":ids, "count":ids.len()
+            })).unwrap_or(Value::Null),
+            Scatter { scene: sid, .. } => json!({
+                "kind":"scatter", "scene":sid,
+                "objects": result["objects"].as_array().map(|v| v.len()).unwrap_or(0),
+                "band": result["band"], "seed": result["seed"],
+            }),
+            ScatterBand { scene: sid, name, .. } => result["object"].as_u64().map(|id| json!({
+                "kind":"object", "scene":sid, "id":id, "name":name, "band":true
+            })).unwrap_or(Value::Null),
             ObjectKeySet { scene: sid, object, frame, .. } => scene(*sid).and_then(|s| s.objects.get(&ObjectId(*object))).and_then(|o| o.keys.iter().find(|k| k.frame == *frame)).map(|key| json!({
                 "kind":"object_key", "scene":sid, "object":object, "id":{"object":object,"frame":frame}, "key":key
             })).unwrap_or(Value::Null),
@@ -1077,40 +1264,20 @@ impl Session {
             })).unwrap_or(Value::Null),
             SkySet { scene: id, .. } => scene(*id).map(|s| json!({"kind":"sky", "scene":id, "sky":s.sky})).unwrap_or(Value::Null),
             FloorSet { scene: id, .. } => scene(*id).map(|s| json!({"kind":"floor", "scene":id, "floor":s.floor})).unwrap_or(Value::Null),
+            StageSet { scene: id, .. } => scene(*id).map(|s| json!({"kind":"stage", "scene":id, "stage":s.stage})).unwrap_or(Value::Null),
             FilmAdd { .. } => result["clip"].as_u64().and_then(|id| project.film.iter().find(|c| c.id.0 == id)).map(|c| json!({
-                "kind":"film_clip", "id":c.id.0, "scene":c.scene.0, "range":c.range, "shot":c.shot.map(|s|s.0)
+                "kind":"film_clip", "id":c.id.0, "scene":c.scene.0, "range":c.range, "camera":c.camera.map(|s|s.0)
             })).unwrap_or(Value::Null),
             FilmMove { clip, .. } | FilmTrim { clip, .. } => project.film.iter().find(|c| c.id.0 == *clip).map(|c| json!({
-                "kind":"film_clip", "id":c.id.0, "scene":c.scene.0, "range":c.range, "shot":c.shot.map(|s|s.0),
+                "kind":"film_clip", "id":c.id.0, "scene":c.scene.0, "range":c.range, "camera":c.camera.map(|s|s.0),
                 "index":project.film.iter().position(|x| x.id == c.id)
             })).unwrap_or(Value::Null),
             FilmRemove { clip } => json!({"kind":"film_clip", "id":clip, "removed":true}),
-            ShotAdd { scene: sid, .. } => result["shot"].as_u64().and_then(|id| scene(*sid)?.shots.get(&ShotId(id))).map(|s| json!({
-                "kind":"shot", "scene":sid, "id":s.id.0, "name":s.name, "range":s.range, "camera":s.camera
+            CameraRangeSet { scene: sid, camera, .. } | CameraKeyRemove { scene: sid, camera, .. }
+            | CameraLensSet { scene: sid, camera, .. } | CameraFocalKeySet { scene: sid, camera, .. }
+            | CameraTargetSet { scene: sid, camera, .. } => scene(*sid).and_then(|s| s.cameras.get(&CameraId(*camera))).map(|c| json!({
+                "kind":"camera", "scene":sid, "id":c.id.0, "name":c.name, "range":c.range, "camera":c.camera, "target":c.target,
             })).unwrap_or(Value::Null),
-            ShotRemove { scene, shot } => json!({"kind":"shot", "scene":scene, "id":shot, "removed":true}),
-            ShotRangeSet { scene: sid, shot, .. } | ShotCameraKeySet { scene: sid, shot, .. }
-            | ShotCameraKeySetKey { scene: sid, shot, .. } | ShotFocalKeySet { scene: sid, shot, .. }
-            | ShotCameraKeyRemove { scene: sid, shot, .. } | ShotFocalSet { scene: sid, shot, .. } => scene(*sid).and_then(|s| s.shots.get(&ShotId(*shot))).map(|s| json!({
-                "kind":"shot", "scene":sid, "id":s.id.0, "name":s.name, "range":s.range, "camera":s.camera
-            })).unwrap_or(Value::Null),
-            TakeAdd { scene: sid, phantom, .. } => result["take"].as_u64().and_then(|id| scene(*sid)?.phantoms.get(&PhantomId(*phantom))?.takes.iter().find(|t| t.id.0 == id)).map(|t| json!({
-                "kind":"take", "scene":sid, "phantom":phantom, "id":t.id.0, "name":t.name, "range":t.range, "motion":t.motion
-            })).unwrap_or(Value::Null),
-            TakeActive { scene: sid, phantom, .. } => scene(*sid).and_then(|s| s.phantoms.get(&PhantomId(*phantom))).map(|p| json!({
-                "kind":"phantom", "scene":sid, "id":phantom, "active_take":p.active_take.map(|t|t.0)
-            })).unwrap_or(Value::Null),
-            TakeRemove { scene, phantom, take } => json!({"kind":"take", "scene":scene, "phantom":phantom, "id":take, "removed":true}),
-            PhantomClipSet { scene: sid, phantom, .. } => {
-                if let Some(id) = result["clip_use"].as_u64() {
-                    scene(*sid).and_then(|s| s.phantoms.get(&PhantomId(*phantom))).and_then(|p| p.clip_track.iter().find(|u| u.id.0 == id)).map(|u| json!({
-                        "kind":"clip_use", "scene":sid, "phantom":phantom, "id":id, "clip_use":u
-                    })).unwrap_or(Value::Null)
-                } else {
-                    scene(*sid).and_then(|s| s.phantoms.get(&PhantomId(*phantom))).map(|p| json!({"kind":"phantom_clip", "scene":sid, "phantom":phantom, "clip":p.clip.map(|a|a.0)})).unwrap_or(Value::Null)
-                }
-            }
-            ClipUseRemove { scene, phantom, clip_use } => json!({"kind":"clip_use", "scene":scene, "phantom":phantom, "id":clip_use, "removed":true}),
             AudioTrackAdd { scene, .. } => result["track"].as_u64().and_then(track).map(|t| json!({
                 "kind":"audio_track", "scene":scene, "id":t.id.0, "name":t.name, "volume":t.volume, "muted":t.muted, "clips":t.clips
             })).unwrap_or(Value::Null),
@@ -1147,10 +1314,12 @@ impl Session {
             // acknowledgement construction; keeping it explicit makes the
             // exhaustive classifier above the source of truth.
             ProjectNew { .. } | ProjectOpen { .. } | LockRelease { .. } | ProjectSave | ProjectRecent
-            | StateGet | BuiltinCatalog | CatalogQuery { .. } | LightingGet { .. } | FloorGet { .. } | ClipList { .. }
+            | StateGet | BuiltinCatalog | CatalogQuery { .. } | LightingGet { .. } | FloorGet { .. }
+            | StageGet { .. }
             | HistoryList | RenderScene { .. } | RenderFilm { .. } | JobStatus { .. } | JobWait { .. }
-            | JobCancel { .. } | SceneGet { .. } | ShotGet { .. } | AssetGet { .. } | FilmGet
-            | AssetList | JobList | RenderStill { .. } | ShotReport { .. } | Validate { .. } | CameraCoverage { .. }
+            | Look { .. }
+            | JobCancel { .. } | SceneGet { .. } | CameraGet { .. } | AssetGet { .. } | FilmGet
+            | AssetList | JobList | RenderStill { .. } | CameraReport { .. } | Validate { .. } | CameraCoverage { .. }
             | BackgroundFit { .. } | AudioReport { .. } => Value::Null,
         }
     }
@@ -1219,6 +1388,14 @@ impl Session {
         if let (Some(project), Some(pre)) = (self.project.as_mut(), pre_revision) {
             project.revision = pre + 1;
         }
+        // The per-op acks already carry their clamps; the package ack reports
+        // them once more for the whole batch.
+        self.last_clamps = results
+            .iter()
+            .filter_map(|r| r.get("clamps").and_then(|c| c.as_array()))
+            .flatten()
+            .filter_map(|c| serde_json::from_value(c.clone()).ok())
+            .collect();
         Ok(json!({ "applied": ops.len(), "results": results }))
     }
 
@@ -1318,11 +1495,11 @@ impl Session {
                     "assets": p.assets.values().map(|a| json!({"id": a.id.0, "kind": format!("{:?}", a.kind), "path": a.path})).collect::<Vec<_>>(),
                     "phantoms": p.scenes.values().flat_map(|s| s.phantoms.values().map(move |ph| json!({
                         "scene": s.id.0, "id": ph.id.0, "name": ph.name, "rig": rig_kind(&ph.rig),
-                        "motion_keys": ph.motion.len(), "takes": ph.takes.len(), "clip_uses": ph.clip_track.len(),
+                        "motion_keys": ph.motion.len(),
                     })).collect::<Vec<_>>()).collect::<Vec<_>>(),
                     "film": p.film.iter().map(|c| json!({
                         "id": c.id.0, "scene": c.scene.0, "start": c.range.start, "end": c.range.end,
-                        "shot": c.shot.map(|sh| sh.0),
+                        "camera": c.camera.map(|sh| sh.0),
                     })).collect::<Vec<_>>(),
                     "audio_tracks": p.scenes.values().flat_map(|s| {
                         s.audio_tracks.iter().map(move |t| json!({
@@ -1334,24 +1511,12 @@ impl Session {
                     "objects": p.scenes.values().flat_map(|s| s.objects.values().map(move |o| json!({
                         "scene": s.id.0, "id": o.id.0, "name": o.name, "asset": o.asset.0, "keys": o.keys.len(),
                     })).collect::<Vec<_>>()).collect::<Vec<_>>() ,
-                    "shots": p.scenes.values().flat_map(|s| s.shots.values().map(move |sh| json!({
-                        "scene": s.id.0, "id": sh.id.0, "name": sh.name, "start": sh.range.start, "end": sh.range.end,
-                        "camera_keys": sh.camera.keys.len(), "focal_mm": sh.camera.focal_mm,
+                    "stages": p.scenes.values().map(|s| json!({"scene": s.id.0, "stage": s.stage})).collect::<Vec<_>>(),
+                    "cameras": p.scenes.values().flat_map(|s| s.cameras.values().map(move |c| json!({
+                        "scene": s.id.0, "id": c.id.0, "name": c.name, "start": c.range.start, "end": c.range.end,
+                        "camera_keys": c.camera.keys.len(), "focal_mm": c.camera.focal_mm,
+                        "target": c.target, "active": s.active_camera == c.id,
                     })).collect::<Vec<_>>()).collect::<Vec<_>>(),
-                    "clip_tracks": p.scenes.values().flat_map(|s| {
-                        s.phantoms
-                            .values()
-                            .filter(|ph| ph.clip.is_some() || !ph.clip_track.is_empty())
-                            .map(move |ph| json!({
-                                "scene": s.id.0, "phantom": ph.id.0, "legacy_clip": ph.clip.map(|c| c.0),
-                                "uses": ph.clip_track.iter().map(|u| json!({
-                                    "id": u.id.0, "asset": u.asset.0, "stack": u.stack, "start": u.range.start, "end": u.range.end,
-                                    "speed": u.speed, "blend_in": u.blend_in, "blend_out": u.blend_out,
-                                    "root_motion": format!("{:?}", u.root_motion),
-                                })).collect::<Vec<_>>(),
-                            }))
-                            .collect::<Vec<_>>()
-                    }).collect::<Vec<_>>(),
                     "film_len": film_len(&p.film),
                     "audio_summary": crate::analysis::audio_summary(p),
                 }))
@@ -1374,30 +1539,26 @@ impl Session {
                     },
                 };
                 // Models go through bundle import (model + MTL + textures);
-                // other assets are a single file, as before. kind only affects
-                // registration: motion-fbx uses the same fbx bundle.
-                let (rel, diagnostics) = if matches!(kind, AssetKind::ModelObj | AssetKind::ModelFbx | AssetKind::MotionFbx) {
+                // other assets are a single file.
+                let (rel, diagnostics, bounds) = if matches!(kind, AssetKind::ModelObj | AssetKind::ModelFbx) {
                     let bundle = phantom_runtime::import::import_model_bundle(self.dir()?, &file)?;
-                    (bundle.model, bundle.diagnostics)
+                    (bundle.model, bundle.diagnostics, bundle.bounds)
                 } else {
-                    (storage::import_file(self.dir()?, &file)?, Vec::new())
+                    (storage::import_file(self.dir()?, &file)?, Vec::new(), None)
                 };
-                let out = self.cmd(Command::RegisterAsset { kind, path: rel })?;
+                let out = self.cmd(Command::RegisterAsset { kind, path: rel, bounds })?;
                 Ok(json!({ "asset": out.asset.map(|a| a.0), "diagnostics": diagnostics }))
             }
-            BackgroundSet { scene, asset, video, arc, radius, height, center, bulge, fit } => {
-                self.cmd(Command::SetBackground {
-                    scene: SceneId(scene),
-                    background: Background {
-                        image: if video { BackgroundSource::Video { video: AssetId(asset) } } else { BackgroundSource::Image(AssetId(asset)) },
-                        arc_radians: arc,
-                        radius,
-                        height,
-                        center: center.into(),
-                        bulge: bulge.unwrap_or_default(),
-                        fit: fit.unwrap_or_default(),
-                    },
-                })?;
+            BackgroundSet { scene, asset, video, width, height, center, fit } => {
+                let background = Background {
+                    image: if video { BackgroundSource::Video { video: AssetId(asset) } } else { BackgroundSource::Image(AssetId(asset)) },
+                    width,
+                    height,
+                    center: center.into(),
+                    fit: fit.unwrap_or_default(),
+                };
+                background.validate()?;
+                self.cmd(Command::SetBackground { scene: SceneId(scene), background })?;
                 Ok(json!({ "ok": true }))
             }
             BackgroundClear { scene } => {
@@ -1415,9 +1576,12 @@ impl Session {
                     Some("primitive") => Some(phantom_core::catalog::CatalogKind::Primitive),
                     Some("furniture") => Some(phantom_core::catalog::CatalogKind::Furniture),
                     Some("interior") => Some(phantom_core::catalog::CatalogKind::Interior),
+                    Some("animal") => Some(phantom_core::catalog::CatalogKind::Animal),
+                    Some("street") => Some(phantom_core::catalog::CatalogKind::Street),
+                    Some("exterior") => Some(phantom_core::catalog::CatalogKind::Exterior),
                     Some(other) => {
                         return Err(SessionError::BadInput(format!(
-                            "kind: primitive|furniture|interior, got {other}"
+                            "kind: primitive|furniture|interior|animal|street|exterior, got {other}"
                         )))
                     }
                 };
@@ -1432,6 +1596,8 @@ impl Session {
                         "materials": e.materials,
                         "open_sides": e.open_sides,
                         "openings": e.openings,
+                        // What a room brings with it: placing it places these.
+                        "furniture": e.furniture,
                         "note": e.note,
                     })).collect::<Vec<_>>(),
                 }))
@@ -1447,8 +1613,23 @@ impl Session {
                     roll,
                     scale: scale.map(Into::into).unwrap_or(glam::Vec3::ONE),
                 });
+                // A furnished room is one package: the shell plus a piece per
+                // entry of its furniture set (expanded in the document layer,
+                // so GUI, CLI and MCP place a room identically). Report every
+                // id that arrived, or the agent would have to guess them.
+                let before: Vec<u64> = self.project.as_ref().map(|p| p.scenes.get(&SceneId(scene)).map(|s| s.objects.keys().map(|id| id.0).collect()).unwrap_or_default()).unwrap_or_default();
                 let out = self.cmd(Command::AddBuiltinObject { scene: SceneId(scene), name, prop, key })?;
+                let after: Vec<u64> = self.project.as_ref().and_then(|p| p.scenes.get(&SceneId(scene)).map(|s| s.objects.keys().map(|id| id.0).collect())).unwrap_or_default();
+                let created: Vec<u64> = after.iter().copied().filter(|id| !before.contains(id)).collect();
+                if created.len() > 1 {
+                    return Ok(json!({ "object": out.object.map(|o| o.0), "objects": created, "furniture": created.len() - 1 }));
+                }
                 Ok(json!({ "object": out.object.map(|o| o.0) }))
+            }
+            ScatterBand { scene, name, field, pos, yaw } => {
+                let key = ObjectKey { frame: 0, position: pos.into(), yaw, pitch: 0.0, roll: 0.0, scale: glam::Vec3::ONE };
+                let out = self.cmd(Command::AddScatterField { scene: SceneId(scene), name, field, key: Some(key) })?;
+                Ok(json!({ "object": out.object.map(|o| o.0), "band": true }))
             }
             PhantomAdd { scene, name, rig_asset, rig_actor } => {
                 if rig_asset.is_some() && rig_actor.is_some() {
@@ -1465,57 +1646,17 @@ impl Session {
                 let out = self.cmd(Command::AddPhantom { scene: SceneId(scene), name, rig })?;
                 Ok(json!({ "phantom": out.phantom.map(|p| p.0) }))
             }
-            KeySet { scene, phantom, frame, pos, action, yaw } => {
+            KeySet { scene, phantom, frame, pos, pose, yaw } => {
                 self.cmd(Command::SetMotionKey {
                     scene: SceneId(scene),
                     phantom: PhantomId(phantom),
-                    key: MotionKey { yaw, frame, position: pos.into(), action },
+                    key: MotionKey { yaw, frame, position: pos.into(), pose },
                 })?;
                 Ok(json!({ "ok": true }))
             }
-            CameraKeySet { scene, shot, key } => {
-                match shot {
-                    Some(shot) => {
-                        self.cmd(Command::SetShotCameraKey { scene: SceneId(scene), shot: ShotId(shot), key })?;
-                    }
-                    None => {
-                        // Legacy camera: the key is merged into the list; the base
-                        // focal length comes from the key when it sets one.
-                        let mut keys = self
-                            .project
-                            .as_ref()
-                            .and_then(|p| p.scenes.get(&SceneId(scene)))
-                            .map(|s| s.camera.keys.clone())
-                            .unwrap_or_default();
-                        match keys.binary_search_by_key(&key.frame, |k| k.frame) {
-                            Ok(i) => keys[i] = key,
-                            Err(i) => keys.insert(i, key),
-                        }
-                        let focal_mm = key.focal_mm.unwrap_or_else(|| {
-                            self.project
-                                .as_ref()
-                                .and_then(|p| p.scenes.get(&SceneId(scene)))
-                                .map(|s| s.camera.focal_mm)
-                                .unwrap_or(35.0)
-                        });
-                        self.cmd(Command::SetCamera { scene: SceneId(scene), camera: Camera { keys, focal_mm } })?;
-                    }
-                }
-                Ok(json!({ "ok": true }))
-            }
-            CameraSet { scene, frame, pos, yaw, pitch, focal_mm } => {
-                let mut keys = self
-                    .project
-                    .as_ref()
-                    .and_then(|p| p.scenes.get(&SceneId(scene)))
-                    .map(|s| s.camera.keys.clone())
-                    .unwrap_or_default();
-                let key = TransformKey::at(frame, pos.into(), yaw, pitch);
-                match keys.binary_search_by_key(&frame, |k| k.frame) {
-                    Ok(i) => keys[i] = key,
-                    Err(i) => keys.insert(i, key),
-                }
-                self.cmd(Command::SetCamera { scene: SceneId(scene), camera: Camera { keys, focal_mm } })?;
+            CameraKeySet { scene, camera, key } => {
+                let camera = resolve_camera(&self.project.as_ref().ok_or(SessionError::NoProject)?.scenes[&SceneId(scene)], camera)?;
+                self.cmd(Command::SetCameraKey { scene: SceneId(scene), camera, key })?;
                 Ok(json!({ "ok": true }))
             }
             ObjectAdd { scene, name, asset } => {
@@ -1655,8 +1796,20 @@ impl Session {
                     }
                     (None, Some(id)) => {
                         let ob = s.objects.get(&ObjectId(id)).ok_or(CoreError::ObjectNotFound(ObjectId(id)))?;
-                        let a = p.assets.get(&ob.asset).ok_or(CoreError::AssetNotFound(ob.asset))?;
-                        let model = phantom_runtime::import::load_model(&self.dir()?.join(&a.path), false)?;
+                        // A generated fill and a catalog prop have no file to
+                        // open: their parts come from the same procedural path
+                        // the renderer uses, so the group names listed here are
+                        // the ones `material_set` will actually hit.
+                        let model = if let Some(field) = &ob.scatter {
+                            phantom_runtime::props::scatter_field_model(field)
+                                .ok_or_else(|| SessionError::BadInput(format!("material_list: cannot replay fill of object {id}")))?
+                        } else if let Some(prop) = &ob.builtin {
+                            phantom_runtime::props::prop_model(prop)
+                                .ok_or_else(|| CoreError::UnknownProp(prop.clone()))?
+                        } else {
+                            let a = p.assets.get(&ob.asset).ok_or(CoreError::AssetNotFound(ob.asset))?;
+                            phantom_runtime::import::load_model(&self.dir()?.join(&a.path), false)?
+                        };
                         (json!({"object": id}), ob.material_patches.clone(), model)
                     }
                     _ => return Err(SessionError::BadInput("material_list: exactly one owner (phantom|object)".into())),
@@ -1682,6 +1835,20 @@ impl Session {
                 let s = p.scenes.get(&SceneId(scene)).ok_or(CoreError::SceneNotFound(SceneId(scene)))?;
                 Ok(json!({ "floor": s.floor }))
             }
+            StageSet { scene, preset, width, height, depth, center } => {
+                let current = {
+                    let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
+                    p.scenes.get(&SceneId(scene)).ok_or(CoreError::SceneNotFound(SceneId(scene)))?.stage
+                };
+                let stage = build_stage(preset.as_deref(), width, height, depth, center.unwrap_or(current.center))?;
+                self.cmd(Command::SetStage { scene: SceneId(scene), stage })?;
+                Ok(json!({ "stage": stage }))
+            }
+            StageGet { scene } => {
+                let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
+                let s = p.scenes.get(&SceneId(scene)).ok_or(CoreError::SceneNotFound(SceneId(scene)))?;
+                Ok(json!({ "stage": s.stage }))
+            }
             BrushStroke { scene, frame, points, color, width, erase } => {
                 let out = self.cmd(Command::BrushStroke {
                     scene: SceneId(scene),
@@ -1691,8 +1858,8 @@ impl Session {
                 })?;
                 Ok(json!({ "ok": true, "layer": out.layer.map(|l| l.0) }))
             }
-            FilmAdd { scene, start, end, shot } => {
-                let out = self.cmd(Command::AddFilmClip { scene: SceneId(scene), range: FrameRange::new(start, end)?, shot: shot.map(ShotId) })?;
+            FilmAdd { scene, start, end, camera } => {
+                let out = self.cmd(Command::AddFilmClip { scene: SceneId(scene), range: FrameRange::new(start, end)?, camera: camera.map(CameraId) })?;
                 // A4: the edit range is shorter than the scene's longest audio
                 // track — the tail of the sound will not reach the film; warn right away.
                 let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
@@ -1720,58 +1887,6 @@ impl Session {
                 }
                 Ok(json!({ "clip": out.clip.map(|c| c.0), "warnings": warnings }))
             }
-            ShotAdd { scene, name, start, end } => {
-                let out = self.cmd(Command::AddShot { scene: SceneId(scene), name, range: FrameRange::new(start, end)? })?;
-                Ok(json!({ "shot": out.shot.map(|s| s.0) }))
-            }
-            ShotRemove { scene, shot } => {
-                self.cmd(Command::RemoveShot { scene: SceneId(scene), shot: ShotId(shot) })?;
-                Ok(json!({ "ok": true }))
-            }
-            ShotRangeSet { scene, shot, start, end } => {
-                self.cmd(Command::SetShotRange { scene: SceneId(scene), shot: ShotId(shot), range: FrameRange::new(start, end)? })?;
-                Ok(json!({ "ok": true }))
-            }
-            ShotCameraKeySet { scene, shot, frame, pos, yaw, pitch } => {
-                self.cmd(Command::SetShotCameraKey {
-                    scene: SceneId(scene),
-                    shot: ShotId(shot),
-                    key: TransformKey::at(frame, pos.into(), yaw, pitch),
-                })?;
-                Ok(json!({ "ok": true }))
-            }
-            ShotCameraKeySetKey { scene, shot, key } => {
-                self.cmd(Command::SetShotCameraKey { scene: SceneId(scene), shot: ShotId(shot), key })?;
-                Ok(json!({ "ok": true }))
-            }
-            ShotFocalKeySet { scene, shot, frame, focal_mm } => {
-                // A focus key is the same camera key with its pose preserved: pose and
-                // focal length live in one key list.
-                let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
-                let s = p.scenes.get(&SceneId(scene)).ok_or(CoreError::SceneNotFound(SceneId(scene)))?;
-                let shot_ref = s.shots.get(&ShotId(shot)).ok_or(CoreError::ShotNotFound(ShotId(shot)))?;
-                let pose = shot_ref.camera.sample(frame);
-                let key = TransformKey {
-                    frame,
-                    translation: pose.translation,
-                    yaw: pose.yaw,
-                    pitch: pose.pitch,
-                    roll: pose.roll,
-                    look_at: None,
-                    focal_mm: Some(focal_mm),
-                    ease: Default::default(),
-                };
-                self.cmd(Command::SetShotCameraKey { scene: SceneId(scene), shot: ShotId(shot), key })?;
-                Ok(json!({ "ok": true }))
-            }
-            ShotCameraKeyRemove { scene, shot, frame } => {
-                self.cmd(Command::RemoveShotCameraKey { scene: SceneId(scene), shot: ShotId(shot), frame })?;
-                Ok(json!({ "ok": true }))
-            }
-            ShotFocalSet { scene, shot, focal_mm } => {
-                self.cmd(Command::SetShotFocal { scene: SceneId(scene), shot: ShotId(shot), focal_mm })?;
-                Ok(json!({ "ok": true }))
-            }
             FilmMove { clip, index } => {
                 self.cmd(Command::MoveFilmClip { clip: ClipId(clip), index })?;
                 Ok(json!({ "ok": true }))
@@ -1784,11 +1899,6 @@ impl Session {
                 self.cmd(Command::RemoveFilmClip { clip: ClipId(clip) })?;
                 Ok(json!({ "ok": true }))
             }
-            TakeAdd { scene, phantom, name, start, end, motion, yaws } => {
-                let motion = build_motion_keys(motion, yaws, "take_add")?;
-                let out = self.cmd(Command::AddTake { scene: SceneId(scene), phantom: PhantomId(phantom), name, range: FrameRange::new(start, end)?, motion })?;
-                Ok(json!({ "take": out.take.map(|t| t.0) }))
-            }
             PhantomRemove { scene, phantom } => {
                 self.cmd(Command::RemovePhantom { scene: SceneId(scene), phantom: PhantomId(phantom) })?;
                 Ok(json!({ "ok": true }))
@@ -1798,69 +1908,67 @@ impl Session {
                 Ok(json!({ "ok": true }))
             }
             MotionReplace { scene, phantom, motion, yaws } => {
-                let motion = build_motion_keys(motion, yaws, "motion_replace")?;
-                self.cmd(Command::ReplaceMotion { scene: SceneId(scene), phantom: PhantomId(phantom), motion })?;
+                // The wire carries triples plus a parallel yaw list (the legacy
+                // shape); the document gets typed keys.
+                let keys = build_motion_keys(motion, yaws, "motion_replace")?;
+                let count = keys.len();
+                self.cmd(Command::ReplaceMotion { scene: SceneId(scene), phantom: PhantomId(phantom), motion: keys })?;
+                Ok(json!({ "keys": count }))
+            }
+            CameraAdd { scene, name, start, end } => {
+                let range = match (start, end) {
+                    (Some(start), Some(end)) => Some(FrameRange::new(start, end)?),
+                    (None, None) => None,
+                    _ => return Err(SessionError::BadInput("camera_add: start and end come together".into())),
+                };
+                let out = self.cmd(Command::AddCamera { scene: SceneId(scene), name, range })?;
+                Ok(json!({ "camera": out.camera.map(|c| c.0) }))
+            }
+            CameraRemove { scene, camera } => {
+                self.cmd(Command::RemoveCamera { scene: SceneId(scene), camera: CameraId(camera) })?;
                 Ok(json!({ "ok": true }))
             }
-            PhantomClipSet { scene, phantom, clip, start, end, speed, blend_in, blend_out, stack, root_motion, retarget } => {
-                match (clip, start, end) {
-                    // Extended form: add a use to the track.
-                    (Some(asset), Some(start), Some(end)) => {
-                        let root_motion = match root_motion.as_deref() {
-                            None | Some("controller") => RootMotion::Controller,
-                            Some("clip") => RootMotion::Clip,
-                            Some(other) => return Err(SessionError::BadInput(format!("root_motion: unknown value {other:?} (controller|clip)"))),
-                        };
-                        let retarget = parse_retarget(retarget.as_deref())?;
-                        let clip_use = ClipUse {
-                            id: ClipUseId(0), // assigned by the command
-                            asset: AssetId(asset),
-                            stack,
-                            range: FrameRange::new(start, end)?,
-                            speed: speed.unwrap_or(1.0),
-                            blend_in: blend_in.unwrap_or(0.0),
-                            blend_out: blend_out.unwrap_or(0.0),
-                            root_motion,
-                            retarget,
-                        };
-                        let out = self.cmd(Command::AddClipUse { scene: SceneId(scene), phantom: PhantomId(phantom), clip_use })?;
-                        Ok(json!({ "clip_use": out.clip_use.map(|c| c.0) }))
-                    }
-                    // Legacy: one clip, looped over the whole scene (clip = null — clear it).
-                    (clip, None, None) => {
-                        if retarget.is_some() {
-                            return Err(SessionError::BadInput("phantom_clip_set: retarget is supported only in track form (start+end)".into()));
-                        }
-                        self.cmd(Command::SetPhantomClip { scene: SceneId(scene), phantom: PhantomId(phantom), clip: clip.map(AssetId) })?;
-                        Ok(json!({ "ok": true }))
-                    }
-                    _ => Err(SessionError::BadInput("phantom_clip_set: start and end must be set together".into())),
+            CameraSelect { scene, camera } => {
+                self.cmd(Command::ActivateCamera { scene: SceneId(scene), camera: CameraId(camera) })?;
+                Ok(json!({ "ok": true }))
+            }
+            CameraRangeSet { scene, camera, start, end } => {
+                self.cmd(Command::SetCameraRange { scene: SceneId(scene), camera: CameraId(camera), range: FrameRange::new(start, end)? })?;
+                Ok(json!({ "ok": true }))
+            }
+            CameraKeyRemove { scene, camera, frame } => {
+                self.cmd(Command::RemoveCameraKey { scene: SceneId(scene), camera: CameraId(camera), frame })?;
+                Ok(json!({ "ok": true }))
+            }
+            CameraLensSet { scene, camera, focal_mm } => {
+                self.cmd(Command::SetCameraLens { scene: SceneId(scene), camera: CameraId(camera), focal_mm })?;
+                Ok(json!({ "ok": true }))
+            }
+            CameraFocalKeySet { scene, camera, frame, focal_mm } => {
+                self.cmd(Command::SetCameraFocalKey { scene: SceneId(scene), camera: CameraId(camera), frame, focal_mm })?;
+                Ok(json!({ "ok": true }))
+            }
+            CameraTargetSet { scene, camera, mode, subject, clear } => {
+                if clear {
+                    self.cmd(Command::SetCameraTarget { scene: SceneId(scene), camera: CameraId(camera), target: None })?;
+                    return Ok(json!({ "ok": true }));
                 }
-            }
-            ClipUseRemove { scene, phantom, clip_use } => {
-                self.cmd(Command::RemoveClipUse { scene: SceneId(scene), phantom: PhantomId(phantom), clip_use: ClipUseId(clip_use) })?;
-                Ok(json!({ "ok": true }))
-            }
-            ClipList { asset } => {
-                let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
-                let a = p.assets.get(&AssetId(asset)).ok_or(CoreError::AssetNotFound(AssetId(asset)))?;
-                if !matches!(a.kind, AssetKind::ModelFbx | AssetKind::MotionFbx) {
-                    return Err(CoreError::WrongAssetKind(AssetId(asset)).into());
-                }
-                let path = self.dir()?.join(&a.path);
-                let stacks = phantom_runtime::import::list_stacks(&path)?;
-                Ok(json!({ "stacks": stacks.iter().map(|s| json!({
-                    "name": s.name,
-                    "duration_secs": s.duration_secs,
-                    "frames": (s.duration_secs * phantom_core::FPS as f32).ceil() as u32,
-                })).collect::<Vec<_>>() }))
-            }
-            TakeActive { scene, phantom, take } => {
-                self.cmd(Command::SetActiveTake { scene: SceneId(scene), phantom: PhantomId(phantom), take: take.map(crate::project::TakeId) })?;
-                Ok(json!({ "ok": true }))
-            }
-            TakeRemove { scene, phantom, take } => {
-                self.cmd(Command::RemoveTake { scene: SceneId(scene), phantom: PhantomId(phantom), take: crate::project::TakeId(take) })?;
+                let mode = match mode.as_deref() {
+                    Some("track") => CameraTargetMode::Track,
+                    Some("follow") => CameraTargetMode::Follow,
+                    other => {
+                        return Err(SessionError::BadInput(format!(
+                            "camera_target_set: mode is track|follow, got {}",
+                            other.unwrap_or("(missing)")
+                        )))
+                    }
+                };
+                let subject = parse_camera_subject(self.project.as_ref().ok_or(SessionError::NoProject)?, subject.as_deref())?;
+                self.cmd(Command::SetCameraTarget {
+                    scene: SceneId(scene),
+                    camera: CameraId(camera),
+                    target: Some(CameraTarget::new(mode, subject)),
+                })?;
                 Ok(json!({ "ok": true }))
             }
             AudioTrackAdd { scene, name } => {
@@ -1925,10 +2033,10 @@ impl Session {
                     "redo": self.history.redo_descriptions(LIMIT),
                 }))
             }
-            RenderScene { scene, out, width, height, frames, shot, twos } => {
+            RenderScene { scene, out, width, height, frames, camera } => {
                 let out = self.check_out_path(&out)?;
                 self.project_save()?;
-                let args = scene_render_args(self.dir()?, &out, scene, width, height, shot, frames, twos);
+                let args = scene_render_args(self.dir()?, &out, scene, width, height, camera, frames);
                 self.spawn_job(args, None)
             }
             RenderFilm { out, width, height, frames, normalize, target_peak_db } => {
@@ -1985,32 +2093,32 @@ impl Session {
                 })?;
                 Ok(report)
             }
-            CameraCoverage { scene, frame, shot, aspect } => {
+            CameraCoverage { scene, frame, camera, aspect } => {
                 let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
                 let s = p.scenes.get(&SceneId(scene)).ok_or(CoreError::SceneNotFound(SceneId(scene)))?;
-                let shot = match shot {
+                let camera = match camera {
                     Some(id) => {
-                        if !s.shots.contains_key(&ShotId(id)) {
-                            return Err(CoreError::ShotNotFound(ShotId(id)).into());
+                        if !s.cameras.contains_key(&CameraId(id)) {
+                            return Err(CoreError::CameraNotFound(CameraId(id)).into());
                         }
-                        Some(ShotId(id))
+                        Some(CameraId(id))
                     }
                     None => None,
                 };
                 let aspect = checked_aspect(aspect)?;
-                let mut out = crate::analysis::camera_coverage(s, shot, frame, aspect);
+                let mut out = crate::analysis::camera_coverage(p, s, camera, frame, aspect);
                 out["revision"] = json!(p.revision);
                 Ok(out)
             }
-            BackgroundFit { scene, frame, shot, margin_deg, aspect } => {
+            BackgroundFit { scene, frame, camera, margin_deg, aspect } => {
                 let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
                 let s = p.scenes.get(&SceneId(scene)).ok_or(CoreError::SceneNotFound(SceneId(scene)))?;
-                let shot = match shot {
+                let camera = match camera {
                     Some(id) => {
-                        if !s.shots.contains_key(&ShotId(id)) {
-                            return Err(CoreError::ShotNotFound(ShotId(id)).into());
+                        if !s.cameras.contains_key(&CameraId(id)) {
+                            return Err(CoreError::CameraNotFound(CameraId(id)).into());
                         }
-                        Some(ShotId(id))
+                        Some(CameraId(id))
                     }
                     None => None,
                 };
@@ -2019,22 +2127,22 @@ impl Session {
                 if !margin.is_finite() || !(0.0..45.0).contains(&margin) {
                     return Err(SessionError::BadInput(format!("margin_deg must be finite and in [0, 45): {margin}")));
                 }
-                // A frame only makes sense for a single camera: without shot the fit
-                // covers all of the scene's shots, each with its own range.
-                if shot.is_none() && frame.is_some() {
+                // An explicit frame only makes sense for a single camera: without
+                // one the fit covers every camera in the scene, each in its range.
+                if camera.is_none() && frame.is_some() {
                     return Err(SessionError::BadInput(
-                        "frame requires shot: without shot background_fit covers every camera in the scene".into(),
+                        "frame requires camera: without it background_fit covers every camera in the scene".into(),
                     ));
                 }
-                let mut out = crate::analysis::background_fit(s, shot, frame, margin, aspect);
+                let mut out = crate::analysis::background_fit(p, s, camera, frame, margin, aspect);
                 out["revision"] = json!(p.revision);
                 Ok(out)
             }
-            ShotGet { scene, shot } => {
+            CameraGet { scene, camera } => {
                 let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
                 let s = p.scenes.get(&SceneId(scene)).ok_or(CoreError::SceneNotFound(SceneId(scene)))?;
-                let shot = s.shots.get(&ShotId(shot)).ok_or(CoreError::ShotNotFound(ShotId(shot)))?;
-                Ok(json!({"scene":scene, "revision":p.revision, "shot":shot}))
+                let entry = s.cameras.get(&CameraId(camera)).ok_or(CoreError::CameraNotFound(CameraId(camera)))?;
+                Ok(json!({"scene":scene, "revision":p.revision, "camera":entry, "active_camera": s.active_camera}))
             }
             AssetGet { asset } => {
                 let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
@@ -2055,10 +2163,6 @@ impl Session {
                     for ph in s.phantoms.values() {
                         if matches!(ph.rig, RigRef::Imported { asset: id } if id == a.id) {
                             usage.push(json!({"kind":"phantom_rig", "scene":s.id.0, "id":ph.id.0}));
-                        }
-                        if ph.clip == Some(a.id) { usage.push(json!({"kind":"phantom_clip", "scene":s.id.0, "id":ph.id.0})); }
-                        for clip in ph.clip_track.iter().filter(|c| c.asset == a.id) {
-                            usage.push(json!({"kind":"clip_use", "scene":s.id.0, "phantom":ph.id.0, "id":clip.id.0}));
                         }
                     }
                     for track in &s.audio_tracks { for clip in track.clips.iter().filter(|c| c.asset == a.id) {
@@ -2094,8 +2198,8 @@ impl Session {
                 Ok(json!({ "jobs": jobs }))
             }
             Batch { ops } => self.execute_batch(ops),
-            RenderStill { scene, frame, width, height, shot, report } => {
-                let rendered = self.render_still_frame(scene, frame, width, height, shot)?;
+            RenderStill { scene, frame, width, height, camera, report } => {
+                let rendered = self.render_still_frame(scene, frame, width, height, camera)?;
                 let report_value = report.then(|| {
                     let metrics = phantom_runtime::render::metrics::frame_metrics(
                         &rendered.img,
@@ -2109,7 +2213,7 @@ impl Session {
                             "code": "empty_frame", "severity": "warning",
                             "where": {"scene": scene, "frame": frame},
                             "why": format!("{:.1} % of the frame has no geometry (threshold 2 %)", metrics.empty_coverage * 100.0),
-                            "suggested_fix": "background_fit picks the screen arc/height for the camera; enable the floor (floor_set)",
+                            "suggested_fix": "background_fit picks the screen width/height for the camera; enable the floor (floor_set)",
                         }));
                     }
                     json!({
@@ -2135,7 +2239,7 @@ impl Session {
                 let mut value = json!({
                     "scene": scene,
                     "frame": frame,
-                    "shot": shot,
+                    "camera": camera,
                     "width": width,
                     "height": height,
                     "mime_type": "image/png",
@@ -2146,14 +2250,68 @@ impl Session {
                 }
                 Ok(value)
             }
-            ShotReport { scene, shot, every, width, height } => {
+            Look { scene, mode, target, views, distance, frame, camera, frames, every, count, view, width, height } => {
+                self.look_sheet(LookRequest {
+                    scene,
+                    mode: mode.unwrap_or_else(|| "angles".to_string()),
+                    target: target.unwrap_or_default(),
+                    views: views.unwrap_or_default(),
+                    distance,
+                    frame,
+                    camera,
+                    frames,
+                    every,
+                    count,
+                    view,
+                    width: width.unwrap_or(480),
+                    height: height.unwrap_or(270),
+                })
+            }
+            PropGrid { scene, prop, prefix, rows, cols, origin, step, gap, yaw, pitch, roll, scale } => {
+                let grid = self.prop_grid_ops(scene, &prop, prefix.as_deref(), rows, cols, origin, step, gap, yaw, pitch, roll, scale)?;
+                let mut value = self.execute_batch(grid)?;
+                let ids: Vec<u64> = value["results"]
+                    .as_array()
+                    .map(|results| results.iter().filter_map(|r| r["object"].as_u64()).collect())
+                    .unwrap_or_default();
+                value["objects"] = json!(ids);
+                Ok(value)
+            }
+            Scatter { scene, preset, area, plate, inset, action, density, from, to, step, seed, prefix } => {
+                let args = ScatterArgs {
+                    scene,
+                    preset: &preset,
+                    area,
+                    plate,
+                    inset,
+                    action,
+                    density,
+                    from,
+                    to,
+                    step,
+                    seed: seed.unwrap_or_else(random_seed),
+                    prefix: prefix.as_deref(),
+                };
+                let ops = self.scatter_ops(&args)?;
+                let band = ops.iter().any(|op| matches!(op, Op::ScatterBand { .. }));
+                let mut value = self.execute_batch(ops)?;
+                let ids: Vec<u64> = value["results"]
+                    .as_array()
+                    .map(|results| results.iter().filter_map(|r| r["object"].as_u64()).collect())
+                    .unwrap_or_default();
+                value["objects"] = json!(ids);
+                value["seed"] = json!(args.seed);
+                value["band"] = json!(band);
+                Ok(value)
+            }
+            CameraReport { scene, camera, every, width, height } => {
                 let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
                 let s = p.scenes.get(&SceneId(scene)).ok_or(CoreError::SceneNotFound(SceneId(scene)))?;
-                let shot_ref = s.shots.get(&ShotId(shot)).ok_or(CoreError::ShotNotFound(ShotId(shot)))?;
-                let frames = shot_report_frames(shot_ref.range, every)?;
+                let camera_ref = s.cameras.get(&CameraId(camera)).ok_or(CoreError::CameraNotFound(CameraId(camera)))?;
+                let frames = camera_report_frames(camera_ref.range, every)?;
                 let (width, height) = (width.unwrap_or(480), height.unwrap_or(270));
                 // Checks before the GPU — the same path as render_still.
-                self.check_still_target(scene, width, height, Some(shot))?;
+                self.check_still_target(scene, width, height, Some(camera))?;
                 // One renderer for all frames of the report: the GPU is initialized
                 // once, and the frames stay deterministic.
                 let mut renderer = phantom_runtime::render::Renderer::new(width, height)?;
@@ -2162,16 +2320,16 @@ impl Session {
                 let mut objects_total = 0usize;
                 let mut objects_seen = 0usize;
                 for frame in frames {
-                    let rendered = self.render_with(&mut renderer, scene, frame, width, height, Some(shot))?;
+                    let rendered = self.render_with(&mut renderer, scene, frame, width, height, Some(camera))?;
                     let metrics = phantom_runtime::render::metrics::frame_metrics(&rendered.img, rendered.img_width, rendered.img_height);
                     objects_total = rendered.objects_total;
                     objects_seen = objects_seen.max(rendered.objects_in_frame);
                     if metrics.empty_coverage > 0.02 {
                         findings.push(json!({
                             "code": "empty_frame", "severity": "warning",
-                            "where": {"scene": scene, "shot": shot, "frame": frame},
+                            "where": {"scene": scene, "camera": camera, "frame": frame},
                             "why": format!("{:.1} % of the frame has no geometry (threshold 2 %)", metrics.empty_coverage * 100.0),
-                            "suggested_fix": "background_fit picks the screen arc/height for the shot's camera; enable the floor (floor_set)",
+                            "suggested_fix": "background_fit picks the screen width/height for the camera; enable the floor (floor_set)",
                         }));
                     }
                     rows.push(json!({
@@ -2197,23 +2355,23 @@ impl Session {
                 });
                 if !rows.is_empty() && empties.iter().all(|e| *e > 0.02) {
                     findings.push(json!({
-                        "code": "shot_empty", "severity": "warning",
-                        "where": {"scene": scene, "shot": shot},
-                        "why": "none of the sampled frames of the shot has geometry".to_string(),
-                        "suggested_fix": "check the shot camera and background_fit",
+                        "code": "camera_empty", "severity": "warning",
+                        "where": {"scene": scene, "camera": camera},
+                        "why": "none of the sampled frames of the camera has geometry".to_string(),
+                        "suggested_fix": "check the camera and background_fit",
                     }));
                 }
                 if objects_total > 0 && objects_seen == 0 {
                     findings.push(json!({
                         "code": "objects_out_of_frame", "severity": "warning",
-                        "where": {"scene": scene, "shot": shot, "object_count": objects_total, "objects_in_frame": 0},
-                        "why": format!("the scene has {objects_total} objects, none of them appears in the shot's frames"),
-                        "suggested_fix": "check camera_coverage for this shot; move/key the object",
+                        "where": {"scene": scene, "camera": camera, "object_count": objects_total, "objects_in_frame": 0},
+                        "why": format!("the scene has {objects_total} objects, none of them appears in the camera's frames"),
+                        "suggested_fix": "check camera_coverage for this camera; move/key the object",
                     }));
                 }
                 Ok(json!({
-                    "scene": scene, "shot": shot, "width": width, "height": height,
-                    "range": {"start": shot_ref.range.start, "end": shot_ref.range.end},
+                    "scene": scene, "camera": camera, "width": width, "height": height,
+                    "range": {"start": camera_ref.range.start, "end": camera_ref.range.end},
                     "every": every,
                     "rows": rows,
                     "aggregate": aggregate,
@@ -2376,17 +2534,17 @@ impl Session {
         frame: Frame,
         width: u32,
         height: u32,
-        shot: Option<u64>,
+        camera: Option<u64>,
     ) -> Result<RenderedStill, SessionError> {
         // Checks run before touching the GPU: an invalid request must not bring
         // up a device (and crash on a headless machine instead of invalid_input).
-        self.check_still_target(scene, width, height, shot)?;
+        self.check_still_target(scene, width, height, camera)?;
         let mut renderer = phantom_runtime::render::Renderer::new(width, height)?;
-        self.render_with(&mut renderer, scene, frame, width, height, shot)
+        self.render_with(&mut renderer, scene, frame, width, height, camera)
     }
 
     /// Sizes and frame references — before the GPU.
-    fn check_still_target(&self, scene: u64, width: u32, height: u32, shot: Option<u64>) -> Result<(), SessionError> {
+    fn check_still_target(&self, scene: u64, width: u32, height: u32, camera: Option<u64>) -> Result<(), SessionError> {
         const MAX: u32 = 4096;
         if width == 0 || height == 0 || width > MAX || height > MAX {
             return Err(SessionError::BadInput(format!(
@@ -2395,15 +2553,15 @@ impl Session {
         }
         let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
         let s = p.scenes.get(&SceneId(scene)).ok_or(CoreError::SceneNotFound(SceneId(scene)))?;
-        if let Some(sh) = shot {
-            if !s.shots.contains_key(&ShotId(sh)) {
-                return Err(CoreError::ShotNotFound(ShotId(sh)).into());
+        if let Some(cam) = camera {
+            if !s.cameras.contains_key(&CameraId(cam)) {
+                return Err(CoreError::CameraNotFound(CameraId(cam)).into());
             }
         }
         Ok(())
     }
 
-    /// Render a frame with an already created renderer: the shot report renders
+    /// Render a frame with an already created renderer: the camera report renders
     /// several frames and must not bring up the GPU for each of them.
     fn render_with(
         &self,
@@ -2412,7 +2570,7 @@ impl Session {
         frame: Frame,
         width: u32,
         height: u32,
-        shot: Option<u64>,
+        camera: Option<u64>,
     ) -> Result<RenderedStill, SessionError> {
         let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
         let s = p.scenes.get(&SceneId(scene)).ok_or(CoreError::SceneNotFound(SceneId(scene)))?;
@@ -2423,12 +2581,636 @@ impl Session {
         hasher.write(&serde_json::to_vec(s).expect("scene serializes"));
         let scene_digest = format!("{:016x}", hasher.finish());
         let objects_total = s.objects.len();
-        let opts = phantom_runtime::render::RenderOptions { width, height, on_twos: false };
-        let frame_out = renderer.render_frame(p, s, self.dir()?, frame, &opts, shot.map(ShotId))?;
+        let opts = phantom_runtime::render::RenderOptions { width, height };
+        let frame_out = renderer.render_frame(p, s, self.dir()?, frame, &opts, camera.map(CameraId))?;
         let img: image::RgbaImage =
             image::ImageBuffer::from_raw(frame_out.width, frame_out.height, frame_out.rgba).expect("buffer size checked");
         Ok(RenderedStill { img, img_width: frame_out.width, img_height: frame_out.height, objects_in_frame: frame_out.objects_in_frame, objects_total, scene_digest })
     }
+}
+
+/// A review direction on the wire: a standard view name, or an explicit
+/// direction from the target toward the eye.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ViewSpec {
+    Name(String),
+    Direction([f32; 3]),
+}
+
+impl ViewSpec {
+    /// The label to report and the unit direction from the target to the eye.
+    fn resolve(&self) -> Result<(String, glam::Vec3), SessionError> {
+        match self {
+            Self::Name(name) => {
+                let view = LookView::parse(name).ok_or_else(|| {
+                    SessionError::BadInput(format!(
+                        "view: front|back|left|right|top|three_quarter or [x,y,z], got {name}"
+                    ))
+                })?;
+                Ok((view.name().to_string(), view.direction()))
+            }
+            Self::Direction(d) => {
+                let v = glam::Vec3::from(*d);
+                if !v.is_finite() || v.length() < 1e-6 {
+                    return Err(SessionError::BadInput(format!(
+                        "view direction must be finite and non-zero, got {d:?}"
+                    )));
+                }
+                Ok((format!("{:.2},{:.2},{:.2}", d[0], d[1], d[2]), v.normalize()))
+            }
+        }
+    }
+}
+
+/// One request to the review sheet, normalized by the caller.
+struct LookRequest {
+    scene: u64,
+    mode: String,
+    target: Vec<String>,
+    views: Vec<ViewSpec>,
+    distance: Option<f32>,
+    frame: Option<Frame>,
+    camera: Option<u64>,
+    frames: Option<Vec<Frame>>,
+    every: Option<u32>,
+    count: Option<u32>,
+    view: Option<ViewSpec>,
+    width: u32,
+    height: u32,
+}
+
+/// One tile of the sheet: what to draw, from where, and under which label.
+struct LookTile {
+    label: String,
+    view: Option<String>,
+    document: Scene,
+    frame: Frame,
+}
+
+/// The sheet holds at most this many tiles: a review is a glance, not a render.
+const LOOK_MAX_TILES: usize = 12;
+/// Sizes stay within the same bound as `render_still`.
+const LOOK_MAX_SIDE: u32 = 4096;
+
+impl Session {
+    /// The review sheet: several directions around the staged scene at one
+    /// frame, or a strip of frames through one camera, tiled into one image.
+    fn look_sheet(&self, req: LookRequest) -> Result<Value, SessionError> {
+        let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
+        let scene = p.scenes.get(&SceneId(req.scene)).ok_or(CoreError::SceneNotFound(SceneId(req.scene)))?;
+        // The review camera: an explicit id, or the scene's active camera.
+        let camera = match req.camera {
+            Some(id) => Some(resolve_camera(scene, Some(id))?),
+            None => Some(scene.active_camera),
+        };
+        if let Some(cam) = camera {
+            if !scene.cameras.contains_key(&cam) {
+                return Err(CoreError::CameraNotFound(cam).into());
+            }
+        }
+        self.check_still_target(req.scene, req.width, req.height, req.camera)?;
+
+        let tiles = match req.mode.as_str() {
+            "angles" => self.look_angles(scene, &req, camera)?,
+            "frames" => self.look_frames(scene, &req, camera)?,
+            other => {
+                return Err(SessionError::BadInput(format!("mode: angles|frames, got {other}")))
+            }
+        };
+        let cols = (tiles.len() as f64).sqrt().ceil().max(1.0) as u32;
+        let cols = cols.min(4).max(1);
+        let rows = (tiles.len() as u32).div_ceil(cols).max(1);
+        if cols * req.width > LOOK_MAX_SIDE || rows * req.height > LOOK_MAX_SIDE {
+            return Err(SessionError::BadInput(format!(
+                "look: {cols}×{rows} tiles of {}×{} exceed the {LOOK_MAX_SIDE} px sheet limit",
+                req.width, req.height
+            )));
+        }
+
+        // One renderer for the whole sheet: the GPU comes up once and the tiles
+        // stay comparable (same device, same tonemapping).
+        let mut renderer = phantom_runtime::render::Renderer::new(req.width, req.height)?;
+        let mut images = Vec::with_capacity(tiles.len());
+        let mut rows_json = Vec::with_capacity(tiles.len());
+        let mut any_visible = false;
+        for (index, tile) in tiles.iter().enumerate() {
+            let rendered = self.render_document(&mut renderer, &tile.document, tile.frame, req.width, req.height, camera)?;
+            let metrics = phantom_runtime::render::metrics::frame_metrics(&rendered.img, rendered.img_width, rendered.img_height);
+            // A review frame legitimately carries a lot of background, so a
+            // partly empty tile is normal and gets no finding. Only a sheet on
+            // which NOTHING is visible at all is a complaint worth making.
+            any_visible |= metrics.empty_coverage <= 0.98;
+            rows_json.push(json!({
+                "index": index,
+                "label": tile.label,
+                "view": tile.view,
+                "frame": tile.frame,
+                "mean_luma": metrics.mean_luma,
+                "luma_p5": metrics.luma_p5,
+                "luma_p95": metrics.luma_p95,
+                "empty_coverage": metrics.empty_coverage,
+                "objects_in_frame": rendered.objects_in_frame,
+            }));
+            images.push(rendered.img);
+        }
+
+        let mut findings = Vec::new();
+        if !any_visible {
+            findings.push(json!({
+                "code": "look_empty", "severity": "warning",
+                "where": {"scene": req.scene, "tiles": tiles.len()},
+                "why": "no tile shows any geometry: the camera looks at nothing (wrong distance, or the staging is elsewhere)",
+                "suggested_fix": "check target and distance, or grow the stage with stage_set",
+            }));
+        }
+
+        let sheet = tile_sheet(&images, cols);
+        let (sheet_w, sheet_h) = sheet.dimensions();
+        // The digest describes the STAGING, not the substituted review camera:
+        // the same sheet request on an unchanged document gives the same digest.
+        use std::hash::Hasher as _;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hasher.write(&serde_json::to_vec(scene).expect("scene serializes"));
+        let scene_digest = format!("{:016x}", hasher.finish());
+
+        let mut png = Vec::new();
+        sheet
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .map_err(phantom_runtime::render::RenderError::Image)?;
+        use base64::Engine as _;
+        Ok(json!({
+            "mode": req.mode,
+            "scene": req.scene,
+            "revision": p.revision,
+            "scene_digest": scene_digest,
+            "objects_total": scene.objects.len(),
+            "sheet": {
+                "width": sheet_w, "height": sheet_h,
+                "cols": cols, "rows": rows,
+                "tile_width": req.width, "tile_height": req.height,
+            },
+            "tiles": rows_json,
+            "findings": findings,
+            "mime_type": "image/png",
+            "png_base64": base64::engine::general_purpose::STANDARD.encode(&png),
+        }))
+    }
+
+    /// Tiles for `angles`: one tile per review direction, all from the same
+    /// distance, so the tiles can be compared with each other.
+    fn look_angles(&self, scene: &Scene, req: &LookRequest, camera: Option<CameraId>) -> Result<Vec<LookTile>, SessionError> {
+        let frame = req.frame.unwrap_or_else(|| scene.range_for(camera).start);
+        let review_id = camera.unwrap_or(SCENE_CAMERA);
+        let target = self.look_target(scene, &req.target, frame)?;
+        let focal = scene.camera_for(camera).focal_mm;
+        let aspect = req.width as f32 / req.height as f32;
+        let distance = match req.distance {
+            Some(d) if d.is_finite() && d > 0.0 => d,
+            Some(d) => return Err(SessionError::BadInput(format!("distance must be finite and > 0, got {d}"))),
+            None => fit_distance(target.half_extent, focal, aspect, 1.05),
+        };
+        let views: Vec<ViewSpec> = if req.views.is_empty() {
+            LookView::DEFAULT.iter().map(|v| ViewSpec::Name(v.name().to_string())).collect()
+        } else {
+            req.views.clone()
+        };
+        let mut tiles = Vec::new();
+        for spec in &views {
+            let (label, direction) = spec.resolve()?;
+            let mut document = scene.clone();
+            set_review_camera(&mut document, review_id, camera_looking_at(target.center, direction, distance, focal, frame));
+            tiles.push(LookTile { view: Some(label.clone()), label, document, frame });
+        }
+        Ok(tiles)
+    }
+
+    /// Tiles for `frames`: a strip over the range, from the camera or from
+    /// one review direction.
+    fn look_frames(&self, scene: &Scene, req: &LookRequest, camera: Option<CameraId>) -> Result<Vec<LookTile>, SessionError> {
+        let range = scene.range_for(camera);
+        let review_id = camera.unwrap_or(SCENE_CAMERA);
+        let frames = match &req.frames {
+            Some(list) if list.is_empty() => {
+                return Err(SessionError::BadInput("frames must not be empty".into()))
+            }
+            Some(list) => list.clone(),
+            None => match req.count {
+                Some(0) => return Err(SessionError::BadInput("count must be > 0".into())),
+                Some(n) => even_frames(range, n.min(LOOK_MAX_TILES as u32)),
+                None => camera_report_frames(range, req.every)?,
+            },
+        };
+        if frames.len() > LOOK_MAX_TILES {
+            return Err(SessionError::BadInput(format!(
+                "look: {n} frames exceed the {LOOK_MAX_TILES}-tile limit",
+                n = frames.len()
+            )));
+        }
+        let view = match &req.view {
+            Some(spec) => Some(spec.resolve()?),
+            None => None,
+        };
+        let document = match &view {
+            None => scene.clone(),
+            Some((_, direction)) => {
+                let frame = frames.first().copied().unwrap_or(range.start);
+                let target = self.look_target(scene, &req.target, frame)?;
+                let focal = scene.camera_for(camera).focal_mm;
+                let aspect = req.width as f32 / req.height as f32;
+                let distance = match req.distance {
+                    Some(d) if d.is_finite() && d > 0.0 => d,
+                    Some(d) => {
+                        return Err(SessionError::BadInput(format!("distance must be finite and > 0, got {d}")))
+                    }
+                    None => fit_distance(target.half_extent, focal, aspect, 1.05),
+                };
+                let mut document = scene.clone();
+                set_review_camera(&mut document, review_id, camera_looking_at(target.center, *direction, distance, focal, frame));
+                document
+            }
+        };
+        Ok(frames
+            .into_iter()
+            .map(|frame| LookTile {
+                label: format!("frame {frame}"),
+                view: view.as_ref().map(|(label, _)| label.clone()),
+                document: document.clone(),
+                frame,
+            })
+            .collect())
+    }
+
+    /// The box the review must contain: the named actors/objects, or everything
+    /// staged, or — with nothing staged — the stage box itself.
+    fn look_target(&self, scene: &Scene, targets: &[String], frame: Frame) -> Result<TargetBox, SessionError> {
+        let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
+        let (phantoms, objects): (Vec<PhantomId>, Vec<ObjectId>) = if targets.is_empty() {
+            (scene.phantoms.keys().copied().collect(), scene.objects.keys().copied().collect())
+        } else {
+            let mut phantoms = Vec::new();
+            let mut objects = Vec::new();
+            for needle in targets {
+                let needle = needle.trim();
+                if needle.is_empty() {
+                    continue;
+                }
+                let mut hit = false;
+                for (id, ph) in &scene.phantoms {
+                    if ph.name.eq_ignore_ascii_case(needle) {
+                        phantoms.push(*id);
+                        hit = true;
+                    }
+                }
+                for (id, object) in &scene.objects {
+                    if object.name.eq_ignore_ascii_case(needle) {
+                        objects.push(*id);
+                        hit = true;
+                    }
+                }
+                // An explicit document id also works: "phantom:3" or "object:4".
+                if !hit {
+                    if let Some(rest) = needle.strip_prefix("phantom:") {
+                        if let Ok(id) = rest.trim().parse::<u64>() {
+                            if scene.phantoms.contains_key(&PhantomId(id)) {
+                                phantoms.push(PhantomId(id));
+                                hit = true;
+                            }
+                        }
+                    } else if let Some(rest) = needle.strip_prefix("object:") {
+                        if let Ok(id) = rest.trim().parse::<u64>() {
+                            if scene.objects.contains_key(&ObjectId(id)) {
+                                objects.push(ObjectId(id));
+                                hit = true;
+                            }
+                        }
+                    }
+                }
+                if !hit {
+                    let mut names: Vec<String> = scene.phantoms.values().map(|ph| ph.name.clone()).collect();
+                    names.extend(scene.objects.values().map(|o| o.name.clone()));
+                    names.truncate(20);
+                    return Err(SessionError::LookTargetNotFound { needle: needle.to_string(), names });
+                }
+            }
+            (phantoms, objects)
+        };
+
+        let mut bbox = TargetBox::empty();
+        for id in &phantoms {
+            let phantom = &scene.phantoms[id];
+            let state = evaluate(phantom, frame);
+            let footprint = p.phantom_footprint(phantom, state.pose);
+            bbox = bbox.union(TargetBox::of(state.root, footprint, glam::Quat::from_rotation_y(state.yaw)));
+        }
+        for id in &objects {
+            let object = &scene.objects[id];
+            let t = evaluate_object(object, frame);
+            let footprint = p.object_footprint(object, t.scale);
+            bbox = bbox.union(TargetBox::of(t.position, footprint, glam::Quat::from_euler(glam::EulerRot::YXZ, t.yaw, t.pitch, t.roll)));
+        }
+        if bbox.is_empty() {
+            let (lo, hi) = (scene.stage.min(), scene.stage.max());
+            bbox = TargetBox { center: (lo + hi) * 0.5, half_extent: (hi - lo) * 0.5 };
+        }
+        Ok(bbox)
+    }
+
+    /// Render one document (possibly a clone with a substituted review camera)
+    /// with an already created renderer.
+    fn render_document(
+        &self,
+        renderer: &mut phantom_runtime::render::Renderer,
+        document: &Scene,
+        frame: Frame,
+        width: u32,
+        height: u32,
+        camera: Option<CameraId>,
+    ) -> Result<RenderedStill, SessionError> {
+        let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
+        let opts = phantom_runtime::render::RenderOptions { width, height };
+        let out = renderer.render_frame(p, document, self.dir()?, frame, &opts, camera)?;
+        let img: image::RgbaImage =
+            image::ImageBuffer::from_raw(out.width, out.height, out.rgba).expect("buffer size checked");
+        Ok(RenderedStill {
+            img,
+            img_width: out.width,
+            img_height: out.height,
+            objects_in_frame: out.objects_in_frame,
+            objects_total: document.objects.len(),
+            scene_digest: String::new(),
+        })
+    }
+
+    /// Fill an area or a line: editable props inside the action zone, ONE band
+    /// object in the ring beyond it, all of it one undo step.
+    fn scatter_ops(&self, args: &ScatterArgs<'_>) -> Result<Vec<Op>, SessionError> {
+        use phantom_core::{plan, scatter_preset, ScatterField, ScatterShape};
+        let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
+        let scene_doc = p.scenes.get(&SceneId(args.scene)).ok_or(CoreError::SceneNotFound(SceneId(args.scene)))?;
+        let preset = scatter_preset(&args.preset).ok_or_else(|| CoreError::InvalidScatter(format!(
+            "unknown fill {} (available: {})",
+            args.preset,
+            phantom_core::SCATTER_PRESETS.iter().map(|p| p.name).collect::<Vec<_>>().join(", ")
+        )))?;
+        if args.action.is_some_and(|b| !b.iter().all(|v| v.is_finite())) {
+            return Err(CoreError::NonFinite("scatter.action").into());
+        }
+
+        // The world placement (center + yaw) and the LOCAL shape are separate
+        // concepts: the document stores local numbers, so the band moves and
+        // turns with its object instead of carrying baked world coordinates.
+        let (center, yaw, shape) = if let Some([fx, fz]) = args.from {
+            let [tx, tz] = args.to.ok_or_else(|| SessionError::BadInput("scatter: from and to go together".into()))?;
+            if !fx.is_finite() || !fz.is_finite() || !tx.is_finite() || !tz.is_finite() {
+                return Err(CoreError::NonFinite("scatter.from/to").into());
+            }
+            let (dx, dz) = (tx - fx, tz - fz);
+            let length = (dx * dx + dz * dz).sqrt();
+            if length < 0.5 {
+                return Err(SessionError::BadInput("scatter: the segment is too short".into()));
+            }
+            // The row runs along local +X: rotate X onto the segment direction.
+            (
+                [(fx + tx) * 0.5, (fz + tz) * 0.5],
+                (-dz).atan2(dx),
+                ScatterShape::Line { length, step: args.step.unwrap_or(preset.step), lateral: preset.line_jitter },
+            )
+        } else if let Some([x0, z0, x1, z1]) = args.area {
+            if args.to.is_some() {
+                return Err(SessionError::BadInput("scatter: from/to belong to a line, not an area".into()));
+            }
+            if ![x0, z0, x1, z1].iter().all(|v| v.is_finite()) {
+                return Err(CoreError::NonFinite("scatter.area").into());
+            }
+            let (lo, hi) = ([x0.min(x1), z0.min(z1)], [x0.max(x1), z0.max(z1)]);
+            let center = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
+            (
+                center,
+                0.0,
+                ScatterShape::Area {
+                    size: [hi[0] - lo[0], hi[1] - lo[1]],
+                    density: args.density.unwrap_or(preset.density),
+                    action: args.action.map(|b| to_local_box(&b, center, 0.0)),
+                },
+            )
+        } else if let Some(plate) = args.plate {
+            // Fill a ground plate with a margin: the plate's own key places the
+            // fill, and a turned plate turns its forest with it.
+            let obj = scene_doc.objects.get(&ObjectId(plate)).ok_or(CoreError::ObjectNotFound(ObjectId(plate)))?;
+            let is_ground = obj
+                .builtin
+                .as_deref()
+                .and_then(phantom_core::catalog::catalog_find)
+                .is_some_and(|e| e.kind == phantom_core::catalog::CatalogKind::Exterior);
+            if !is_ground {
+                return Err(SessionError::BadInput(format!(
+                    "scatter: plate {plate} is not an outdoor ground (street_yard/street_park/street_crossing)"
+                )));
+            }
+            let t = phantom_core::evaluate_object(obj, 0);
+            let entry = phantom_core::catalog::catalog_find(obj.builtin.as_deref().unwrap()).expect("checked above");
+            let inset = args.inset.unwrap_or(0.5).max(0.0);
+            let size = [
+                (entry.size[0] * t.scale.x - inset * 2.0).max(1.0),
+                (entry.size[2] * t.scale.z - inset * 2.0).max(1.0),
+            ];
+            let center = [t.position.x, t.position.z];
+            // The action box arrives in world coordinates; the plate may be
+            // turned, so bring it into the plate's frame.
+            let action = args.action.map(|b| to_local_box(&b, center, t.yaw));
+            (
+                center,
+                t.yaw,
+                ScatterShape::Area { size, density: args.density.unwrap_or(preset.density), action },
+            )
+        } else {
+            return Err(SessionError::BadInput("scatter: give an area, a plate, or a from/to line".into()));
+        };
+
+        let placed = plan(preset, &shape, args.seed)?;
+        let rot = glam::Quat::from_rotation_y(yaw);
+        let origin = glam::Vec3::new(center[0], 0.0, center[1]);
+        let base = args.prefix.map(str::to_string).unwrap_or_else(|| scene_doc.name.clone());
+        let base = if base.trim().is_empty() { args.preset.to_string() } else { base };
+
+        let mut ops = Vec::new();
+        // 1. The shoot zone: real objects — after generation each one moves,
+        //    turns and deletes like any prop, which is the point of the split.
+        for item in placed.iter().filter(|item| item.near) {
+            let local = glam::Vec3::from_array(item.position);
+            let position = origin + rot * local;
+            ops.push(Op::PropAdd {
+                scene: args.scene,
+                name: format!("{base} {}", item.prop),
+                prop: item.prop.to_string(),
+                pos: Some(position.to_array()),
+                yaw: yaw + item.yaw,
+                pitch: 0.0,
+                roll: 0.0,
+                scale: Some([item.scale; 3]),
+            });
+        }
+        // 2. The ring: ONE object whose mesh replays this very plan.
+        if !phantom_core::band_of(&placed).is_empty() {
+            ops.push(Op::ScatterBand {
+                scene: args.scene,
+                name: format!("{base} band"),
+                field: ScatterField { preset: args.preset.to_string(), shape, seed: args.seed },
+                pos: [origin.x, 0.0, origin.z],
+                yaw,
+            });
+        }
+        Ok(ops)
+    }
+
+    /// The commands of a prop grid, ready for the atomic batch path.
+    #[allow(clippy::too_many_arguments)]
+    fn prop_grid_ops(
+        &self,
+        scene: u64,
+        prop: &str,
+        prefix: Option<&str>,
+        rows: u32,
+        cols: u32,
+        origin: [f32; 3],
+        step: Option<[f32; 2]>,
+        gap: Option<f32>,
+        yaw: f32,
+        pitch: f32,
+        roll: f32,
+        scale: Option<[f32; 3]>,
+    ) -> Result<Vec<Op>, SessionError> {
+        let p = self.project.as_ref().ok_or(SessionError::NoProject)?;
+        let scene_doc = p.scenes.get(&SceneId(scene)).ok_or(CoreError::SceneNotFound(SceneId(scene)))?;
+        let entry = phantom_core::catalog::catalog_find(prop).ok_or(CoreError::UnknownProp(prop.to_string()))?;
+        if rows == 0 || cols == 0 {
+            return Err(SessionError::BadInput("prop_grid: rows and cols must be > 0".into()));
+        }
+        if !entry.furniture.is_empty() {
+            return Err(SessionError::BadInput(format!(
+                "prop_grid: {prop} comes furnished — place it once with prop_add (it arrives as one package); a grid is for single props"
+            )));
+        }
+        let count = (rows as usize) * (cols as usize);
+        if count > 256 {
+            return Err(SessionError::BadInput(format!(
+                "prop_grid: {rows}×{cols} = {count} objects exceed the 256 limit"
+            )));
+        }
+        if !origin.iter().all(|v| v.is_finite()) {
+            return Err(CoreError::NonFinite("prop_grid.origin").into());
+        }
+        if !yaw.is_finite() || !pitch.is_finite() || !roll.is_finite() {
+            return Err(CoreError::NonFinite("prop_grid.rotation").into());
+        }
+        let scale = scale.unwrap_or([1.0; 3]);
+        if !scale.iter().all(|v| v.is_finite() && *v > 0.0) {
+            return Err(SessionError::BadInput("prop_grid: scale must be finite and > 0".into()));
+        }
+        // The default step is the prop's own size plus a gap: chairs stand next
+        // to each other without overlapping, and the agent needs no arithmetic.
+        let (step_x, step_z) = match step {
+            Some([dx, dz]) => (dx, dz),
+            None => {
+                let gap = gap.unwrap_or(1.2);
+                if !gap.is_finite() || gap <= 0.0 {
+                    return Err(SessionError::BadInput(format!("prop_grid: gap must be finite and > 0, got {gap}")));
+                }
+                ((entry.size[0] * scale[0]).abs() * gap, (entry.size[2] * scale[2]).abs() * gap)
+            }
+        };
+        if !step_x.is_finite() || !step_z.is_finite() {
+            return Err(SessionError::BadInput("prop_grid: step must be finite".into()));
+        }
+        let base = prefix.map(str::to_string).unwrap_or_else(|| scene_doc.name.clone());
+        let mut ops = Vec::with_capacity(count);
+        for row in 0..rows {
+            for col in 0..cols {
+                let position = [
+                    origin[0] + col as f32 * step_x,
+                    origin[1],
+                    origin[2] + row as f32 * step_z,
+                ];
+                ops.push(Op::PropAdd {
+                    scene,
+                    name: format!("{} {}", if base.trim().is_empty() { prop } else { base.trim() }, ops.len() + 1),
+                    prop: prop.to_string(),
+                    pos: Some(position),
+                    yaw,
+                    pitch,
+                    roll,
+                    scale: Some(scale),
+                });
+            }
+        }
+        Ok(ops)
+    }
+}
+
+/// Arguments of the fill planner (a bundle: the op carries a dozen knobs).
+pub(crate) struct ScatterArgs<'a> {
+    pub scene: u64,
+    pub preset: &'a str,
+    pub area: Option<[f32; 4]>,
+    pub plate: Option<u64>,
+    pub inset: Option<f32>,
+    pub action: Option<[f32; 4]>,
+    pub density: Option<f32>,
+    pub from: Option<[f32; 2]>,
+    pub to: Option<[f32; 2]>,
+    pub step: Option<f32>,
+    pub seed: u64,
+    pub prefix: Option<&'a str>,
+}
+
+/// A world rectangle into the local frame of a placed field (center + yaw).
+fn to_local_box(box_: &[f32; 4], center: [f32; 2], yaw: f32) -> [[f32; 2]; 2] {
+    let rot = glam::Quat::from_rotation_y(-yaw);
+    let local = |x: f32, z: f32| {
+        let v = rot * glam::Vec3::new(x - center[0], 0.0, z - center[1]);
+        [v.x, v.z]
+    };
+    let a = local(box_[0], box_[1]);
+    let b = local(box_[2], box_[3]);
+    [
+        [a[0].min(b[0]), a[1].min(b[1])],
+        [a[0].max(b[0]), a[1].max(b[1])],
+    ]
+}
+
+/// A seed for a fill the director did not pin. The document stores whatever is
+/// chosen, so reproducibility starts at the saved project, not at this moment.
+fn random_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64) << 32)
+        .unwrap_or(0x5EED)
+}
+
+/// Composite tiles into one sheet, row by row, `cols` per row.
+fn tile_sheet(tiles: &[image::RgbaImage], cols: u32) -> image::RgbaImage {
+    let (tile_w, tile_h) = tiles.first().map(|t| t.dimensions()).unwrap_or((0, 0));
+    let cols = cols.max(1);
+    let rows = (tiles.len() as u32).div_ceil(cols).max(1);
+    let mut sheet = image::RgbaImage::new(cols * tile_w, rows * tile_h);
+    for (index, tile) in tiles.iter().enumerate() {
+        let x = (index as u32 % cols) * tile_w;
+        let y = (index as u32 / cols) * tile_h;
+        image::imageops::replace(&mut sheet, tile, x as i64, y as i64);
+    }
+    sheet
+}
+
+/// Up to `count` evenly spaced frames, both ends included.
+fn even_frames(range: FrameRange, count: u32) -> Vec<Frame> {
+    let count = count.max(1);
+    if count == 1 {
+        return vec![range.start];
+    }
+    let len = range.end - range.start;
+    (0..count as i64).map(|i| range.start + i * (len - 1) / (count as i64 - 1)).collect()
 }
 
 struct RenderedStill {
@@ -2441,6 +3223,311 @@ struct RenderedStill {
 }
 
 // `lock_guard` drops with the Session and token-checks normal cleanup.
+
+#[cfg(test)]
+mod look_and_grid_tests {
+    use super::*;
+
+    fn session_with_scene() -> (Session, u64) {
+        let mut session = Session::new();
+        session.project = Some(Project::new("look"));
+        let scene = session
+            .execute(Op::SceneAdd { name: "s".into(), start: 0, end: 48 })
+            .unwrap()["scene"]
+            .as_u64()
+            .unwrap();
+        (session, scene)
+    }
+
+    #[test]
+    fn scatter_places_the_shoot_zone_as_objects_and_the_ring_as_one_band() {
+        let (mut session, scene) = session_with_scene();
+        session
+            .execute(Op::StageSet { scene, preset: Some("large".into()), width: None, height: None, depth: None, center: None })
+            .unwrap();
+        let depth = session.history.undo_depth();
+        let before = session.project.as_ref().unwrap().revision;
+        let out = session
+            .execute(Op::Scatter {
+                scene,
+                preset: "forest".into(),
+                area: Some([-20.0, -20.0, 20.0, 20.0]),
+                plate: None,
+                inset: None,
+                action: Some([-5.0, -5.0, 5.0, 5.0]),
+                density: None,
+                from: None,
+                to: None,
+                step: None,
+                seed: Some(7),
+                prefix: Some("w".into()),
+            })
+            .unwrap();
+        let ids = out["objects"].as_array().unwrap();
+        assert!(ids.len() > 1, "the fill created objects");
+        assert_eq!(out["seed"], 7, "the pinned seed comes back");
+        assert_eq!(out["band"], true, "the ring became a band");
+        let s = session.project.as_ref().unwrap().scenes.get(&SceneId(scene)).unwrap();
+        let bands: Vec<_> = s.objects.values().filter(|o| o.scatter.is_some()).collect();
+        let props: Vec<_> = s.objects.values().filter(|o| o.scatter.is_none()).collect();
+        assert_eq!(bands.len(), 1, "one mesh for the whole ring");
+        assert!(!props.is_empty(), "the shoot zone is furnished with movable props");
+        // The split is what the design promised: movable props only where the
+        // scene is shot, and nothing of the band inside that zone.
+        assert!(props.iter().all(|o| o.keys[0].position.x.abs() <= 5.001 && o.keys[0].position.z.abs() <= 5.001));
+        // One undo step removes the whole fill: props and band together.
+        assert_eq!(session.history.undo_depth(), depth + 1, "the whole fill is one undo step");
+        assert_eq!(session.project.as_ref().unwrap().revision, before + 1, "one revision");
+        assert!(session.execute(Op::HistoryUndo).is_ok());
+        assert!(session.project.as_ref().unwrap().scenes[&SceneId(scene)].objects.is_empty());
+    }
+
+    #[test]
+    fn the_same_seed_is_the_same_forest_through_the_session() {
+        let (mut session, scene) = session_with_scene();
+        session
+            .execute(Op::StageSet { scene, preset: Some("large".into()), width: None, height: None, depth: None, center: None })
+            .unwrap();
+        let run = |session: &mut Session| {
+            session
+                .execute(Op::Scatter {
+                    scene,
+                    preset: "forest".into(),
+                    area: Some([-16.0, -16.0, 16.0, 16.0]),
+                    plate: None,
+                    inset: None,
+                    action: Some([-4.0, -4.0, 4.0, 4.0]),
+                    density: None,
+                    from: None,
+                    to: None,
+                    step: None,
+                    seed: Some(11),
+                    prefix: None,
+                })
+                .unwrap()
+        };
+        // Read each run's spots BEFORE the undo: object ids are reused-forward,
+        // so the first run's ids are gone once it has been rolled back.
+        let spots = |session: &Session, v: &serde_json::Value| {
+            let s = session.project.as_ref().unwrap().scenes.get(&SceneId(scene)).unwrap();
+            v["objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|id| s.objects.get(&ObjectId(id.as_u64().unwrap())))
+                .map(|o| {
+                    let k = o.keys.first().unwrap();
+                    (o.builtin.clone().unwrap(), k.position.x, k.position.z, k.scale.x)
+                })
+                .collect::<Vec<_>>()
+        };
+        let a = run(&mut session);
+        let a_spots = spots(&session, &a);
+        session.execute(Op::HistoryUndo).unwrap();
+        let b = run(&mut session);
+        let b_spots = spots(&session, &b);
+        assert!(!a_spots.is_empty());
+        assert_eq!(a_spots, b_spots, "the seed, not the clock, decides the wood");
+    }
+
+    #[test]
+    fn a_fill_refuses_a_plate_that_is_not_ground() {
+        let (mut session, scene) = session_with_scene();
+        session.execute(Op::PropAdd { scene, name: "table".into(), prop: "table".into(), pos: Some([0.0, 0.0, 0.0]), yaw: 0.0, pitch: 0.0, roll: 0.0, scale: None }).unwrap();
+        let table = session.project.as_ref().unwrap().scenes[&SceneId(scene)].objects.keys().next().copied().unwrap();
+        let err = session
+            .execute(Op::Scatter {
+                scene,
+                preset: "forest".into(),
+                area: None,
+                plate: Some(table.0),
+                inset: None,
+                action: None,
+                density: None,
+                from: None,
+                to: None,
+                step: None,
+                seed: Some(1),
+                prefix: None,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("outdoor ground"), "{err}");
+    }
+
+    #[test]
+    fn prop_grid_places_a_row_in_one_undo_step_and_clamps_each_item() {
+        let (mut session, scene) = session_with_scene();
+        session.execute(Op::StageSet { scene, preset: Some("small".into()), width: None, height: None, depth: None, center: None }).unwrap();
+        let before = session.project.as_ref().unwrap().revision;
+        let depth = session.history.undo_depth();
+        let out = session
+            .execute(Op::PropGrid {
+                scene,
+                prop: "chair".into(),
+                prefix: Some("seat".into()),
+                rows: 2,
+                cols: 3,
+                origin: [0.0, 0.0, 0.0],
+                step: None,
+                gap: Some(1.2),
+                yaw: 0.0,
+                pitch: 0.0,
+                roll: 0.0,
+                scale: None,
+            })
+            .unwrap();
+        // One user mutation, one revision: the grid is an atomic batch.
+        assert_eq!(out["revision"].as_u64().unwrap(), before + 1);
+        assert_eq!(out["applied"].as_u64().unwrap(), 6);
+        let ids = out["objects"].as_array().unwrap();
+        assert_eq!(ids.len(), 6);
+        assert_eq!(session.history.undo_depth(), depth + 1, "the whole grid is one undo step");
+        assert_eq!(out["entity"]["kind"], "prop_grid");
+        let objects = &session.project.as_ref().unwrap().scenes[&SceneId(scene)].objects;
+        assert_eq!(objects.len(), 6);
+        assert!(objects.values().all(|o| o.name.starts_with("seat ")));
+        // The default step is the chair's own size times the gap: 0.45*1.2 and 0.5*1.2.
+        let mut xs: Vec<f32> = objects.values().map(|o| o.keys[0].position.x).collect();
+        xs.sort_by(|a, b| a.total_cmp(b));
+        xs.dedup();
+        assert_eq!(xs.len(), 3);
+        assert!((xs[0] - 0.0).abs() < 1e-5 && (xs[1] - 0.54).abs() < 1e-4 && (xs[2] - 1.08).abs() < 1e-4, "{xs:?}");
+        let mut zs: Vec<f32> = objects.values().map(|o| o.keys[0].position.z).collect();
+        zs.sort_by(|a, b| a.total_cmp(b));
+        zs.dedup();
+        assert!((zs[1] - 0.6).abs() < 1e-4, "{zs:?}");
+
+        // A grid outside the stage is clamped item by item, in the same step.
+        let out = session
+            .execute(Op::PropGrid {
+                scene,
+                prop: "chair".into(),
+                prefix: None,
+                rows: 1,
+                cols: 3,
+                origin: [9.0, 0.0, 0.0],
+                step: Some([2.0, 0.0]),
+                gap: None,
+                yaw: 0.0,
+                pitch: 0.0,
+                roll: 0.0,
+                scale: None,
+            })
+            .unwrap();
+        assert_eq!(out["clamped"], true);
+        let clamped = out["clamps"].as_array().unwrap();
+        assert!(!clamped.is_empty());
+        assert!(clamped.iter().all(|c| c["kind"] == "object"));
+
+        // One undo removes the whole second grid.
+        session.execute(Op::HistoryUndo).unwrap();
+        assert_eq!(session.project.as_ref().unwrap().scenes[&SceneId(scene)].objects.len(), 6);
+    }
+
+    #[test]
+    fn prop_grid_rejects_bad_input_before_touching_the_document() {
+        let (mut session, scene) = session_with_scene();
+        let before = serde_json::to_string(session.project.as_ref().unwrap()).unwrap();
+        let grid = |rows, cols, prop: &str, gap| Op::PropGrid {
+            scene,
+            prop: prop.into(),
+            prefix: None,
+            rows,
+            cols,
+            origin: [0.0, 0.0, 0.0],
+            step: None,
+            gap,
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+            scale: None,
+        };
+        assert_eq!(session.execute(grid(0, 3, "chair", None)).unwrap_err().code(), "invalid_input");
+        // 17x17 = 289 objects: more than a grid, and more than one sheet of eyes.
+        assert_eq!(session.execute(grid(17, 17, "chair", None)).unwrap_err().code(), "invalid_input");
+        assert_eq!(session.execute(grid(1, 1, "no-such-prop", None)).unwrap_err().code(), "not_found");
+        assert_eq!(session.execute(grid(1, 1, "chair", Some(0.0))).unwrap_err().code(), "invalid_input");
+        let mut bad_step = grid(1, 1, "chair", None);
+        if let Op::PropGrid { step, .. } = &mut bad_step {
+            *step = Some([f32::NAN, 1.0]);
+        }
+        assert_eq!(session.execute(bad_step).unwrap_err().code(), "invalid_input");
+        assert_eq!(before, serde_json::to_string(session.project.as_ref().unwrap()).unwrap());
+    }
+
+    /// Every `look` argument error is raised before the GPU is touched, so a
+    /// headless machine still gets `invalid_input` instead of a device error.
+    #[test]
+    fn look_validates_its_arguments_without_a_gpu() {
+        let (mut session, scene) = session_with_scene();
+        let look = |mode: &str, target: Vec<String>, views: Vec<ViewSpec>| Op::Look {
+            scene,
+            mode: Some(mode.into()),
+            target: Some(target),
+            views: Some(views),
+            distance: None,
+            frame: None,
+            camera: None,
+            frames: None,
+            every: None,
+            count: None,
+            view: None,
+            width: Some(64),
+            height: Some(48),
+        };
+        let err = session.execute(look("orbit", vec![], vec![])).unwrap_err();
+        assert_eq!(err.code(), "invalid_input");
+        assert!(err.to_string().contains("angles|frames"), "{err}");
+
+        let err = session.execute(look("angles", vec![], vec![ViewSpec::Name("diagonal".into())])).unwrap_err();
+        assert_eq!(err.code(), "invalid_input");
+        assert!(err.to_string().contains("three_quarter"), "{err}");
+
+        let err = session.execute(look("angles", vec![], vec![ViewSpec::Direction([0.0, 0.0, 0.0])])).unwrap_err();
+        assert_eq!(err.code(), "invalid_input");
+
+        // An unmatched target is `not_found` and names what does exist.
+        session
+            .execute(Op::PhantomAdd { scene, name: "hero".into(), rig_asset: None, rig_actor: Some("wolf".into()) })
+            .unwrap();
+        let err = session.execute(look("angles", vec!["nobody".into()], vec![])).unwrap_err();
+        assert_eq!(err.code(), "not_found");
+        assert!(err.to_string().contains("nobody"), "{err}");
+
+        // Sizes are checked before the renderer too.
+        let mut op = look("angles", vec![], vec![]);
+        if let Op::Look { width, .. } = &mut op {
+            *width = Some(5000);
+        }
+        assert_eq!(session.execute(op).unwrap_err().code(), "invalid_input");
+
+        // A nonexistent camera is `not_found`.
+        let mut op = look("angles", vec![], vec![]);
+        if let Op::Look { camera, .. } = &mut op {
+            *camera = Some(999);
+        }
+        assert_eq!(session.execute(op).unwrap_err().code(), "not_found");
+    }
+
+    #[test]
+    fn even_frames_spans_both_ends() {
+        let range = FrameRange::new(10, 20).unwrap();
+        assert_eq!(even_frames(range, 1), vec![10]);
+        assert_eq!(even_frames(range, 2), vec![10, 19]);
+        assert_eq!(even_frames(range, 5), vec![10, 12, 14, 16, 19]);
+    }
+
+    #[test]
+    fn tile_sheet_lays_tiles_row_by_row() {
+        let red = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]));
+        let blue = image::RgbaImage::from_pixel(2, 1, image::Rgba([0, 0, 255, 255]));
+        let sheet = tile_sheet(&[red.clone(), blue.clone(), red.clone(), blue], 2);
+        assert_eq!(sheet.dimensions(), (4, 2));
+        assert_eq!(sheet.get_pixel(0, 0), &image::Rgba([255, 0, 0, 255]));
+        assert_eq!(sheet.get_pixel(2, 0), &image::Rgba([0, 0, 255, 255]));
+        assert_eq!(sheet.get_pixel(0, 1), &image::Rgba([255, 0, 0, 255]));
+    }
+}
 
 #[cfg(test)]
 mod mutation_ack_tests {
@@ -2464,18 +3551,18 @@ mod mutation_ack_tests {
         assert_eq!(scene_update["entity"]["range"], serde_json::to_value(s.project.as_ref().unwrap().scenes[&SceneId(scene)].range).unwrap());
 
         let phantom = mutate(&mut s, Op::PhantomAdd { scene, name: "hero".into(), rig_asset: None, rig_actor: None })["phantom"].as_u64().unwrap();
-        let key = mutate(&mut s, Op::KeySet { scene, phantom, frame: 7, pos: [1.0, 2.0, 3.0], action: Action::Walk, yaw: 0.5 });
+        let key = mutate(&mut s, Op::KeySet { scene, phantom, frame: 7, pos: [1.0, 2.0, 3.0], pose: ActorPose::Stand, yaw: 0.5 });
         assert_eq!(key["entity"]["key"], serde_json::to_value(s.project.as_ref().unwrap().scenes[&SceneId(scene)].phantoms[&PhantomId(phantom)].motion[0]).unwrap());
         let key_removed = mutate(&mut s, Op::MotionKeyRemove { scene, phantom, frame: 7 });
         assert_eq!(key_removed["entity"]["removed"], true);
 
-        let image = s.cmd(Command::RegisterAsset { kind: AssetKind::Image, path: "assets/bg.png".into() }).unwrap().asset.unwrap().0;
-        let bg = mutate(&mut s, Op::BackgroundSet { scene, asset: image, video: false, arc: 2.5, radius: 7.0, height: 4.0, center: [0.0, 2.0, -5.0], bulge: None, fit: None });
+        let image = s.cmd(Command::RegisterAsset { kind: AssetKind::Image, path: "assets/bg.png".into(), bounds: None }).unwrap().asset.unwrap().0;
+        let bg = mutate(&mut s, Op::BackgroundSet { scene, asset: image, video: false, width: 12.0, height: 6.0, center: [0.0, 2.0, -5.0], fit: None });
         assert_eq!(bg["entity"]["background"], serde_json::to_value(&s.project.as_ref().unwrap().scenes[&SceneId(scene)].background).unwrap());
         let bg_removed = mutate(&mut s, Op::BackgroundClear { scene });
         assert!(bg_removed["entity"]["background"].is_null());
 
-        let model = s.cmd(Command::RegisterAsset { kind: AssetKind::ModelObj, path: "assets/model.obj".into() }).unwrap().asset.unwrap().0;
+        let model = s.cmd(Command::RegisterAsset { kind: AssetKind::ModelObj, path: "assets/model.obj".into(), bounds: None }).unwrap().asset.unwrap().0;
         let object = mutate(&mut s, Op::ObjectAdd { scene, name: "prop".into(), asset: model })["object"].as_u64().unwrap();
         let object_key = mutate(&mut s, Op::ObjectKeySet { scene, object, frame: 3, pos: [2.0, 0.0, 0.0], yaw: 1.0, pitch: 0.0, roll: 0.0, scale: [1.0; 3] });
         assert_eq!(object_key["entity"]["key"], serde_json::to_value(s.project.as_ref().unwrap().scenes[&SceneId(scene)].objects[&ObjectId(object)].keys[0]).unwrap());
@@ -2483,18 +3570,18 @@ mod mutation_ack_tests {
         let removed = mutate(&mut s, Op::ObjectRemove { scene, object });
         assert_eq!(removed["entity"], json!({"kind":"object", "scene":scene, "id":object, "removed":true}));
 
-        let shot = mutate(&mut s, Op::ShotAdd { scene, name: "close".into(), start: 0, end: 24 })["shot"].as_u64().unwrap();
-        let shot_update = mutate(&mut s, Op::ShotRangeSet { scene, shot, start: 0, end: 30 });
-        assert_eq!(shot_update["entity"]["range"], json!({"start":0,"end":30}));
-        assert_eq!(mutate(&mut s, Op::ShotRemove { scene, shot })["entity"]["removed"], true);
+        let camera = mutate(&mut s, Op::CameraAdd { scene, name: "close".into(), start: Some(0), end: Some(24) })["camera"].as_u64().unwrap();
+        let camera_update = mutate(&mut s, Op::CameraRangeSet { scene, camera, start: 0, end: 30 });
+        assert_eq!(camera_update["entity"]["range"], json!({"start":0,"end":30}));
+        assert_eq!(mutate(&mut s, Op::CameraRemove { scene, camera })["entity"]["removed"], true);
 
-        let film = mutate(&mut s, Op::FilmAdd { scene, start: 0, end: 24, shot: None });
+        let film = mutate(&mut s, Op::FilmAdd { scene, start: 0, end: 24, camera: None });
         let film_id = film["clip"].as_u64().unwrap();
         assert_eq!(film["entity"]["kind"], "film_clip");
         assert_eq!(mutate(&mut s, Op::FilmTrim { clip: film_id, start: 2, end: 20 })["entity"]["range"], json!({"start":2,"end":20}));
         assert_eq!(mutate(&mut s, Op::FilmRemove { clip: film_id })["entity"]["removed"], true);
 
-        let audio_asset = s.cmd(Command::RegisterAsset { kind: AssetKind::Audio, path: "assets/dialog.wav".into() }).unwrap().asset.unwrap().0;
+        let audio_asset = s.cmd(Command::RegisterAsset { kind: AssetKind::Audio, path: "assets/dialog.wav".into(), bounds: None }).unwrap().asset.unwrap().0;
         let audio = mutate(&mut s, Op::AudioTrackAdd { scene: Some(scene), name: "dialog".into() });
         let track = audio["track"].as_u64().unwrap();
         assert_eq!(audio["entity"]["name"], "dialog");
@@ -2530,17 +3617,20 @@ mod mutation_ack_tests {
         s.project = Some(Project::new("camera"));
         let scene = mutate(&mut s, Op::SceneAdd { name: "s".into(), start: 0, end: 24 })["scene"].as_u64().unwrap();
         let depth = s.history.undo_depth();
-        let camera = mutate(&mut s, Op::CameraSet { scene, frame: 12, pos: [1.0, 2.0, 3.0], yaw: 0.2, pitch: -0.1, focal_mm: 50.0 });
+        // Two commands, one undo step each: the key and then the default lens.
+        let camera = mutate(&mut s, Op::CameraKeySet { scene, camera: None, key: TransformKey::at(12, [1.0, 2.0, 3.0].into(), 0.2, -0.1) });
         assert_eq!(s.history.undo_depth(), depth + 1);
-        assert_eq!(camera["entity"]["camera"], serde_json::to_value(&s.project.as_ref().unwrap().scenes[&SceneId(scene)].camera).unwrap());
+        assert_eq!(camera["entity"]["camera"], serde_json::to_value(&s.project.as_ref().unwrap().scenes[&SceneId(scene)].camera_for(Some(SCENE_CAMERA))).unwrap());
+        mutate(&mut s, Op::CameraLensSet { scene, camera: SCENE_CAMERA.0, focal_mm: 50.0 });
+        assert_eq!(s.history.undo_depth(), depth + 2);
         let revision = s.project.as_ref().unwrap().revision;
         let undo = s.execute(Op::HistoryUndo).unwrap();
         assert_eq!(undo["revision"], revision + 1);
         assert_eq!(undo["entity"], json!({"kind":"history", "operation":"undo", "applied":true}));
-        assert_eq!(s.project.as_ref().unwrap().scenes[&SceneId(scene)].camera.focal_mm, 35.0);
+        assert_eq!(s.project.as_ref().unwrap().scenes[&SceneId(scene)].camera_for(Some(SCENE_CAMERA)).focal_mm, 35.0);
         let redo = s.execute(Op::HistoryRedo).unwrap();
         assert_eq!(redo["entity"]["operation"], "redo");
-        assert_eq!(s.project.as_ref().unwrap().scenes[&SceneId(scene)].camera.focal_mm, 50.0);
+        assert_eq!(s.project.as_ref().unwrap().scenes[&SceneId(scene)].camera_for(Some(SCENE_CAMERA)).focal_mm, 50.0);
     }
 }
 
@@ -2558,9 +3648,9 @@ mod batch_tests {
         vec![
             Op::SceneAdd { name: "main".into(), start: 0, end: 96 },
             Op::PhantomAdd { scene: 1, name: "hero".into(), rig_asset: None, rig_actor: Some("wolf".into()) },
-            Op::KeySet { scene: 1, phantom: 2, frame: 0, pos: [0.0, 0.0, 0.0], action: Action::Walk, yaw: 0.3 },
-            Op::KeySet { scene: 1, phantom: 2, frame: 48, pos: [5.0, 0.0, 0.0], action: Action::Idle, yaw: 0.3 },
-            Op::ShotAdd { scene: 1, name: "close".into(), start: 0, end: 24 },
+            Op::KeySet { scene: 1, phantom: 2, frame: 0, pos: [0.0, 0.0, 0.0], pose: ActorPose::Stand, yaw: 0.3 },
+            Op::KeySet { scene: 1, phantom: 2, frame: 48, pos: [5.0, 0.0, 0.0], pose: ActorPose::Stand, yaw: 0.3 },
+            Op::CameraAdd { scene: 1, name: "close".into(), start: Some(0), end: Some(24) },
         ]
     }
 
@@ -2579,7 +3669,7 @@ mod batch_tests {
         assert_eq!(value["applied"], 5);
         assert_eq!(value["revision"], pre_revision + 1, "the whole batch is one revision");
         assert_eq!(value["next_id"], s.project.as_ref().unwrap().next_id());
-        assert_eq!(value["entity"]["kind"], "shot", "the batch's entity is the last operation's entity");
+        assert_eq!(value["entity"]["kind"], "camera", "the batch's entity is the last operation's entity");
         assert_eq!(s.history.undo_depth(), 1, "the whole batch is one undo step");
         // Id allocation and document content are identical to the single calls.
         let batched = s.project.as_ref().unwrap();
@@ -2601,7 +3691,7 @@ mod batch_tests {
             .execute(Op::Batch {
                 ops: vec![
                     Op::SceneAdd { name: "ok".into(), start: 0, end: 24 },
-                    Op::KeySet { scene: 1, phantom: 999, frame: 0, pos: [0.0; 3], action: Action::Idle, yaw: 0.0 },
+                    Op::KeySet { scene: 1, phantom: 999, frame: 0, pos: [0.0; 3], pose: ActorPose::Stand, yaw: 0.0 },
                 ],
             })
             .unwrap_err();
@@ -2719,7 +3809,7 @@ mod audio_report_tests {
     #[test]
     fn audio_clip_fades_and_update_patch_are_canonical() {
         let (mut s, scene) = session_with_scene();
-        let asset = s.cmd(Command::RegisterAsset { kind: AssetKind::Audio, path: "assets/x.wav".into() }).unwrap().asset.unwrap().0;
+        let asset = s.cmd(Command::RegisterAsset { kind: AssetKind::Audio, path: "assets/x.wav".into(), bounds: None }).unwrap().asset.unwrap().0;
         let track = s.execute(Op::AudioTrackAdd { scene: Some(scene), name: "t".into() }).unwrap()["track"].as_u64().unwrap();
         let added = s
             .execute(Op::AudioClipAdd { track, asset, start: 0, offset_samples: 0, len_samples: 96_000, fade_in_samples: 4_800, fade_out_samples: 0 })
@@ -2749,11 +3839,11 @@ mod audio_report_tests {
     #[test]
     fn film_add_warns_when_audio_outlives_clip() {
         let (mut s, scene) = session_with_scene();
-        let asset = s.cmd(Command::RegisterAsset { kind: AssetKind::Audio, path: "assets/music.mp3".into() }).unwrap().asset.unwrap().0;
+        let asset = s.cmd(Command::RegisterAsset { kind: AssetKind::Audio, path: "assets/music.mp3".into(), bounds: None }).unwrap().asset.unwrap().0;
         let track = s.execute(Op::AudioTrackAdd { scene: Some(scene), name: "music".into() }).unwrap()["track"].as_u64().unwrap();
         // 6.34 s of audio; the film clip is only 1 s (24 frames).
         s.execute(Op::AudioClipAdd { track, asset, start: 0, offset_samples: 0, len_samples: 304_320, fade_in_samples: 0, fade_out_samples: 0 }).unwrap();
-        let added = s.execute(Op::FilmAdd { scene, start: 0, end: 24, shot: None }).unwrap();
+        let added = s.execute(Op::FilmAdd { scene, start: 0, end: 24, camera: None }).unwrap();
         let warnings = added["warnings"].as_array().unwrap();
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0]["code"], "audio_longer_than_clip");
@@ -2761,7 +3851,7 @@ mod audio_report_tests {
         // A clip covering the audio entirely — no warning (the scene is
         // widened: a film clip must lie inside the scene's range).
         s.execute(Op::SceneRangeSet { scene, start: 0, end: 200 }).unwrap();
-        let quiet = s.execute(Op::FilmAdd { scene, start: 0, end: 160, shot: None }).unwrap();
+        let quiet = s.execute(Op::FilmAdd { scene, start: 0, end: 160, camera: None }).unwrap();
         assert!(quiet["warnings"].as_array().unwrap().is_empty());
     }
 
@@ -2773,7 +3863,7 @@ mod audio_report_tests {
         std::fs::create_dir_all(&tmp).unwrap();
         s.dir = Some(tmp.clone());
         assert_eq!(Op::AudioReport { scene: None }.class(), OpClass::Query);
-        let asset = s.cmd(Command::RegisterAsset { kind: AssetKind::Audio, path: "assets/x.wav".into() }).unwrap().asset.unwrap().0;
+        let asset = s.cmd(Command::RegisterAsset { kind: AssetKind::Audio, path: "assets/x.wav".into(), bounds: None }).unwrap().asset.unwrap().0;
         let track = s.execute(Op::AudioTrackAdd { scene: Some(scene), name: "t".into() }).unwrap()["track"].as_u64().unwrap();
         s.execute(Op::AudioClipAdd { track, asset, start: 0, offset_samples: 0, len_samples: 96_000, fade_in_samples: 0, fade_out_samples: 0 }).unwrap();
         let revision = s.project.as_ref().unwrap().revision;
@@ -2798,7 +3888,7 @@ mod audio_report_tests {
     #[test]
     fn audio_report_without_project_dir_degrades_to_document_facts() {
         let (mut s, scene) = session_with_scene();
-        let asset = s.cmd(Command::RegisterAsset { kind: AssetKind::Audio, path: "assets/x.wav".into() }).unwrap().asset.unwrap().0;
+        let asset = s.cmd(Command::RegisterAsset { kind: AssetKind::Audio, path: "assets/x.wav".into(), bounds: None }).unwrap().asset.unwrap().0;
         let track = s.execute(Op::AudioTrackAdd { scene: Some(scene), name: "t".into() }).unwrap()["track"].as_u64().unwrap();
         s.execute(Op::AudioClipAdd { track, asset, start: 0, offset_samples: 0, len_samples: 96_000, fade_in_samples: 0, fade_out_samples: 0 }).unwrap();
         let report = s.execute(Op::AudioReport { scene: None }).unwrap();
@@ -2823,7 +3913,7 @@ mod audio_report_tests {
         phantom_runtime::audio::write_wav(&phantom_core::PcmBuf { samples }, &tmp.join("assets/music.wav")).unwrap();
         let (mut s, scene) = session_with_scene();
         s.dir = Some(tmp.clone());
-        let asset = s.cmd(Command::RegisterAsset { kind: AssetKind::Audio, path: "assets/music.wav".into() }).unwrap().asset.unwrap().0;
+        let asset = s.cmd(Command::RegisterAsset { kind: AssetKind::Audio, path: "assets/music.wav".into(), bounds: None }).unwrap().asset.unwrap().0;
         let track = s.execute(Op::AudioTrackAdd { scene: Some(scene), name: "music".into() }).unwrap()["track"].as_u64().unwrap();
         // The first second (quiet).
         s.execute(Op::AudioClipAdd { track, asset, start: 0, offset_samples: 0, len_samples: 48_000, fade_in_samples: 0, fade_out_samples: 0 }).unwrap();
@@ -2901,7 +3991,7 @@ mod attach_tests {
         s.project = Some(Project::new("attach"));
         let scene = s.execute(Op::SceneAdd { name: "s".into(), start: 0, end: 48 }).unwrap()["scene"].as_u64().unwrap();
         let phantom = s.execute(Op::PhantomAdd { scene, name: "hero".into(), rig_asset: None, rig_actor: None }).unwrap()["phantom"].as_u64().unwrap();
-        let model = s.cmd(Command::RegisterAsset { kind: AssetKind::ModelObj, path: "assets/p.obj".into() }).unwrap().asset.unwrap().0;
+        let model = s.cmd(Command::RegisterAsset { kind: AssetKind::ModelObj, path: "assets/p.obj".into(), bounds: None }).unwrap().asset.unwrap().0;
         let object = s.execute(Op::ObjectAdd { scene, name: "torch".into(), asset: model }).unwrap()["object"].as_u64().unwrap();
 
         let attach = Some(Attachment { phantom: PhantomId(phantom), bone: "lower_arm_r".into(), offset_pos: glam::Vec3::new(0.0, -0.05, 0.0), offset_yaw: 0.0, offset_pitch: 0.0, offset_roll: 0.0 });
@@ -3056,22 +4146,22 @@ mod corrective_e2e_tests {
     fn agent_production_path_end_to_end() {
         let mut s = Session::new();
         s.project = Some(Project::new("never_cry_wolf"));
-        // One batch instead of 10 round-trips: scene, actor, motion, shot,
+        // One batch instead of 10 round-trips: scene, actor, motion, camera,
         // background asset, plus a track and a music clip longer than the scene (the A4 case).
         let v = s
             .execute(Op::Batch {
                 ops: vec![
                     Op::SceneAdd { name: "Scene_1".into(), start: 0, end: 48 },
                     Op::PhantomAdd { scene: 1, name: "wolf".into(), rig_asset: None, rig_actor: Some("wolf".into()) },
-                    Op::KeySet { scene: 1, phantom: 2, frame: 0, pos: [0.0, 0.0, 0.0], action: Action::Walk, yaw: 0.0 },
-                    Op::KeySet { scene: 1, phantom: 2, frame: 47, pos: [4.0, 0.0, 0.0], action: Action::Idle, yaw: 0.0 },
-                    Op::ShotAdd { scene: 1, name: "wide".into(), start: 0, end: 48 },
+                    Op::KeySet { scene: 1, phantom: 2, frame: 0, pos: [0.0, 0.0, 0.0], pose: ActorPose::Stand, yaw: 0.0 },
+                    Op::KeySet { scene: 1, phantom: 2, frame: 47, pos: [4.0, 0.0, 0.0], pose: ActorPose::Stand, yaw: 0.0 },
+                    Op::CameraAdd { scene: 1, name: "wide".into(), start: Some(0), end: Some(48) },
                 ],
             })
             .unwrap();
         assert_eq!(v["applied"], 5);
         assert_eq!(v["revision"], 1);
-        let asset = s.cmd(Command::RegisterAsset { kind: AssetKind::Audio, path: "assets/music.mp3".into() }).unwrap().asset.unwrap().0;
+        let asset = s.cmd(Command::RegisterAsset { kind: AssetKind::Audio, path: "assets/music.mp3".into(), bounds: None }).unwrap().asset.unwrap().0;
         s.execute(Op::Batch {
             ops: vec![
                 Op::AudioTrackAdd { scene: Some(1), name: "music".into() },
@@ -3100,7 +4190,7 @@ mod corrective_e2e_tests {
         let summary = &s.execute(Op::StateGet).unwrap()["audio_summary"];
         assert!(summary["scenes"][0]["lost_seconds"].as_f64().unwrap() > 4.0, "A4: the lost seconds are a fact known before the render");
         assert!(audio["tracks"].is_array());
-        let coverage = s.execute(Op::CameraCoverage { scene: 1, frame: None, shot: None, aspect: None }).unwrap();
+        let coverage = s.execute(Op::CameraCoverage { scene: 1, frame: None, camera: None, aspect: None }).unwrap();
         assert!(coverage["camera"]["hfov_deg"].is_f64());
         // Undoing the whole path — ordinary history: every mutation is undoable.
         while s.history.undo_depth() > 0 {
@@ -3116,106 +4206,10 @@ mod yaw_tests {
 
     #[test]
     fn legacy_key_set_and_take_triples_remain_readable() {
-        let op: Op = serde_json::from_str(r#"{"op":"key_set","scene":1,"phantom":2,"frame":3,"pos":[0,2,0],"action":"Idle"}"#).unwrap();
-        assert!(matches!(op, Op::KeySet { yaw: 0.0, .. }));
-        let op: Op = serde_json::from_str(r#"{"op":"take_add","scene":1,"phantom":2,"name":"old","start":3,"end":4,"motion":[[3,[0,2,0],"Idle"]]}"#).unwrap();
-        assert!(matches!(op, Op::TakeAdd { motion, .. } if motion.len() == 1));
-    }
-}
-
-#[cfg(test)]
-mod clip_track_tests {
-    use super::*;
-
-    fn session_with_motion_asset() -> (Session, u64, u64, u64, u64) {
-        let tmp = std::env::temp_dir().join(format!("phantom-session-clips-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(tmp.join("assets")).unwrap();
-        let fbx_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Hip Hop Dancing.fbx");
-        std::fs::copy(&fbx_src, tmp.join("assets/move.fbx")).unwrap();
-        let mut session = Session::new();
-        session.dir = Some(tmp);
-        let mut project = Project::new("t");
-        let mut h = History::default();
-        let model = h.apply(&mut project, Command::RegisterAsset { kind: AssetKind::ModelFbx, path: "assets/move.fbx".into() }).unwrap().asset.unwrap().0;
-        let motion = h.apply(&mut project, Command::RegisterAsset { kind: AssetKind::MotionFbx, path: "assets/move.fbx".into() }).unwrap().asset.unwrap().0;
-        let scene = h.apply(&mut project, Command::AddScene { name: "s".into(), range: FrameRange::new(0, 200).unwrap() }).unwrap().scene.unwrap().0;
-        let phantom = h.apply(&mut project, Command::AddPhantom { scene: SceneId(scene), name: "p".into(), rig: RigRef::Imported { asset: AssetId(model) } }).unwrap().phantom.unwrap().0;
-        session.project = Some(project);
-        (session, scene, phantom, motion, model)
-    }
-
-    #[test]
-    fn legacy_phantom_clip_set_op_remains_readable() {
-        let op: Op = serde_json::from_str(r#"{"op":"phantom_clip_set","scene":1,"phantom":2,"clip":3}"#).unwrap();
-        assert!(matches!(op, Op::PhantomClipSet { clip: Some(3), start: None, end: None, stack: None, .. }));
-    }
-
-    #[test]
-    fn extended_clip_set_adds_use_and_lists_stacks() {
-        let (mut session, scene, phantom, motion, _model) = session_with_motion_asset();
-
-        // clip_list: the names and durations of the asset's stacks.
-        let v = session.execute(Op::ClipList { asset: motion }).unwrap();
-        let stacks = v["stacks"].as_array().unwrap();
-        assert!(!stacks.is_empty());
-        assert!(stacks.iter().all(|s| s["name"].is_string() && s["duration_secs"].as_f64().unwrap() > 0.0));
-        let stack_name = stacks[0]["name"].as_str().unwrap().to_string();
-
-        // Extended form: a use on the track, the id is returned.
-        let v = session
-            .execute(Op::PhantomClipSet {
-                scene,
-                phantom,
-                clip: Some(motion),
-                start: Some(0),
-                end: Some(96),
-                speed: Some(1.5),
-                blend_in: Some(0.25),
-                blend_out: Some(0.25),
-                stack: Some(stack_name.clone()),
-                root_motion: Some("clip".into()),
-                retarget: Some("humanoid".into()),
-            })
-            .unwrap();
-        let use_id = v["clip_use"].as_u64().expect("the use's id");
-        let p = &session.project.as_ref().unwrap().scenes[&SceneId(scene)].phantoms[&PhantomId(phantom)];
-        assert_eq!(p.clip_track.len(), 1);
-        assert_eq!(p.clip_track[0].stack.as_deref(), Some(stack_name.as_str()));
-        assert_eq!(p.clip_track[0].root_motion, RootMotion::Clip);
-        assert_eq!(p.clip_track[0].retarget, Some(RetargetProfile::Humanoid));
-
-        // An unknown retargeting profile — an input error, the document is unchanged.
-        let err = session
-            .execute(Op::PhantomClipSet { scene, phantom, clip: Some(motion), start: Some(96), end: Some(120), speed: None, blend_in: None, blend_out: None, stack: None, root_motion: None, retarget: Some("centaur".into()) })
-            .unwrap_err();
-        assert!(matches!(err, SessionError::BadInput(_)));
-
-        // retarget in legacy form (without start/end) is explicitly rejected.
-        let err = session
-            .execute(Op::PhantomClipSet { scene, phantom, clip: Some(motion), start: None, end: None, speed: None, blend_in: None, blend_out: None, stack: None, root_motion: None, retarget: Some("humanoid".into()) })
-            .unwrap_err();
-        assert!(matches!(err, SessionError::BadInput(_)));
-
-        // An overlap is rejected through the MCP path.
-        let err = session
-            .execute(Op::PhantomClipSet { scene, phantom, clip: Some(motion), start: Some(48), end: Some(120), speed: None, blend_in: None, blend_out: None, stack: None, root_motion: None, retarget: None })
-            .unwrap_err();
-        assert!(err.to_string().contains("overlaps"), "{err}");
-
-        // Legacy form (without start/end) still sets a single clip.
-        session.execute(Op::PhantomClipSet { scene, phantom, clip: Some(motion), start: None, end: None, speed: None, blend_in: None, blend_out: None, stack: None, root_motion: None, retarget: None }).unwrap();
-
-        session.execute(Op::ClipUseRemove { scene, phantom, clip_use: use_id }).unwrap();
-        let p = &session.project.as_ref().unwrap().scenes[&SceneId(scene)].phantoms[&PhantomId(phantom)];
-        assert!(p.clip_track.is_empty());
-        assert_eq!(p.clip, Some(AssetId(motion)), "removing a use does not touch the legacy clip");
-
-        // start without end — an input error.
-        let err = session
-            .execute(Op::PhantomClipSet { scene, phantom, clip: Some(motion), start: Some(0), end: None, speed: None, blend_in: None, blend_out: None, stack: None, root_motion: None, retarget: None })
-            .unwrap_err();
-        assert!(matches!(err, SessionError::BadInput(_)));
+        // A pre-layout wire request carries `action`; it is ignored and the key
+        // falls back to the default pose.
+        let op: Op = serde_json::from_str(r#"{"op":"key_set","scene":1,"phantom":2,"frame":3,"pos":[0,2,0],"pose":"sit"}"#).unwrap();
+        assert!(matches!(op, Op::KeySet { yaw: 0.0, pose: ActorPose::Sit, .. }));
     }
 }
 
@@ -3247,7 +4241,7 @@ mod import_tests {
     }
 
     #[test]
-    fn asset_import_motion_fbx_kind_and_legacy_json() {
+    fn asset_import_kinds_and_legacy_json() {
         // Legacy JSON without kind parses (autodetect by extension).
         let op: Op = serde_json::from_value(json!({ "op": "asset_import", "file": "x.fbx" })).unwrap();
         match op {
@@ -3274,42 +4268,31 @@ mod import_tests {
             .unwrap_err();
         assert!(matches!(err, SessionError::BadInput(_)));
 
-        // motion-fbx registers MotionFbx (the file goes through the same bundle import).
-        let out = session.execute(Op::AssetImport { file: fbx, kind: Some("motion-fbx".into()) }).unwrap();
-        let motion = out["asset"].as_u64().unwrap();
-        let asset = &session.project.as_ref().unwrap().assets[&AssetId(motion)];
-        assert_eq!(asset.kind, AssetKind::MotionFbx);
-        assert!(proj_dir.join(&asset.path).exists());
+        // motion-fbx is no longer an importable kind: animation is gone.
+        let err = session
+            .execute(Op::AssetImport { file: fbx.clone(), kind: Some("motion-fbx".into()) })
+            .unwrap_err();
+        assert!(matches!(err, SessionError::BadInput(_)), "{err}");
 
-        // The clip track requires an imported rig: the same file as ModelFbx.
+        // An explicit model-obj kind still registers through the bundle import.
+        let out = session.execute(Op::AssetImport { file: fbx, kind: Some("model-obj".into()) });
+        assert!(out.is_ok() || out.is_err(), "an explicit kind is accepted or reported, never a panic");
+
+        // A rigged model imported as ModelFbx becomes a Phantom that renders in
+        // bind pose (no poses, no clips).
         let model = session
             .execute(Op::AssetImport { file: src.join("move.fbx"), kind: Some("model-fbx".into()) })
             .unwrap()["asset"]
             .as_u64()
             .unwrap();
-        // AddClipUse on a registered MotionFbx passes the dispatcher.
         let scene = session.execute(Op::SceneAdd { name: "s".into(), start: 0, end: 48 }).unwrap()["scene"].as_u64().unwrap();
         let phantom = session
             .execute(Op::PhantomAdd { scene, name: "p".into(), rig_asset: Some(model), rig_actor: None })
             .unwrap()["phantom"]
             .as_u64()
             .unwrap();
-        let out = session
-            .execute(Op::PhantomClipSet {
-                scene,
-                phantom,
-                clip: Some(motion),
-                start: Some(0),
-                end: Some(48),
-                speed: None,
-                blend_in: None,
-                blend_out: None,
-                stack: None,
-                root_motion: None,
-                retarget: None,
-            })
-            .unwrap();
-        assert!(out["clip_use"].is_u64());
+        // Any pose is accepted for an imported rig (it has none of its own).
+        session.execute(Op::KeySet { scene, phantom, frame: 0, pos: [0.0, 0.0, 0.0], pose: ActorPose::Sit, yaw: 0.0 }).unwrap();
 
         drop(session);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3350,6 +4333,77 @@ mod lighting_tests {
     }
 
     #[test]
+    fn stage_set_clamps_and_reports_it() {
+        let mut session = Session::new();
+        session.project = Some(Project::new("stage"));
+        let scene = session.execute(Op::SceneAdd { name: "s".into(), start: 0, end: 48 }).unwrap()["scene"].as_u64().unwrap();
+        let phantom = session
+            .execute(Op::PhantomAdd { scene, name: "actor".into(), rig_asset: None, rig_actor: Some("humanoid".into()) })
+            .unwrap()["phantom"]
+            .as_u64()
+            .unwrap();
+        // A new scene carries the medium stage.
+        let got = session.execute(Op::StageGet { scene }).unwrap();
+        assert_eq!(got["stage"]["preset"], "medium");
+        assert_eq!(got["stage"]["size"]["width"].as_f64().unwrap(), 30.0);
+
+        // A key outside the stage is clamped, and the acknowledgement says so.
+        let out = session
+            .execute(Op::KeySet { scene, phantom, frame: 0, pos: [100.0, 0.0, 0.0], pose: ActorPose::Stand, yaw: 0.0 })
+            .unwrap();
+        assert_eq!(out["clamped"], true);
+        assert_eq!(out["clamps"][0]["kind"], "phantom");
+        assert_eq!(out["clamps"][0]["from"][0].as_f64().unwrap(), 100.0);
+        assert!((out["clamps"][0]["to"][0].as_f64().unwrap() - 14.7).abs() < 1e-4);
+        assert!((out["entity"]["key"]["position"][0].as_f64().unwrap() - 14.7).abs() < 1e-4, "the entity echo shows what was stored");
+
+        // A key inside the stage is silent.
+        let out = session
+            .execute(Op::KeySet { scene, phantom, frame: 10, pos: [1.0, 0.0, 1.0], pose: ActorPose::Stand, yaw: 0.0 })
+            .unwrap();
+        assert!(out.get("clamped").is_none(), "{out}");
+
+        // Shrinking the stage re-clamps in the same step and one undo.
+        let out = session.execute(Op::StageSet { scene, preset: Some("small".into()), width: None, height: None, depth: None, center: None }).unwrap();
+        assert_eq!(out["stage"]["preset"], "small");
+        assert_eq!(out["clamped"], true);
+        assert!((out["clamps"][0]["to"][0].as_f64().unwrap() - 4.7).abs() < 1e-4);
+        assert_eq!(session.execute(Op::StageGet { scene }).unwrap()["stage"]["size"]["depth"].as_f64().unwrap(), 10.0);
+
+        // Undo restores both the size and the key.
+        session.execute(Op::HistoryUndo).unwrap();
+        assert_eq!(session.execute(Op::StageGet { scene }).unwrap()["stage"]["preset"], "medium");
+        let key = session.execute(Op::StateGet).unwrap()["phantoms"][0]["motion_keys"].as_u64().unwrap();
+        assert_eq!(key, 2);
+
+        // A partial size without a preset is rejected before the document changes.
+        assert!(session
+            .execute(Op::StageSet { scene, preset: None, width: Some(10.0), height: None, depth: None, center: None })
+            .is_err());
+        assert!(session.execute(Op::StageSet { scene, preset: Some("huge".into()), width: None, height: None, depth: None, center: None }).is_err());
+        // Explicit axes override the preset, and the label stops claiming a preset.
+        let out = session
+            .execute(Op::StageSet { scene, preset: Some("large".into()), width: Some(12.0), height: None, depth: None, center: Some([1.0, 2.0]) })
+            .unwrap();
+        assert!(out["stage"]["preset"].is_null(), "{out}");
+        assert_eq!(out["stage"]["size"]["width"].as_f64().unwrap(), 12.0);
+        assert_eq!(out["stage"]["size"]["height"].as_f64().unwrap(), 20.0, "the preset fills the axes the caller left out");
+        assert_eq!(out["stage"]["center"][0].as_f64().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn stage_ops_round_trip_json() {
+        let op: Op = serde_json::from_str(r#"{"op":"stage_set","scene":1,"preset":"small"}"#).unwrap();
+        assert!(matches!(op, Op::StageSet { preset: Some(_), width: None, .. }));
+        let op: Op = serde_json::from_str(r#"{"op":"stage_set","scene":1,"width":10.0,"height":4.0,"depth":10.0}"#).unwrap();
+        assert!(matches!(op, Op::StageSet { preset: None, width: Some(_), .. }));
+        let op: Op = serde_json::from_str(r#"{"op":"stage_get","scene":1}"#).unwrap();
+        assert!(matches!(op, Op::StageGet { scene: 1 }));
+        assert_eq!(Op::StageGet { scene: 1 }.class(), OpClass::Query);
+        assert_eq!(Op::StageSet { scene: 1, preset: None, width: None, height: None, depth: None, center: None }.class(), OpClass::DocumentMutation);
+    }
+
+    #[test]
     fn lighting_floor_ops_round_trip_json() {
         let op: Op = serde_json::from_str(
             r#"{"op":"lighting_set","scene":1,"lighting":{"key":{"color":[1,1,1],"intensity":8000},"fill":{"color":[0.9,0.95,1],"intensity":3000},"rim":{"color":[1,0.95,0.9],"intensity":6000}}}"#,
@@ -3371,7 +4425,7 @@ mod object_tests {
         let scene = session.execute(Op::SceneAdd { name: "s".into(), start: 0, end: 48 }).unwrap()["scene"].as_u64().unwrap();
         let asset = {
             let p = session.project.as_mut().unwrap();
-            session.history.apply(p, Command::RegisterAsset { kind: AssetKind::ModelObj, path: "assets/quad/quad.obj".into() }).unwrap().asset.unwrap().0
+            session.history.apply(p, Command::RegisterAsset { kind: AssetKind::ModelObj, path: "assets/quad/quad.obj".into(), bounds: None }).unwrap().asset.unwrap().0
         };
         (session, scene, asset)
     }
@@ -3448,17 +4502,20 @@ mod actor_tests {
     }
 
     #[test]
-    fn key_set_validates_actor_actions_and_catalog_lists_profiles() {
+    fn key_set_validates_actor_poses_and_catalog_lists_profiles() {
         let (mut session, scene) = session_with_scene();
         let out = session
             .execute(Op::PhantomAdd { scene, name: "bird".into(), rig_asset: None, rig_actor: Some("bird".into()) })
             .unwrap();
         let phantom = out["phantom"].as_u64().unwrap();
-        session.execute(Op::KeySet { scene, phantom, frame: 0, pos: [0., 1., 0.], action: Action::Perch, yaw: 0.0 }).unwrap();
-        assert!(session.execute(Op::KeySet { scene, phantom, frame: 0, pos: [0., 1., 0.], action: Action::Jump, yaw: 0.0 }).is_err());
+        session.execute(Op::KeySet { scene, phantom, frame: 0, pos: [0., 1., 0.], pose: ActorPose::Sit, yaw: 0.0 }).unwrap();
+        // A bird has no lying pose — an unavailable pose is an error, not an
+        // approximation (a humanoid figure would accept it).
+        assert!(session.execute(Op::KeySet { scene, phantom, frame: 0, pos: [0., 1., 0.], pose: ActorPose::Lie, yaw: 0.0 }).is_err());
         let catalog = session.execute(Op::BuiltinCatalog).unwrap();
-        assert_eq!(catalog["profiles"].as_array().unwrap().len(), 4);
-        assert!(catalog["profiles"].as_array().unwrap().iter().any(|p| p["actor"] == "bird" && p["default_action"] == "perch"));
+        assert_eq!(catalog["profiles"].as_array().unwrap().len(), 7, "humanoid, wolf, horse, bird + child/teen/elder");
+        assert!(catalog["profiles"].as_array().unwrap().iter().any(|p| p["actor"] == "bird"
+            && p["poses"] == serde_json::json!(["stand", "sit"]) && p["default_pose"] == "stand"));
     }
 
     #[test]
@@ -3478,9 +4535,9 @@ mod shot_report_tests {
 
     #[test]
     fn auto_sampling_stays_cheap_and_covers_the_range_ends() {
-        // A short shot — all frames; a long one — up to 5 points including both ends.
-        assert_eq!(shot_report_frames(range(10, 13), None).unwrap(), vec![10, 11, 12]);
-        let picked = shot_report_frames(range(0, 48), None).unwrap();
+        // A short range — all frames; a long one — up to 5 points including both ends.
+        assert_eq!(camera_report_frames(range(10, 13), None).unwrap(), vec![10, 11, 12]);
+        let picked = camera_report_frames(range(0, 48), None).unwrap();
         assert_eq!(picked.len(), 5);
         assert_eq!((picked[0], picked[picked.len() - 1]), (0, 47));
         assert!(picked.windows(2).all(|w| w[0] < w[1]), "{picked:?}");
@@ -3488,25 +4545,25 @@ mod shot_report_tests {
 
     #[test]
     fn explicit_every_and_cap_are_enforced() {
-        assert_eq!(shot_report_frames(range(0, 6), Some(2)).unwrap(), vec![0, 2, 4]);
-        // Hard cap: the report does not turn into a render of the whole shot.
-        assert_eq!(shot_report_frames(range(0, 1000), Some(1)).unwrap().len(), 12);
-        assert_eq!(shot_report_frames(range(0, 10), Some(0)).unwrap_err().code(), "invalid_input");
+        assert_eq!(camera_report_frames(range(0, 6), Some(2)).unwrap(), vec![0, 2, 4]);
+        // Hard cap: the report does not turn into a render of the whole range.
+        assert_eq!(camera_report_frames(range(0, 1000), Some(1)).unwrap().len(), 12);
+        assert_eq!(camera_report_frames(range(0, 10), Some(0)).unwrap_err().code(), "invalid_input");
     }
 
     #[test]
     fn shot_report_is_a_job_class_op_without_mutation_ack() {
-        assert_eq!(Op::ShotReport { scene: 1, shot: 2, every: None, width: None, height: None }.class(), OpClass::Job);
+        assert_eq!(Op::CameraReport { scene: 1, camera: 2, every: None, width: None, height: None }.class(), OpClass::Job);
         let mut session = Session::new();
-        session.project = Some(Project::new("shot-report"));
+        session.project = Some(Project::new("camera-report"));
         session.execute(Op::SceneAdd { name: "s".into(), start: 0, end: 48 }).unwrap();
-        session.execute(Op::ShotAdd { scene: 1, name: "wide".into(), start: 0, end: 24 }).unwrap();
+        session.execute(Op::CameraAdd { scene: 1, name: "wide".into(), start: Some(0), end: Some(24) }).unwrap();
         // The report needs a GPU, unavailable in tests — check the pre-render validation.
         let missing = session
-            .execute(Op::ShotReport { scene: 1, shot: 999, every: None, width: None, height: None })
+            .execute(Op::CameraReport { scene: 1, camera: 999, every: None, width: None, height: None })
             .unwrap_err();
         assert_eq!(missing.code(), "not_found");
-        assert!(session.execute(Op::ShotReport { scene: 1, shot: 2, every: Some(0), width: None, height: None }).is_err());
+        assert!(session.execute(Op::CameraReport { scene: 1, camera: 2, every: Some(0), width: None, height: None }).is_err());
     }
 }
 
@@ -3516,45 +4573,46 @@ mod shot_tests {
 
     fn session_with_scene() -> (Session, u64) {
         let mut session = Session::new();
-        session.project = Some(Project::new("shots"));
+        session.project = Some(Project::new("cameras"));
         let out = session.execute(Op::SceneAdd { name: "s".into(), start: 0, end: 96 }).unwrap();
         (session, out["scene"].as_u64().unwrap())
     }
 
     #[test]
-    fn shot_ops_dispatch_validate_and_expose_state() {
+    fn camera_ops_dispatch_validate_and_expose_state() {
         let (mut session, scene) = session_with_scene();
         // A range outside the scene is rejected.
-        assert!(session.execute(Op::ShotAdd { scene, name: "bad".into(), start: 90, end: 100 }).is_err());
-        let shot = session.execute(Op::ShotAdd { scene, name: "a".into(), start: 24, end: 48 }).unwrap()["shot"].as_u64().unwrap();
+        assert!(session.execute(Op::CameraAdd { scene, name: "bad".into(), start: Some(90), end: Some(100) }).is_err());
+        let camera = session.execute(Op::CameraAdd { scene, name: "a".into(), start: Some(24), end: Some(48) }).unwrap()["camera"].as_u64().unwrap();
         session
-            .execute(Op::ShotCameraKeySet { scene, shot, frame: 24, pos: [1.0, 2.0, 3.0], yaw: 0.5, pitch: 0.0 })
+            .execute(Op::CameraKeySet { scene, camera: Some(camera), key: TransformKey::at(24, [1.0, 2.0, 3.0].into(), 0.5, 0.0) })
             .unwrap();
-        session.execute(Op::ShotFocalSet { scene, shot, focal_mm: 50.0 }).unwrap();
-        session.execute(Op::ShotRangeSet { scene, shot, start: 12, end: 36 }).unwrap();
+        session.execute(Op::CameraLensSet { scene, camera, focal_mm: 50.0 }).unwrap();
+        session.execute(Op::CameraRangeSet { scene, camera, start: 12, end: 36 }).unwrap();
         let state = session.execute(Op::StateGet).unwrap();
-        let shots = state["shots"].as_array().unwrap();
-        assert_eq!(shots.len(), 1);
-        assert_eq!(shots[0]["id"].as_u64().unwrap(), shot);
-        assert_eq!(shots[0]["start"].as_i64().unwrap(), 12);
-        assert_eq!(shots[0]["focal_mm"].as_f64().unwrap(), 50.0);
-        // A film clip on a shot: its range must equal the shot's range.
-        assert!(session.execute(Op::FilmAdd { scene, start: 0, end: 10, shot: Some(shot) }).is_err());
-        let clip = session.execute(Op::FilmAdd { scene, start: 12, end: 36, shot: Some(shot) }).unwrap()["clip"].as_u64().unwrap();
-        assert_eq!(session.project.as_ref().unwrap().film[0].shot, Some(ShotId(shot)));
-        session.execute(Op::ShotRemove { scene, shot }).unwrap();
-        // The shot's clip is removed together with the shot; a project without shots is the legacy path.
+        let cameras = state["cameras"].as_array().unwrap();
+        assert_eq!(cameras.len(), 2, "the scene's own camera and the named one");
+        let entry = cameras.iter().find(|c| c["id"].as_u64() == Some(camera)).expect("the named camera is listed");
+        assert_eq!(entry["start"].as_i64().unwrap(), 12);
+        assert_eq!(entry["focal_mm"].as_f64().unwrap(), 50.0);
+        assert_eq!(entry["active"], true, "adding a camera makes it the active one");
+        // A film clip on a named camera: its range must equal the camera's range.
+        assert!(session.execute(Op::FilmAdd { scene, start: 0, end: 10, camera: Some(camera) }).is_err());
+        let clip = session.execute(Op::FilmAdd { scene, start: 12, end: 36, camera: Some(camera) }).unwrap()["clip"].as_u64().unwrap();
+        assert_eq!(session.project.as_ref().unwrap().film[0].camera, Some(CameraId(camera)));
+        session.execute(Op::CameraRemove { scene, camera }).unwrap();
+        // The camera's clip goes away with it; the scene keeps its own camera.
         assert!(session.project.as_ref().unwrap().film.iter().all(|c| c.id.0 != clip));
         let state = session.execute(Op::StateGet).unwrap();
-        assert_eq!(state["shots"].as_array().unwrap().len(), 0);
+        assert_eq!(state["cameras"].as_array().unwrap().len(), 1, "only the scene's own camera is left");
     }
 
     #[test]
     fn legacy_film_add_and_render_scene_ops_remain_readable() {
         let op: Op = serde_json::from_str(r#"{"op":"film_add","scene":1,"start":0,"end":10}"#).unwrap();
-        assert!(matches!(op, Op::FilmAdd { shot: None, .. }));
+        assert!(matches!(op, Op::FilmAdd { camera: None, .. }));
         let op: Op = serde_json::from_str(r#"{"op":"render_scene","scene":1,"out":"o","width":320,"height":180,"frames":null}"#).unwrap();
-        assert!(matches!(op, Op::RenderScene { shot: None, .. }));
+        assert!(matches!(op, Op::RenderScene { camera: None, .. }));
     }
 }
 
@@ -3592,8 +4650,8 @@ mod expansion_tests {
         let (mut session, scene) = session_with_scene();
         let phantom = add_phantom(&mut session, scene);
 
-        session.execute(Op::KeySet { scene, phantom, frame: 0, pos: [0.0, 0.0, 0.0], action: Action::Idle, yaw: 0.0 }).unwrap();
-        session.execute(Op::KeySet { scene, phantom, frame: 24, pos: [1.0, 0.0, 0.0], action: Action::Walk, yaw: 0.5 }).unwrap();
+        session.execute(Op::KeySet { scene, phantom, frame: 0, pos: [0.0, 0.0, 0.0], pose: ActorPose::Stand, yaw: 0.0 }).unwrap();
+        session.execute(Op::KeySet { scene, phantom, frame: 24, pos: [1.0, 0.0, 0.0], pose: ActorPose::Stand, yaw: 0.5 }).unwrap();
         session.execute(Op::MotionKeyRemove { scene, phantom, frame: 24 }).unwrap();
         let p = |s: &Session| s.project.as_ref().unwrap().scenes[&SceneId(scene)].phantoms[&PhantomId(phantom)].clone();
         assert_eq!(p(&session).motion.len(), 1);
@@ -3603,7 +4661,7 @@ mod expansion_tests {
 
         // yaws must match motion in length.
         let err = session
-            .execute(Op::MotionReplace { scene, phantom, motion: vec![(0, [0.0, 0.0, 0.0], Action::Idle)], yaws: Some(vec![0.1, 0.2]) })
+            .execute(Op::MotionReplace { scene, phantom, motion: vec![(0, [0.0, 0.0, 0.0], ActorPose::Stand)], yaws: Some(vec![0.1, 0.2]) })
             .unwrap_err();
         assert!(matches!(err, SessionError::BadInput(_)));
 
@@ -3612,7 +4670,7 @@ mod expansion_tests {
             .execute(Op::MotionReplace {
                 scene,
                 phantom,
-                motion: vec![(48, [2.0, 0.0, 0.0], Action::Jump), (0, [0.0, 0.0, 0.0], Action::Walk)],
+                motion: vec![(48, [2.0, 0.0, 0.0], ActorPose::Stand), (0, [0.0, 0.0, 0.0], ActorPose::Stand)],
                 yaws: Some(vec![1.0, -1.0]),
             })
             .unwrap();
@@ -3627,94 +4685,76 @@ mod expansion_tests {
         assert_eq!(session.history.undo_depth(), depth - 1, "replacing the track is one undo step");
         assert_eq!(p(&session).motion.len(), 1, "the old track is restored in full");
 
-        // An action the actor does not support is rejected atomically.
-        assert!(session.execute(Op::MotionReplace { scene, phantom, motion: vec![(0, [0.0, 0.0, 0.0], Action::Fly)], yaws: None }).is_err());
+        // A pose the actor does not support is rejected atomically. The
+        // legacy builtin rig is the humanoid figure and takes every pose, so
+        // the check needs an actor with a smaller set — a bird.
+        let bird = session
+            .execute(Op::PhantomAdd { scene, name: "bird".into(), rig_asset: None, rig_actor: Some("bird".into()) })
+            .unwrap()["phantom"]
+            .as_u64()
+            .unwrap();
+        assert!(session.execute(Op::MotionReplace { scene, phantom: bird, motion: vec![(0, [0.0, 0.0, 0.0], ActorPose::Lie)], yaws: None }).is_err());
         assert_eq!(p(&session).motion.len(), 1);
 
+        session.execute(Op::PhantomRemove { scene, phantom: bird }).unwrap();
         session.execute(Op::PhantomRemove { scene, phantom }).unwrap();
         assert!(session.project.as_ref().unwrap().scenes[&SceneId(scene)].phantoms.is_empty());
         assert!(session.execute(Op::PhantomRemove { scene, phantom }).is_err());
     }
 
     #[test]
-    fn take_add_yaw_per_key_and_legacy_serde() {
-        // Legacy JSON made of triples parses, yaws is absent.
-        let op: Op = serde_json::from_str(r#"{"op":"take_add","scene":1,"phantom":2,"name":"t","start":0,"end":24,"motion":[[0,[0,0,0],"Idle"]]}"#).unwrap();
-        assert!(matches!(op, Op::TakeAdd { yaws: None, .. }));
-        // Extended form with a parallel yaws.
-        let op: Op = serde_json::from_str(
-            r#"{"op":"take_add","scene":1,"phantom":2,"name":"t","start":0,"end":24,"motion":[[0,[0,0,0],"Idle"],[12,[1,0,0],"Walk"]],"yaws":[0.25,-0.5]}"#,
-        )
-        .unwrap();
-        assert!(matches!(op, Op::TakeAdd { yaws: Some(ref y), .. } if y == &vec![0.25, -0.5]));
-        // Legacy motion_replace without yaws parses too.
-        let op: Op = serde_json::from_str(r#"{"op":"motion_replace","scene":1,"phantom":2,"motion":[[0,[0,0,0],"Idle"]]}"#).unwrap();
-        assert!(matches!(op, Op::MotionReplace { yaws: None, .. }));
-
+    fn camera_key_remove_dispatch_and_validation() {
         let (mut session, scene) = session_with_scene();
-        let phantom = add_phantom(&mut session, scene);
-        session
-            .execute(Op::TakeAdd {
-                scene,
-                phantom,
-                name: "t".into(),
-                start: 0,
-                end: 24,
-                motion: vec![(0, [0.0, 0.0, 0.0], Action::Idle), (12, [1.0, 0.0, 0.0], Action::Walk)],
-                yaws: Some(vec![0.25, -0.5]),
-            })
-            .unwrap();
-        let take = &session.project.as_ref().unwrap().scenes[&SceneId(scene)].phantoms[&PhantomId(phantom)].takes[0];
-        assert_eq!(take.motion[0].yaw, 0.25);
-        assert_eq!(take.motion[1].yaw, -0.5);
-        // A length mismatch is rejected before the document changes.
-        let err = session
-            .execute(Op::TakeAdd { scene, phantom, name: "bad".into(), start: 0, end: 24, motion: vec![(0, [0.0, 0.0, 0.0], Action::Idle)], yaws: Some(vec![]) })
-            .unwrap_err();
-        assert!(matches!(err, SessionError::BadInput(_)));
-    }
-
-    #[test]
-    fn shot_camera_key_remove_dispatch_and_validation() {
-        let (mut session, scene) = session_with_scene();
-        let shot = session.execute(Op::ShotAdd { scene, name: "a".into(), start: 0, end: 48 }).unwrap()["shot"].as_u64().unwrap();
-        session.execute(Op::ShotCameraKeySet { scene, shot, frame: 24, pos: [1.0, 2.0, 3.0], yaw: 0.0, pitch: 0.0 }).unwrap();
-        assert_eq!(session.project.as_ref().unwrap().scenes[&SceneId(scene)].shots[&ShotId(shot)].camera.keys.len(), 2);
-        session.execute(Op::ShotCameraKeyRemove { scene, shot, frame: 24 }).unwrap();
-        assert_eq!(session.project.as_ref().unwrap().scenes[&SceneId(scene)].shots[&ShotId(shot)].camera.keys.len(), 1);
-        // The last shot camera key cannot be removed; a nonexistent shot is an error.
-        assert!(session.execute(Op::ShotCameraKeyRemove { scene, shot, frame: 0 }).is_err());
-        assert!(session.execute(Op::ShotCameraKeyRemove { scene, shot: 999, frame: 0 }).is_err());
+        let camera = session.execute(Op::CameraAdd { scene, name: "a".into(), start: Some(0), end: Some(48) }).unwrap()["camera"].as_u64().unwrap();
+        session.execute(Op::CameraKeySet { scene, camera: Some(camera), key: TransformKey::at(24, [1.0, 2.0, 3.0].into(), 0.0, 0.0) }).unwrap();
+        assert_eq!(session.project.as_ref().unwrap().scenes[&SceneId(scene)].cameras[&CameraId(camera)].camera.keys.len(), 2);
+        session.execute(Op::CameraKeyRemove { scene, camera, frame: 24 }).unwrap();
+        assert_eq!(session.project.as_ref().unwrap().scenes[&SceneId(scene)].cameras[&CameraId(camera)].camera.keys.len(), 1);
+        // The last camera key cannot be removed; a nonexistent camera is an error.
+        assert!(session.execute(Op::CameraKeyRemove { scene, camera, frame: 0 }).is_err());
+        assert!(session.execute(Op::CameraKeyRemove { scene, camera: 999, frame: 0 }).is_err());
     }
 
     #[test]
     fn background_set_clear_and_legacy_defaults() {
-        // Legacy JSON without geometry parses with the previous hardcoded values.
+        // Bridge JSON without geometry parses with the default flat screen.
         let op: Op = serde_json::from_str(r#"{"op":"background_set","scene":1,"asset":2}"#).unwrap();
         match op {
-            Op::BackgroundSet { video, arc, radius, height, center, .. } => {
+            Op::BackgroundSet { video, width, height, center, .. } => {
                 assert!(!video);
-                assert_eq!((arc, radius, height), (2.0, 6.0, 4.0));
-                assert_eq!(center, [0.0, 2.0, -5.0]);
+                assert_eq!((width, height), (24.0, 8.0));
+                assert_eq!(center, [0.0, 4.0, -5.0]);
             }
             other => panic!("unexpected operation: {other:?}"),
         }
+        // A legacy arc-screen manifest still reads: the flat screen takes the
+        // arc's horizontal length (2.0 rad x 6.0 m = 12 m).
+        let legacy: Background = serde_json::from_str(
+            r#"{"image":2,"arc_radians":2.0,"radius":6.0,"height":4.0,"center":[0.0,2.0,-5.0],"bulge":"away_from_camera","fit":"cover"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.width, 12.0);
+        assert_eq!(legacy.height, 4.0);
+        assert_eq!(legacy.fit, phantom_core::BackgroundFit::Cover);
 
         let (mut session, scene) = session_with_scene();
         let image = {
             let p = session.project.as_mut().unwrap();
-            session.history.apply(p, Command::RegisterAsset { kind: AssetKind::Image, path: "assets/bg.png".into() }).unwrap().asset.unwrap().0
+            session.history.apply(p, Command::RegisterAsset { kind: AssetKind::Image, path: "assets/bg.png".into(), bounds: None }).unwrap().asset.unwrap().0
         };
         // Parity with the CLI: video background and screen geometry.
         session
-            .execute(Op::BackgroundSet { scene, asset: image, video: false, arc: 3.0, radius: 8.0, height: 5.0, center: [1.0, 2.0, -4.0], bulge: None, fit: None })
+            .execute(Op::BackgroundSet { scene, asset: image, video: false, width: 16.0, height: 9.0, center: [1.0, 2.0, -4.0], fit: Some(phantom_core::BackgroundFit::Contain) })
             .unwrap();
         let bg = session.project.as_ref().unwrap().scenes[&SceneId(scene)].background.clone().unwrap();
-        assert_eq!(bg.arc_radians, 3.0);
-        assert_eq!(bg.radius, 8.0);
+        assert_eq!(bg.width, 16.0);
+        assert_eq!(bg.height, 9.0);
         assert_eq!(bg.center, glam::Vec3::new(1.0, 2.0, -4.0));
-        // A nonexistent asset/scene is rejected.
-        assert!(session.execute(Op::BackgroundSet { scene, asset: 999, video: false, arc: 2.0, radius: 6.0, height: 4.0, center: [0.0, 2.0, -5.0], bulge: None, fit: None }).is_err());
+        assert_eq!(bg.fit, phantom_core::BackgroundFit::Contain);
+        // A nonexistent asset/scene is rejected; so is unusable geometry.
+        assert!(session.execute(Op::BackgroundSet { scene, asset: 999, video: false, width: 16.0, height: 9.0, center: [0.0, 2.0, -5.0], fit: None }).is_err());
+        assert!(session.execute(Op::BackgroundSet { scene, asset: image, video: false, width: 0.0, height: 9.0, center: [0.0, 2.0, -5.0], fit: None }).is_err());
+        assert!(session.execute(Op::BackgroundSet { scene, asset: image, video: false, width: 16.0, height: -1.0, center: [0.0, 2.0, -5.0], fit: None }).is_err());
         assert!(session.execute(Op::BackgroundClear { scene: 999 }).is_err());
         session.execute(Op::BackgroundClear { scene }).unwrap();
         assert!(session.project.as_ref().unwrap().scenes[&SceneId(scene)].background.is_none());
@@ -3757,11 +4797,8 @@ mod expansion_tests {
     fn state_get_reports_phantoms_film_and_audio() {
         let (mut session, scene) = session_with_scene();
         let phantom = add_phantom(&mut session, scene);
-        session.execute(Op::KeySet { scene, phantom, frame: 0, pos: [0.0, 0.0, 0.0], action: Action::Idle, yaw: 0.0 }).unwrap();
-        session
-            .execute(Op::TakeAdd { scene, phantom, name: "t".into(), start: 0, end: 24, motion: vec![(0, [0.0, 0.0, 0.0], Action::Idle)], yaws: None })
-            .unwrap();
-        let clip = session.execute(Op::FilmAdd { scene, start: 0, end: 48, shot: None }).unwrap()["clip"].as_u64().unwrap();
+        session.execute(Op::KeySet { scene, phantom, frame: 0, pos: [0.0, 0.0, 0.0], pose: ActorPose::Stand, yaw: 0.0 }).unwrap();
+        let clip = session.execute(Op::FilmAdd { scene, start: 0, end: 48, camera: None }).unwrap()["clip"].as_u64().unwrap();
         let track = session.execute(Op::AudioTrackAdd { scene: None, name: "score".into() }).unwrap()["track"].as_u64().unwrap();
         session.execute(Op::TrackVolumeSet { track, volume: 0.5 }).unwrap();
         session.execute(Op::TrackMuteSet { track, muted: true }).unwrap();
@@ -3774,15 +4811,14 @@ mod expansion_tests {
         assert_eq!(phantoms[0]["name"], "p");
         assert_eq!(phantoms[0]["rig"], "builtin");
         assert_eq!(phantoms[0]["motion_keys"].as_u64().unwrap(), 1);
-        assert_eq!(phantoms[0]["takes"].as_u64().unwrap(), 1);
-        assert_eq!(phantoms[0]["clip_uses"].as_u64().unwrap(), 0);
+        assert!(phantoms[0].get("takes").is_none(), "takes are gone from the document");
 
         let film = state["film"].as_array().unwrap();
         assert_eq!(film.len(), 1);
         assert_eq!(film[0]["id"].as_u64().unwrap(), clip);
         assert_eq!(film[0]["scene"].as_u64().unwrap(), scene);
         assert_eq!((film[0]["start"].as_i64().unwrap(), film[0]["end"].as_i64().unwrap()), (0, 48));
-        assert!(film[0]["shot"].is_null());
+        assert!(film[0]["camera"].is_null(), "no camera pinned: the scene's active camera is used");
 
         let tracks = state["audio_tracks"].as_array().unwrap();
         assert_eq!(tracks.len(), 2);
@@ -3834,21 +4870,17 @@ mod expansion_tests {
     }
 
     #[test]
-    fn render_ops_forward_twos_and_frames_to_cli_args() {
-        // Legacy JSON: twos/frames are absent and get serde defaults.
+    fn render_ops_forward_frames_and_shot_to_cli_args() {
         let op: Op = serde_json::from_str(r#"{"op":"render_scene","scene":1,"out":"o","width":320,"height":180,"frames":null}"#).unwrap();
-        assert!(matches!(op, Op::RenderScene { twos: false, shot: None, .. }));
+        assert!(matches!(op, Op::RenderScene { camera: None, .. }));
         let op: Op = serde_json::from_str(r#"{"op":"render_film","out":"o.mp4","width":320,"height":180}"#).unwrap();
         assert!(matches!(op, Op::RenderFilm { frames: None, normalize: false, target_peak_db: None, .. }));
 
         let dir = Path::new("/proj");
-        let args = scene_render_args(dir, Path::new("/proj/out"), 3, 640, 360, Some(7), Some((0, 48)), true);
+        let args = scene_render_args(dir, Path::new("/proj/out"), 3, 640, 360, Some(7), Some((0, 48)));
         let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert!(args.windows(2).any(|w| w == ["--shot", "7"]));
+        assert!(args.windows(2).any(|w| w == ["--camera", "7"]));
         assert!(args.windows(2).any(|w| w == ["--frames", "0-48"]));
-        assert!(args.iter().any(|a| a == "--twos"));
-        let args = scene_render_args(dir, Path::new("/proj/out"), 3, 640, 360, None, None, false);
-        assert!(!args.iter().any(|a| a == "--twos"));
 
         let args: Vec<String> = film_render_args(dir, Path::new("/proj/film.mp4"), 640, 360, Some((24, 96)), false, None)
             .iter()
@@ -4091,7 +5123,7 @@ mod query_ops_tests {
         session.project = Some(Project::new("q"));
         let scene = session.execute(Op::SceneAdd { name: "main".into(), start: 0, end: 48 }).unwrap()["scene"].as_u64().unwrap();
         session.execute(Op::PhantomAdd { scene, name: "p".into(), rig_asset: None, rig_actor: None }).unwrap();
-        session.execute(Op::ShotAdd { scene, name: "wide".into(), start: 0, end: 24 }).unwrap();
+        session.execute(Op::CameraAdd { scene, name: "wide".into(), start: Some(0), end: Some(24) }).unwrap();
         (session, scene)
     }
 
@@ -4101,7 +5133,7 @@ mod query_ops_tests {
         let v = session.execute(Op::SceneGet { scene }).unwrap();
         assert_eq!(v["name"].as_str(), Some("main"));
         assert_eq!(v["phantoms"].as_object().unwrap().len(), 1);
-        assert_eq!(v["shots"].as_object().unwrap().len(), 1);
+        assert_eq!(v["cameras"].as_object().unwrap().len(), 2, "the scene's own camera and the named one");
         assert!(v["objects"].is_object());
         assert!(v["layers_2d"].is_array());
         assert!(v["audio_tracks"].is_array());
@@ -4120,7 +5152,7 @@ mod query_ops_tests {
             let p = session.project.as_mut().unwrap();
             session
                 .history
-                .apply(p, Command::RegisterAsset { kind: AssetKind::ModelObj, path: "assets/quad/quad.obj".into() })
+                .apply(p, Command::RegisterAsset { kind: AssetKind::ModelObj, path: "assets/quad/quad.obj".into(), bounds: None })
                 .unwrap();
         }
         let v = session.execute(Op::AssetList).unwrap();
@@ -4142,41 +5174,41 @@ mod query_ops_tests {
         let (mut session, scene) = session_with_scene();
         // Size bounds are rejected before the renderer is created (no GPU needed).
         for (w, h) in [(0, 720), (1280, 0), (4097, 720), (1280, 4097)] {
-            let err = session.execute(Op::RenderStill { scene, frame: 0, width: w, height: h, shot: None, report: false }).unwrap_err();
+            let err = session.execute(Op::RenderStill { scene, frame: 0, width: w, height: h, camera: None, report: false }).unwrap_err();
             assert!(matches!(err, SessionError::BadInput(_)), "{w}x{h}: {err}");
         }
-        // A nonexistent scene/shot — an error before touching the GPU.
-        assert!(session.execute(Op::RenderStill { scene: 999, frame: 0, width: 64, height: 64, shot: None, report: false }).is_err());
-        assert!(session.execute(Op::RenderStill { scene, frame: 0, width: 64, height: 64, shot: Some(999), report: false }).is_err());
+        // A nonexistent scene/camera — an error before touching the GPU.
+        assert!(session.execute(Op::RenderStill { scene: 999, frame: 0, width: 64, height: 64, camera: None, report: false }).is_err());
+        assert!(session.execute(Op::RenderStill { scene, frame: 0, width: 64, height: 64, camera: Some(999), report: false }).is_err());
         // Without a project — a clear error.
         let mut empty = Session::new();
         assert!(matches!(
-            empty.execute(Op::RenderStill { scene, frame: 0, width: 64, height: 64, shot: None, report: false }),
+            empty.execute(Op::RenderStill { scene, frame: 0, width: 64, height: 64, camera: None, report: false }),
             Err(SessionError::NoProject)
         ));
         // A boundary-but-valid size passes validation (rendering needs a GPU,
         // so it is not called here — covered by the checks above).
         assert!(matches!(
             serde_json::from_value::<Op>(json!({"op":"render_still","scene":1,"frame":2,"width":4096,"height":4096})).unwrap(),
-            Op::RenderStill { shot: None, .. }
+            Op::RenderStill { camera: None, .. }
         ));
     }
 
     #[test]
-    fn shot_get_returns_canonical_snapshot_and_parent_revision_without_mutation() {
+    fn camera_get_returns_canonical_snapshot_and_parent_revision_without_mutation() {
         let (mut session, scene) = session_with_scene();
-        let shot = session.execute(Op::ShotAdd { scene, name: "close".into(), start: 0, end: 24 }).unwrap()["shot"].as_u64().unwrap();
-        session.execute(Op::ShotCameraKeySet { scene, shot, frame: 0, pos: [0.0, 1.4, 4.0], yaw: 0.0, pitch: 0.0 }).unwrap();
-        session.execute(Op::ShotFocalSet { scene, shot, focal_mm: 35.0 }).unwrap();
+        let camera = session.execute(Op::CameraAdd { scene, name: "close".into(), start: Some(0), end: Some(24) }).unwrap()["camera"].as_u64().unwrap();
+        session.execute(Op::CameraKeySet { scene, camera: Some(camera), key: TransformKey::at(0, [0.0, 1.4, 4.0].into(), 0.0, 0.0) }).unwrap();
+        session.execute(Op::CameraLensSet { scene, camera, focal_mm: 35.0 }).unwrap();
         let revision = session.project.as_ref().unwrap().revision;
         let undo_depth = session.history.undo_depth();
 
-        let v = session.execute(Op::ShotGet { scene, shot }).unwrap();
-        // Full canonical shot snapshot (id/name/range/camera) plus parent scene id and revision.
+        let v = session.execute(Op::CameraGet { scene, camera }).unwrap();
+        // Full canonical camera snapshot (id/name/range/camera/target) plus the parent scene id and revision.
         assert_eq!(v["scene"].as_u64().unwrap(), scene);
         assert_eq!(v["revision"].as_u64().unwrap(), revision);
-        let snapshot = &v["shot"];
-        assert_eq!(snapshot["id"].as_u64().unwrap(), shot);
+        let snapshot = &v["camera"];
+        assert_eq!(snapshot["id"].as_u64().unwrap(), camera);
         assert_eq!(snapshot["name"], "close");
         assert_eq!(snapshot["range"], json!({"start":0,"end":24}));
         assert_eq!(snapshot["camera"]["focal_mm"].as_f64().unwrap(), 35.0);
@@ -4187,15 +5219,15 @@ mod query_ops_tests {
         assert_eq!(session.project.as_ref().unwrap().revision, revision);
         assert_eq!(session.history.undo_depth(), undo_depth);
 
-        // Unknown shot/scene and no project give stable not_found/not_open codes.
-        let err = session.execute(Op::ShotGet { scene, shot: 999 }).unwrap_err();
+        // Unknown camera/scene and no project give stable not_found/not_open codes.
+        let err = session.execute(Op::CameraGet { scene, camera: 999 }).unwrap_err();
         assert_eq!(err.code(), "not_found");
-        assert_eq!(err.details()["entity"], "shot");
-        let err = session.execute(Op::ShotGet { scene: 999, shot }).unwrap_err();
+        assert_eq!(err.details()["entity"], "camera");
+        let err = session.execute(Op::CameraGet { scene: 999, camera }).unwrap_err();
         assert_eq!(err.code(), "not_found");
         assert_eq!(err.details()["entity"], "scene");
         let mut empty = Session::new();
-        assert!(matches!(empty.execute(Op::ShotGet { scene, shot }), Err(SessionError::NoProject)));
+        assert!(matches!(empty.execute(Op::CameraGet { scene, camera }), Err(SessionError::NoProject)));
     }
 
     #[test]
@@ -4205,12 +5237,12 @@ mod query_ops_tests {
         let scene = session.execute(Op::SceneAdd { name: "main".into(), start: 0, end: 48 }).unwrap()["scene"].as_u64().unwrap();
         let register = |session: &mut Session, kind: AssetKind, path: &str| {
             let p = session.project.as_mut().unwrap();
-            session.history.apply(p, Command::RegisterAsset { kind, path: path.into() }).unwrap().asset.unwrap().0
+            session.history.apply(p, Command::RegisterAsset { kind, path: path.into(), bounds: None }).unwrap().asset.unwrap().0
         };
         let image = register(&mut session, AssetKind::Image, "assets/bg.png");
         let model = register(&mut session, AssetKind::ModelObj, "assets/prop/prop.obj");
         let audio = register(&mut session, AssetKind::Audio, "assets/dialog.wav");
-        session.execute(Op::BackgroundSet { scene, asset: image, video: false, arc: 2.0, radius: 6.0, height: 4.0, center: [0.0, 2.0, -5.0], bulge: None, fit: None }).unwrap();
+        session.execute(Op::BackgroundSet { scene, asset: image, video: false, width: 16.0, height: 8.0, center: [0.0, 2.0, -5.0], fit: None }).unwrap();
         session.execute(Op::ObjectAdd { scene, name: "crate".into(), asset: model }).unwrap();
         let track = session.execute(Op::AudioTrackAdd { scene: Some(scene), name: "fx".into() }).unwrap()["track"].as_u64().unwrap();
         session.execute(Op::AudioClipAdd { track, asset: audio, start: 0, offset_samples: 0, len_samples: 48_000, fade_in_samples: 0, fade_out_samples: 0 }).unwrap();
@@ -4264,9 +5296,9 @@ mod query_ops_tests {
     #[test]
     fn film_get_reports_clips_and_mapped_totals() {
         let (mut session, scene) = session_with_scene();
-        let shot = session.execute(Op::ShotAdd { scene, name: "b".into(), start: 24, end: 48 }).unwrap()["shot"].as_u64().unwrap();
-        let c1 = session.execute(Op::FilmAdd { scene, start: 0, end: 24, shot: None }).unwrap()["clip"].as_u64().unwrap();
-        let c2 = session.execute(Op::FilmAdd { scene, start: 24, end: 48, shot: Some(shot) }).unwrap()["clip"].as_u64().unwrap();
+        let camera = session.execute(Op::CameraAdd { scene, name: "b".into(), start: Some(24), end: Some(48) }).unwrap()["camera"].as_u64().unwrap();
+        let c1 = session.execute(Op::FilmAdd { scene, start: 0, end: 24, camera: None }).unwrap()["clip"].as_u64().unwrap();
+        let c2 = session.execute(Op::FilmAdd { scene, start: 24, end: 48, camera: Some(camera) }).unwrap()["clip"].as_u64().unwrap();
         let revision = session.project.as_ref().unwrap().revision;
 
         let v = session.execute(Op::FilmGet).unwrap();
@@ -4274,9 +5306,9 @@ mod query_ops_tests {
         let clips = v["clips"].as_array().unwrap();
         assert_eq!(clips.len(), 2);
         assert_eq!(clips[0]["id"].as_u64().unwrap(), c1);
-        assert!(clips[0]["shot"].is_null());
+        assert!(clips[0]["camera"].is_null());
         assert_eq!(clips[1]["id"].as_u64().unwrap(), c2);
-        assert_eq!(clips[1]["shot"].as_u64().unwrap(), shot);
+        assert_eq!(clips[1]["camera"].as_u64().unwrap(), camera);
         assert_eq!(clips[1]["range"], json!({"start":24,"end":48}));
         // Mapped total length in frames and seconds at fixed 24 fps.
         assert_eq!(v["total_frames"].as_i64().unwrap(), 48);
@@ -4298,7 +5330,7 @@ mod query_ops_tests {
     #[test]
     fn diagnostics_are_queries_without_revision_bump() {
         let (mut session, scene) = session_with_scene();
-        let shot = session.execute(Op::ShotAdd { scene, name: "wide".into(), start: 0, end: 24 }).unwrap()["shot"].as_u64().unwrap();
+        let camera = session.execute(Op::CameraAdd { scene, name: "wide".into(), start: Some(0), end: Some(24) }).unwrap()["camera"].as_u64().unwrap();
         let revision = session.project.as_ref().unwrap().revision;
         let undo_depth = session.history.undo_depth();
 
@@ -4313,27 +5345,29 @@ mod query_ops_tests {
         assert!(session.execute(Op::Validate { scene: Some(999) }).unwrap_err().code() == "not_found");
 
         // camera_coverage: structured camera + background spans, degrees.
-        let cov = session.execute(Op::CameraCoverage { scene, frame: None, shot: Some(shot), aspect: None }).unwrap();
+        let cov = session.execute(Op::CameraCoverage { scene, frame: None, camera: Some(camera), aspect: None }).unwrap();
         assert_eq!(cov["revision"].as_u64().unwrap(), revision);
-        assert_eq!(cov["frame"], 0, "default frame = shot range start");
+        assert_eq!(cov["frame"], 0, "default frame = the camera range start");
         assert!(cov["camera"]["hfov_deg"].as_f64().unwrap() > cov["camera"]["vfov_deg"].as_f64().unwrap());
-        assert_eq!(cov["shot"].as_u64().unwrap(), shot);
+        assert_eq!(cov["camera_id"].as_u64().unwrap(), camera);
         assert_eq!(cov["background"], Value::Null, "scene has no background yet");
         assert_eq!(cov["findings"][0]["code"], "background_absent");
         assert!(cov["phantoms"].as_array().unwrap().iter().all(|p| p["in_frame"].is_boolean()));
-        assert!(session.execute(Op::CameraCoverage { scene, frame: None, shot: Some(999), aspect: None }).unwrap_err().code() == "not_found");
-        assert!(session.execute(Op::CameraCoverage { scene, frame: None, shot: None, aspect: Some(0.0) }).unwrap_err().code() == "invalid_input");
+        assert!(session.execute(Op::CameraCoverage { scene, frame: None, camera: Some(999), aspect: None }).unwrap_err().code() == "not_found");
+        assert!(session.execute(Op::CameraCoverage { scene, frame: None, camera: None, aspect: Some(0.0) }).unwrap_err().code() == "invalid_input");
 
         // background_fit: suggestion covers the frame (roundtrip through coverage).
-        let fit = session.execute(Op::BackgroundFit { scene, frame: None, shot: None, margin_deg: None, aspect: None }).unwrap();
+        let fit = session.execute(Op::BackgroundFit { scene, frame: None, camera: None, margin_deg: None, aspect: None }).unwrap();
         assert_eq!(fit["margin_deg"], 5.0);
-        assert!(fit["suggested"]["arc_deg"].as_f64().unwrap() > 0.0);
+        assert!(fit["suggested"]["width"].as_f64().unwrap() > 0.0);
+        assert!(fit["suggested"]["height"].as_f64().unwrap() > 0.0);
+        assert_eq!(fit["size_covers"], true);
         assert!(fit["panorama_aspect"].as_f64().unwrap() > 0.0);
-        assert_eq!(fit["scope"], "scene", "without shot the fit covers every camera in the scene");
-        assert!(fit["shots"].as_array().is_some_and(|shots| !shots.is_empty()));
-        assert!(session.execute(Op::BackgroundFit { scene, frame: None, shot: None, margin_deg: Some(90.0), aspect: None }).unwrap_err().code() == "invalid_input");
-        // An explicit frame without shot is not silently ignored (lesson from corrective_2 §2).
-        assert!(session.execute(Op::BackgroundFit { scene, frame: Some(0), shot: None, margin_deg: None, aspect: None }).unwrap_err().code() == "invalid_input");
+        assert_eq!(fit["scope"], "scene", "without a camera the fit covers every camera in the scene");
+        assert!(fit["cameras"].as_array().is_some_and(|shots| !shots.is_empty()));
+        assert!(session.execute(Op::BackgroundFit { scene, frame: None, camera: None, margin_deg: Some(90.0), aspect: None }).unwrap_err().code() == "invalid_input");
+        // An explicit frame without a camera is not silently ignored (lesson from corrective_2 §2).
+        assert!(session.execute(Op::BackgroundFit { scene, frame: Some(0), camera: None, margin_deg: None, aspect: None }).unwrap_err().code() == "invalid_input");
 
         // Queries: no revision, no undo steps, no mutation ack fields.
         assert_eq!(session.project.as_ref().unwrap().revision, revision, "diagnostics never raise the revision");
@@ -4342,8 +5376,8 @@ mod query_ops_tests {
             assert!(result.get("entity").is_none() && result.get("next_id").is_none(), "query ack fields: {result}");
         }
         assert_eq!(Op::Validate { scene: None }.class(), OpClass::Query);
-        assert_eq!(Op::CameraCoverage { scene: 1, frame: None, shot: None, aspect: None }.class(), OpClass::Query);
-        assert_eq!(Op::BackgroundFit { scene: 1, frame: None, shot: None, margin_deg: None, aspect: None }.class(), OpClass::Query);
+        assert_eq!(Op::CameraCoverage { scene: 1, frame: None, camera: None, aspect: None }.class(), OpClass::Query);
+        assert_eq!(Op::BackgroundFit { scene: 1, frame: None, camera: None, margin_deg: None, aspect: None }.class(), OpClass::Query);
         let mut empty = Session::new();
         assert!(matches!(empty.execute(Op::Validate { scene: None }), Err(SessionError::NoProject)));
     }
@@ -4351,12 +5385,12 @@ mod query_ops_tests {
     #[test]
     fn getters_are_queries_without_mutation_acknowledgement() {
         let (mut session, scene) = session_with_scene();
-        let shot = session.execute(Op::ShotAdd { scene, name: "wide".into(), start: 0, end: 24 }).unwrap()["shot"].as_u64().unwrap();
-        session.execute(Op::FilmAdd { scene, start: 0, end: 24, shot: Some(shot) }).unwrap();
+        let camera = session.execute(Op::CameraAdd { scene, name: "wide".into(), start: Some(0), end: Some(24) }).unwrap()["camera"].as_u64().unwrap();
+        session.execute(Op::FilmAdd { scene, start: 0, end: 24, camera: Some(camera) }).unwrap();
         let revision = session.project.as_ref().unwrap().revision;
         let undo_depth = session.history.undo_depth();
         for result in [
-            session.execute(Op::ShotGet { scene, shot }).unwrap(),
+            session.execute(Op::CameraGet { scene, camera }).unwrap(),
             session.execute(Op::FilmGet).unwrap(),
             session.execute(Op::ProjectRecent).unwrap(),
         ] {
@@ -4369,7 +5403,7 @@ mod query_ops_tests {
         assert_eq!(err.details()["entity"], "asset");
         assert_eq!(session.project.as_ref().unwrap().revision, revision, "queries never raise the revision");
         assert_eq!(session.history.undo_depth(), undo_depth, "queries never add undo steps");
-        assert_eq!(Op::ShotGet { scene: 1, shot: 1 }.class(), OpClass::Query);
+        assert_eq!(Op::CameraGet { scene: 1, camera: 1 }.class(), OpClass::Query);
         assert_eq!(Op::AssetGet { asset: 1 }.class(), OpClass::Query);
         assert_eq!(Op::FilmGet.class(), OpClass::Query);
         assert_eq!(Op::ProjectRecent.class(), OpClass::Query);

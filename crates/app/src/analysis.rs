@@ -2,21 +2,19 @@
 //! `camera_coverage`, `background_fit`. Only the core document and camera
 //! geometry — no render, no GPU, no media decoding.
 //!
-//! Screen geometry is the same one `mesh_gen::arc_screen_mesh` builds:
-//! arc point = `center + (sin θ·R, y − height/2, sign·(1 − cos θ)·R)`,
-//! θ ∈ [−arc/2, arc/2], y ∈ [0, height]; the arc midpoint sits at `center`,
-//! the sign comes from `bg.bulge`: `toward_camera` — edges farther from the
-//! viewer (a backdrop-style screen), `away_from_camera` (default) — edges
-//! closer, the screen wraps around the scene (A3a).
+//! Screen geometry is the one `mesh_gen::screen_mesh` builds: a flat rectangle
+//! `width × height` centered on `center`, facing the camera side (+Z). Both
+//! places must agree — a coverage number that describes a different plane than
+//! the one drawn would be worse than no number.
 //! Camera — `Camera::sample` plus a YXZ(yaw, pitch) rotation looking along
 //! local −Z, as in the render (`Quat::from_euler(YXZ, yaw, pitch, 0)`).
 //! Vertical FOV — `phantom_core::vertical_fov`, the formula shared with the
 //! renderer; horizontal FOV derived from it via `phantom_core::horizontal_fov`.
 //!
 //! Documented approximations:
-//! - coverage is estimated from 129 arc points (and two edges in height):
+//! - coverage is estimated from 129 columns (and two edges in height):
 //!   the screen's azimuth range is the min/max over samples, sampling error
-//!   < arc/128 rad;
+//!   < width / 128 m of the plane;
 //! - vertical coverage uses the worst column inside the frustum
 //!   (conservative: the real frame may be covered slightly better);
 //! - camera roll does not exist in the document and is not accounted for;
@@ -27,87 +25,32 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use glam::{Quat, Vec3};
+use glam::Vec3;
 use serde_json::{json, Value};
+
+#[cfg(test)]
+use phantom_core::{SceneCamera, SCENE_CAMERA};
 
 use phantom_core::audio::SAMPLES_PER_FRAME;
 use phantom_core::time::frame_to_secs;
 use phantom_core::{
-    evaluate, evaluate_object, film_len, horizontal_fov, vertical_fov, Background, Camera, Frame, FrameRange, Project, Scene, ShotId,
+    evaluate, evaluate_object, film_len, Background, Camera, Frame, FrameRange, Project, Scene, CameraId, CameraSubject,
 };
 
-/// Default frame aspect ratio (16:9) when the call does not set aspect.
-pub const DEFAULT_ASPECT: f32 = 16.0 / 9.0;
-/// Screen arc sample points for the coverage estimate (both ends included).
+pub use phantom_core::view::DEFAULT_ASPECT;
+use phantom_core::view::{Frustum, MIN_DEPTH};
+
+/// Screen columns sampled for the coverage estimate (both ends included).
 const SCREEN_SAMPLES: usize = 128;
-/// Minimum depth in front of the camera: points closer/behind add no coverage.
-const MIN_DEPTH: f32 = 1e-3;
-
-/// Camera at a specific frame, with its derived field-of-view angles.
-struct Frustum {
-    pos: Vec3,
-    yaw: f32,
-    pitch: f32,
-    focal_mm: f32,
-    vfov: f32,
-    hfov: f32,
-    /// world → camera (conjugate of YXZ(yaw, pitch)).
-    inv_rot: Quat,
-}
-
-impl Frustum {
-    fn new(camera: &Camera, frame: Frame, aspect: f32) -> Self {
-        let pose = camera.sample(frame);
-        // Focal length comes from the pose: a key may set its own (C1.2), and
-        // then the diagnostics FOV must match the real frame.
-        let focal_mm = pose.focal_mm;
-        Self {
-            pos: pose.translation,
-            yaw: pose.yaw,
-            pitch: pose.pitch,
-            focal_mm,
-            vfov: vertical_fov(focal_mm),
-            hfov: horizontal_fov(focal_mm, aspect),
-            inv_rot: Quat::from_euler(glam::EulerRot::YXZ, pose.yaw, pose.pitch, 0.0).conjugate(),
-        }
-    }
-
-    fn local(&self, p: Vec3) -> Vec3 {
-        self.inv_rot * (p - self.pos)
-    }
-
-    /// Whether a point is in frame: in front of the camera and inside both half-FOVs.
-    fn contains(&self, p: Vec3) -> bool {
-        let l = self.local(p);
-        if l.z > -MIN_DEPTH {
-            return false;
-        }
-        let az = l.x.atan2(-l.z);
-        let el = l.y.atan2(-l.z);
-        az.abs() <= self.hfov * 0.5 && el.abs() <= self.vfov * 0.5
-    }
-}
 
 /// Why the screen geometry is invalid; `None` — the geometry is valid.
 fn background_invalid_reason(bg: &Background) -> Option<&'static str> {
-    if !bg.arc_radians.is_finite() || !bg.radius.is_finite() || !bg.height.is_finite() || !bg.center.is_finite() {
-        return Some("non-numeric values in arc/radius/height/center");
+    match bg.validate() {
+        Ok(()) => None,
+        Err(phantom_core::CoreError::InvalidBackground(reason)) => Some(reason),
+        Err(phantom_core::CoreError::NonFinite(_)) => Some("non-numeric values in width/height/center"),
+        Err(_) => Some("invalid geometry"),
     }
-    if bg.arc_radians <= 0.0 {
-        return Some("arc <= 0");
-    }
-    // JSON clients commonly send a rounded full circle (6.2832). Accept this
-    // harmless f32 rounding; materially larger arcs remain invalid geometry.
-    if bg.arc_radians > std::f32::consts::TAU + 1e-3 {
-        return Some("arc > 2π");
-    }
-    if bg.radius <= 0.0 {
-        return Some("radius <= 0");
-    }
-    if bg.height <= 0.0 {
-        return Some("height <= 0");
-    }
-    None
 }
 
 /// Angular spans of the screen seen from the camera (radians, relative to the
@@ -125,6 +68,9 @@ struct ScreenSpan {
     any_behind: bool,
 }
 
+/// The flat screen sampled along its width: two edges (top and bottom) per
+/// column. One implementation for the renderer's geometry and the diagnostics,
+/// so a coverage number always describes the plane that is really drawn.
 fn screen_span(bg: &Background, fr: &Frustum) -> ScreenSpan {
     let mut span = ScreenSpan {
         min_az: f32::INFINITY,
@@ -134,21 +80,14 @@ fn screen_span(bg: &Background, fr: &Frustum) -> ScreenSpan {
         any_in_frustum: false,
         any_behind: false,
     };
-    let z_sign = match bg.bulge {
-        phantom_core::project::Bulge::TowardCamera => -1.0,
-        phantom_core::project::Bulge::AwayFromCamera => 1.0,
-    };
     for i in 0..=SCREEN_SAMPLES {
-        let theta = (i as f32 / SCREEN_SAMPLES as f32 - 0.5) * bg.arc_radians;
-        let x = theta.sin() * bg.radius;
-        let z = z_sign * (1.0 - theta.cos()) * bg.radius;
+        let x = (i as f32 / SCREEN_SAMPLES as f32 - 0.5) * bg.width;
         for &y in &[bg.height * 0.5, -bg.height * 0.5] {
-            let p = bg.center + Vec3::new(x, y, z);
+            let p = bg.center + Vec3::new(x, y, 0.0);
             let l = fr.local(p);
             if l.z > -MIN_DEPTH {
                 // Points behind the camera do not project into the frame: they
-                // do not break coverage (a full-turn screen correctly wraps the
-                // camera), but they also take no part in the span.
+                // do not break coverage, but they also take no part in the span.
                 span.any_behind = true;
                 continue;
             }
@@ -195,44 +134,79 @@ fn coverage(bg: &Background, fr: &Frustum) -> Coverage {
     }
 }
 
-/// Smallest arc (radians, ≤ 2π) that closes the horizontal frustum with a
-/// `margin` of slack at the current radius/center. Monotonicity of span(arc)
-/// (the θ range widens) makes bisection correct. `None` when even a full
-/// circle does not close the frame (the camera is too far from the screen for
-/// the current radius — `background_fit` then picks the radius).
-fn needed_arc(bg: &Background, fr: &Frustum, margin: f32) -> Option<f32> {
+/// Does the screen at this width close the horizontal frustum with `margin`
+/// of slack per side?
+fn width_covers(bg: &Background, width: f32, fr: &Frustum, margin: f32) -> bool {
+    let mut probe = bg.clone();
+    probe.width = width;
     let half_h = fr.hfov * 0.5 + margin;
-    bisect_arc(|arc| {
-        let mut probe = bg.clone();
-        probe.arc_radians = arc;
-        let span = screen_span(&probe, fr);
-        span.min_az <= -half_h && span.max_az >= half_h
-    })
+    let span = screen_span(&probe, fr);
+    span.min_az <= -half_h && span.max_az >= half_h
 }
 
-/// Smallest arc that closes EVERY scene sample (corrective_2 K0.1).
-/// Monotonicity still holds: widening the arc only widens the spans, so
-/// bisection stays correct for the union of requirements too.
-fn needed_arc_all(bg: &Background, samples: &[FitSample], margin: f32) -> Option<f32> {
-    bisect_arc(|arc| {
-        let mut probe = bg.clone();
-        probe.arc_radians = arc;
-        samples.iter().all(|s| {
-            let half_h = s.fr.hfov * 0.5 + margin;
-            let span = screen_span(&probe, &s.fr);
-            span.min_az <= -half_h && span.max_az >= half_h
-        })
-    })
+/// Does the screen at this height close the vertical frustum with `margin`?
+/// The caller must already have a sufficient width: a screen no column of which
+/// falls inside the frame cannot cover any part of it.
+fn height_covers(bg: &Background, height: f32, fr: &Frustum, margin: f32) -> bool {
+    let mut probe = bg.clone();
+    probe.height = height;
+    let half_v = fr.vfov * 0.5 + margin;
+    let span = screen_span(&probe, fr);
+    span.any_in_frustum && span.top_el >= half_v && span.bottom_el <= -half_v
 }
 
-/// Bisection for the minimal arc under a monotone predicate `covers`;
-/// `None` when even a full circle does not close the frame.
-fn bisect_arc(covers: impl Fn(f32) -> bool) -> Option<f32> {
-    if !covers(std::f32::consts::TAU) {
-        return None;
-    }
+/// Smallest screen width that closes the horizontal frustum with `margin` at
+/// the screen's current plane. `None` when no width helps — the plane does not
+/// face the camera or lies behind it, in which case the screen has to be moved.
+///
+/// Monotone in width (a wider plane only widens the azimuth span), so growth to
+/// a covering bound plus bisection is exact.
+fn needed_width(bg: &Background, fr: &Frustum, margin: f32) -> Option<f32> {
     let mut lo = 0.0f32;
-    let mut hi = std::f32::consts::TAU;
+    let mut hi = bg.width.max(1.0);
+    let mut guard = 0;
+    while !width_covers(bg, hi, fr, margin) {
+        lo = hi;
+        hi *= 1.5;
+        guard += 1;
+        if guard > 48 {
+            return None;
+        }
+    }
+    for _ in 0..48 {
+        let mid = 0.5 * (lo + hi);
+        if width_covers(bg, mid, fr, margin) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Some(hi)
+}
+
+/// Smallest screen width that closes EVERY sample's horizontal frustum.
+fn needed_width_all(bg: &Background, samples: &[FitSample], margin: f32) -> Option<f32> {
+    let mut need = 0.0f32;
+    for s in samples {
+        need = need.max(needed_width(bg, &s.fr, margin)?);
+    }
+    Some(need)
+}
+
+/// Smallest screen height that closes every sample's vertical frustum.
+fn needed_height_all(bg: &Background, samples: &[FitSample], margin: f32) -> Option<f32> {
+    let mut lo = 0.0f32;
+    let mut hi = bg.height.max(1.0);
+    let covers = |h: f32| samples.iter().all(|s| height_covers(bg, h, &s.fr, margin));
+    let mut guard = 0;
+    while !covers(hi) {
+        lo = hi;
+        hi *= 1.5;
+        guard += 1;
+        if guard > 48 {
+            return None;
+        }
+    }
     for _ in 0..48 {
         let mid = 0.5 * (lo + hi);
         if covers(mid) {
@@ -244,21 +218,17 @@ fn bisect_arc(covers: impl Fn(f32) -> bool) -> Option<f32> {
     Some(hi)
 }
 
-/// suggested_fix line for a coverage gap: either the minimal arc at the
-/// current radius (plus a focal-length alternative), or an admission that the
-/// radius is too small and background_fit is needed.
+/// Suggested_fix line for a coverage gap: the minimal width at the current
+/// plane, plus a focal-length alternative, or an admission that no width helps.
 fn gap_fix_string(bg: &Background, fr: &Frustum, aspect: f32) -> String {
-    match needed_arc(bg, fr, 0.0) {
-        Some(arc) => {
-            let arc_deg = deg(arc);
-            match max_fitting_focal(bg, fr, aspect) {
-                Some(f) => format!("arc >= {arc_deg:.1}° at radius {:.1} m, or focal_mm <= {f:.1}", bg.radius),
-                None => format!("arc >= {arc_deg:.1}° at radius {:.1} m", bg.radius),
-            }
-        }
+    match needed_width(bg, fr, 0.0) {
+        Some(width) => match max_fitting_focal(bg, fr, aspect) {
+            Some(f) => format!("width >= {width:.1} m at z = {:.1} m, or focal_mm <= {f:.1}", bg.center.z),
+            None => format!("width >= {width:.1} m at z = {:.1} m", bg.center.z),
+        },
         None => format!(
-            "at radius {:.1} m the frame cannot be closed even by a 360° arc — background_fit will pick radius/arc",
-            bg.radius
+            "no width closes the frame at z = {:.1} m — the plane does not face this camera; move the screen back (background_set center)",
+            bg.center.z
         ),
     }
 }
@@ -308,10 +278,10 @@ fn span_json(cov: &Coverage) -> Value {
     })
 }
 
-fn camera_json(scene_id: u64, shot: Option<ShotId>, frame: Frame, fr: &Frustum, aspect: f32) -> Value {
+fn camera_json(scene_id: u64, camera: Option<CameraId>, frame: Frame, fr: &Frustum, aspect: f32) -> Value {
     json!({
         "scene": scene_id,
-        "shot": shot.map(|s| s.0),
+        "camera_id": camera.map(|s| s.0),
         "frame": frame,
         "camera": {
             "pos": v3(fr.pos),
@@ -328,13 +298,13 @@ fn camera_json(scene_id: u64, shot: Option<ShotId>, frame: Frame, fr: &Frustum, 
 /// Frame coverage by the background screen and phantom/object point
 /// visibility at a frame (corrective C3.3). Pure geometry, no render.
 ///
-/// `frame` defaults to the start of the shot/scene range. The scene and shot
+/// `frame` defaults to the start of the camera's range. The scene and camera
 /// must exist (the calling Session checks that).
-pub fn camera_coverage(scene: &Scene, shot: Option<ShotId>, frame: Option<Frame>, aspect: f32) -> Value {
-    let range = scene.range_for_shot(shot);
+pub fn camera_coverage(project: &Project, scene: &Scene, camera: Option<CameraId>, frame: Option<Frame>, aspect: f32) -> Value {
+    let range = scene.range_for(camera);
     let frame = frame.unwrap_or(range.start);
-    let fr = Frustum::new(scene.camera_for_shot(shot), frame, aspect);
-    let mut out = camera_json(scene.id.0, shot, frame, &fr, aspect);
+    let fr = phantom_core::camera_frustum(project, scene, camera, frame, aspect);
+    let mut out = camera_json(scene.id.0, camera, frame, &fr, aspect);
     let object = out.as_object_mut().expect("object");
 
     let mut findings = Vec::new();
@@ -351,19 +321,19 @@ pub fn camera_coverage(scene: &Scene, shot: Option<ShotId>, frame: Option<Frame>
         Some(bg) => {
             if let Some(reason) = background_invalid_reason(bg) {
                 object.insert("background".into(), json!({
-                    "arc_deg": deg(bg.arc_radians), "radius": bg.radius, "height": bg.height,
+                    "width": bg.width, "height": bg.height,
                     "center": v3(bg.center), "covers_frame": Value::Null,
                 }));
                 findings.push(json!({
                     "code": "bg_geometry_invalid", "severity": "error",
                     "where": {"scene": scene.id.0, "frame": frame},
                     "why": format!("screen geometry is invalid: {reason}"),
-                    "suggested_fix": "fix background_set (arc in (0, 2π], radius > 0, height > 0)",
+                    "suggested_fix": "fix background_set (width > 0, height > 0, finite center)",
                 }));
             } else {
                 let cov = coverage(bg, &fr);
                 object.insert("background".into(), json!({
-                    "arc_deg": deg(bg.arc_radians), "radius": bg.radius, "height": bg.height,
+                    "width": bg.width, "height": bg.height,
                     "center": v3(bg.center),
                     "covers_frame": cov.covers_frame,
                     "span": span_json(&cov),
@@ -371,13 +341,13 @@ pub fn camera_coverage(scene: &Scene, shot: Option<ShotId>, frame: Option<Frame>
                     "points_behind_camera": cov.span.any_behind,
                 }));
                 if !cov.covers_frame {
-                    let needed_arc_deg = needed_arc(bg, &fr, 0.0).map(deg);
+                    let needed_width = needed_width(bg, &fr, 0.0);
                     findings.push(json!({
                         "code": "screen_fov_gap", "severity": "warning",
-                        "where": {"scene": scene.id.0, "frame": frame, "shot": shot.map(|s| s.0)},
+                        "where": {"scene": scene.id.0, "frame": frame, "camera": camera.map(|s| s.0)},
                         "why": format!("the screen does not cover the frame: gaps in degrees {}", gap_json(&cov)),
                         "suggested_fix": gap_fix_string(bg, &fr, aspect),
-                        "needed_arc_deg": needed_arc_deg,
+                        "needed_width_m": needed_width.map(|w| (w as f64 * 100.0).ceil() / 100.0),
                     }));
                 }
             }
@@ -388,7 +358,7 @@ pub fn camera_coverage(scene: &Scene, shot: Option<ShotId>, frame: Option<Frame>
         .phantoms
         .values()
         .map(|ph| {
-            let state = evaluate(ph, &scene.range, frame, false);
+            let state = evaluate(ph, frame);
             json!({"id": ph.id.0, "pos": v3(state.root), "in_frame": fr.contains(state.root)})
         })
         .collect();
@@ -396,7 +366,7 @@ pub fn camera_coverage(scene: &Scene, shot: Option<ShotId>, frame: Option<Frame>
         .objects
         .values()
         .map(|o| {
-            let t = evaluate_object(o, &scene.range, frame, false);
+            let t = evaluate_object(o, frame);
             json!({"id": o.id.0, "pos": v3(t.position), "in_frame": fr.contains(t.position)})
         })
         .collect();
@@ -406,83 +376,57 @@ pub fn camera_coverage(scene: &Scene, shot: Option<ShotId>, frame: Option<Frame>
     out
 }
 
-/// Fit the screen geometry to the camera (corrective C3.3): the smallest
-/// honest arc/height that close the frame with `margin_deg` of slack per side.
+/// Fit the screen size to the camera (layout mode): the smallest honest
+/// width/height that close the frame with `margin_deg` of slack per side, at
+/// the screen's current plane.
 ///
-/// Formulas (documented approximations):
-/// - `center` is preserved (or the default [0,2,−5] when there is no background);
-/// - `radius = max(current|6.0, dist_xz(camera, center) + 0.5)` — the starting
-///   point: the camera inside the curvature circle with a 0.5 m delta. Because
-///   the screen bulges TOWARD the camera (A3) this may not be enough: the arc
-///   edges move away from the camera, so radius is scaled by ×1.5 until the
-///   bisection finds a closing arc (10 km cap — a guard against degenerate
-///   setups; then a 360° arc is returned with `arc_covers: false`);
-/// - `arc` — minimum found by bisection over the sampled azimuthal span, so
-///   that min_az <= −(hfov/2 + margin) and max_az >= hfov/2 + margin;
-/// - `height` — from the nearest screen point (arc midpoint, dist_xz):
-///   top/bottom y = cam.y ± tan(pitch ± (vfov/2 + margin))·dist, symmetric
-///   around the preserved center.y; angles are clamped to ±85° against tan→∞;
-/// - `panorama_aspect = (arc·radius) / height` — the ratio of the screen's
-///   horizontal length to its height, for the panorama generator.
+/// The screen is a flat rectangle at `center`, facing +Z. `center` is preserved
+/// (or the default [0,2,−5] when there is no background); a camera that never
+/// faces the plane is not fixable by size alone, and then `size_covers` is
+/// false with an empty suggestion — move the screen with `background_set`.
 ///
-/// Without `shot` the fit runs over the WHOLE scene (corrective_2 K0.1): the
-/// legacy camera keys and each shot camera's keys are sampled, and
-/// arc/radius/height must close every sample — that is, the union of the
-/// shots' requirements, not one camera. Fitting a single shot that looks
-/// elsewhere would otherwise give a "fit for the neighbouring frame" and leave
-/// a hole in its own.
-/// An explicit `frame` without `shot` makes no sense (shots have their own
+/// `width` — the minimum closing the horizontal frustum of every sample (growth
+/// to a covering bound plus bisection; the span is monotone in width);
+/// `height` — the same for the vertical frustum, at that width;
+/// `panorama_aspect = width / height` — the ratio for the panorama generator.
+///
+/// Without `camera` the fit runs over the WHOLE scene (corrective_2 K0.1): each
+/// camera's keys are sampled and the size must close every sample — the union of
+/// the cameras' requirements, not one camera. Fitting a single camera that looks elsewhere would otherwise give a "fit for
+/// the neighbouring frame" and leave a hole in its own.
+/// An explicit `frame` without `camera` makes no sense (each camera has its own
 /// ranges) and is rejected by the calling code.
 ///
-/// Results are rounded up (arc to 0.1°, radius to 0.1 m, height to 0.01 m),
-/// so the suggestion really does close the frame (roundtrip test).
-pub fn background_fit(scene: &Scene, shot: Option<ShotId>, frame: Option<Frame>, margin_deg: f32, aspect: f32) -> Value {
+/// Results are rounded up (0.01 m), so the suggestion really does close the
+/// frame (roundtrip test).
+pub fn background_fit(project: &Project, scene: &Scene, camera: Option<CameraId>, frame: Option<Frame>, margin_deg: f32, aspect: f32) -> Value {
     let margin = margin_deg.to_radians();
-    let samples = fit_samples(scene, shot, frame, aspect);
-    let scope = if shot.is_some() { "shot" } else { "scene" };
+    let samples = fit_samples(project, scene, camera, frame, aspect);
+    let scope = if camera.is_some() { "camera" } else { "scene" };
 
     let current = scene.background.as_ref();
     let center = current.map(|b| b.center).filter(|c| c.is_finite()).unwrap_or(Vec3::new(0.0, 2.0, -5.0));
-    let radius0 = current.map(|b| b.radius).filter(|r| r.is_finite() && *r > 0.0).unwrap_or(6.0);
-    // Starting radius — the most demanding sample: the camera inside the
-    // curvature circle with a 0.5 m delta.
-    let start_radius = samples
-        .iter()
-        .map(|s| dist_xz(s.fr.pos, center) + 0.5)
-        .fold(radius0, f32::max);
-    let mut radius = (start_radius * 10.0).ceil() / 10.0;
-
     // The image source does not affect geometry — a placeholder id.
     let source = || phantom_core::BackgroundSource::Image(phantom_core::AssetId(0));
-    let probe = |radius: f32| Background { image: current.map(|b| b.image).unwrap_or_else(source), arc_radians: 0.0, radius, height: 1.0, center, bulge: current.map(|b| b.bulge).unwrap_or_default(), fit: Default::default() };
-    let mut arc = needed_arc_all(&probe(radius), &samples, margin);
-    let mut guard = 0;
-    while arc.is_none() && radius < 10_000.0 && guard < 64 {
-        radius *= 1.5;
-        arc = needed_arc_all(&probe(radius), &samples, margin);
-        guard += 1;
-    }
-    radius = (radius * 10.0).ceil() / 10.0;
-    // Recompute the arc after rounding radius, so the suggestion is guaranteed to close every sample.
-    let arc_covers = arc.is_some();
-    let arc = needed_arc_all(&probe(radius), &samples, margin).unwrap_or(std::f32::consts::TAU);
-    let arc_deg_ceil = (deg(arc) * 10.0).ceil() / 10.0;
-    let arc = ((arc_deg_ceil as f32).to_radians()).min(std::f32::consts::TAU);
+    let image = current.map(|b| b.image).unwrap_or_else(source);
+    let fit = current.map(|b| b.fit).unwrap_or_default();
+    let base = Background { image, width: current.map(|b| b.width).filter(|w| w.is_finite() && *w > 0.0).unwrap_or(8.0), height: 1.0, center, fit };
 
-    let clamp_el = |a: f32| a.clamp(-85.0f32.to_radians(), 85.0f32.to_radians());
-    // Height — the union of vertical requirements: the highest top and the
-    // lowest bottom across samples, symmetric around center.y.
-    let mut need_top = f32::NEG_INFINITY;
-    let mut need_bottom = f32::INFINITY;
-    for s in &samples {
-        let d = dist_xz(s.fr.pos, center).max(0.5);
-        need_top = need_top.max(s.fr.pos.y + clamp_el(s.fr.pitch + s.fr.vfov * 0.5 + margin).tan() * d);
-        need_bottom = need_bottom.min(s.fr.pos.y + clamp_el(s.fr.pitch - s.fr.vfov * 0.5 - margin).tan() * d);
-    }
-    let half_h = (need_top - center.y).max(center.y - need_bottom).max(0.1);
-    let height = (2.0 * half_h * 100.0).ceil() / 100.0;
+    // Width first (it decides whether any column is inside the frame at all),
+    // then height at that width.
+    let needed = needed_width_all(&base, &samples, margin);
+    let width = needed.map(|w| (w as f64 * 100.0).ceil() / 100.0).unwrap_or(0.0);
+    let mut with_width = base.clone();
+    with_width.width = width as f32;
+    let height = needed
+        .and_then(|_| needed_height_all(&with_width, &samples, margin))
+        .map(|h| (h as f64 * 100.0).ceil() / 100.0)
+        .unwrap_or(0.0);
+    let size_covers = needed.is_some() && height > 0.0;
 
-    let panorama_aspect = arc as f64 * radius as f64 / height as f64;
+    let panorama_aspect = if height > 0.0 { width / height } else { 0.0 };
+
+    let suggested = Background { image, width: width as f32, height: height as f32, center, fit };
 
     let (current_json, fits, delta) = match current {
         Some(bg) => {
@@ -490,61 +434,58 @@ pub fn background_fit(scene: &Scene, shot: Option<ShotId>, frame: Option<Frame>,
             let fits = if valid { Some(samples.iter().all(|s| coverage(bg, &s.fr).covers_frame)) } else { None };
             (
                 json!({
-                    "arc_deg": deg(bg.arc_radians), "radius": bg.radius,
-                    "height": bg.height, "center": v3(bg.center),
+                    "width": bg.width, "height": bg.height, "center": v3(bg.center),
                     "geometry_valid": valid,
                 }),
                 fits,
                 json!({
-                    "arc_deg": arc_deg_ceil - deg(bg.arc_radians),
-                    "radius": radius as f64 - bg.radius as f64,
-                    "height": height as f64 - bg.height as f64,
+                    "width": width - bg.width as f64,
+                    "height": height - bg.height as f64,
                 }),
             )
         }
         None => (Value::Null, None, Value::Null),
     };
 
-    // Worst sample per shot: it is what sets the arc; the rest are reference.
-    let suggested = probe(radius);
-    let mut per_shot: Vec<Value> = Vec::new();
-    for (id, worst) in worst_per_shot(&samples, &suggested, margin) {
+    // Worst sample per camera: it is what sets the size; the rest are reference.
+    let mut per_camera: Vec<Value> = Vec::new();
+    for (id, worst) in worst_per_camera(&samples, &suggested, margin) {
         let cov = coverage(current.unwrap_or(&suggested), &worst.fr);
-        per_shot.push(json!({
-            "shot": id.map(|s| s.0),
+        per_camera.push(json!({
+            "camera": id.map(|s| s.0),
             "frame": worst.frame,
             "covers_current": current.map(|_| cov.covers_frame),
             "gap_deg": gap_json(&cov),
-            "needed_arc_deg": needed_arc(&suggested, &worst.fr, margin).map(|arc| (deg(arc) * 10.0).ceil() / 10.0),
+            "needed_width_m": needed_width(&suggested, &worst.fr, margin).map(|w| (w as f64 * 100.0).ceil() / 100.0),
         }));
     }
-    // Binding sample: the largest required arc under the suggested geometry.
+    // Binding sample: the one needing the largest width.
     let binding = samples
         .iter()
         .max_by(|a, b| {
-            let key = |s: &FitSample| needed_arc(&suggested, &s.fr, margin).unwrap_or(std::f32::consts::TAU);
+            let key = |s: &FitSample| needed_width(&suggested, &s.fr, margin).unwrap_or(f32::INFINITY);
             key(a).total_cmp(&key(b))
         })
         .expect("fit_samples is never empty");
 
-    let mut out = camera_json(scene.id.0, binding.shot, binding.frame, &binding.fr, aspect);
+    let mut out = camera_json(scene.id.0, binding.camera, binding.frame, &binding.fr, aspect);
     let object = out.as_object_mut().expect("object");
     object.insert("scope".into(), json!(scope));
-    object.insert("cameras".into(), json!(per_shot.len()));
+    object.insert("camera_count".into(), json!(per_camera.len()));
     object.insert("samples".into(), json!(samples.len()));
     object.insert("margin_deg".into(), json!(margin_deg));
     object.insert("current".into(), current_json);
     object.insert("suggested".into(), json!({
-        "arc_deg": arc_deg_ceil,
-        "radius": radius,
+        "width": width,
         "height": height,
         "center": v3(center),
     }));
     object.insert("panorama_aspect".into(), json!(panorama_aspect));
-    object.insert("arc_covers".into(), json!(arc_covers));
+    object.insert("size_covers".into(), json!(size_covers));
+    object.insert("what_fits".into(), json!("a flat screen at its current plane; no size helps when a camera never faces it — move the screen with background_set"));
     object.insert("fits".into(), fits.map(|f| json!(f)).unwrap_or(Value::Null));
     object.insert("delta".into(), delta);
-    object.insert("shots".into(), json!(per_shot));
+    object.insert("cameras".into(), json!(per_camera));
     // A3b: the lower half of the frame without a floor is dead; suggest enabling one.
     object.insert(
         "floor".into(),
@@ -557,31 +498,25 @@ pub fn background_fit(scene: &Scene, shot: Option<ShotId>, frame: Option<Frame>,
     out
 }
 
-/// Camera sample for the fit: shot (None — the scene's legacy camera) and frame.
+/// Camera sample for the fit: the camera (None — the scene's own) and frame.
 struct FitSample {
-    shot: Option<ShotId>,
+    camera: Option<CameraId>,
     frame: Frame,
     fr: Frustum,
 }
 
-/// Camera samples for the fit: an explicit `shot` — only it (the frame is given
+/// Camera samples for the fit: an explicit `camera` — only it (the frame is given
 /// explicitly or taken from the start of the range); otherwise the scene's
-/// legacy camera plus every shot camera at its keys and range ends.
-fn fit_samples(scene: &Scene, shot: Option<ShotId>, frame: Option<Frame>, aspect: f32) -> Vec<FitSample> {
+/// every camera at its keys and range ends.
+fn fit_samples(project: &Project, scene: &Scene, camera: Option<CameraId>, frame: Option<Frame>, aspect: f32) -> Vec<FitSample> {
     let mut out = Vec::new();
-    let mut sources: Vec<(Option<ShotId>, &Camera, FrameRange)> = match shot {
-        Some(id) => vec![(Some(id), scene.camera_for_shot(Some(id)), scene.range_for_shot(Some(id)))],
-        None => {
-            let mut all: Vec<(Option<ShotId>, &Camera, FrameRange)> = vec![(None, &scene.camera, scene.range)];
-            for s in scene.shots.values() {
-                all.push((Some(s.id), &s.camera, s.range));
-            }
-            all
-        }
+    let mut sources: Vec<(Option<CameraId>, &Camera, FrameRange)> = match camera {
+        Some(id) => vec![(Some(id), scene.camera_for(Some(id)), scene.range_for(Some(id)))],
+        None => scene.cameras.values().map(|c| (Some(c.id), &c.camera, c.range)).collect(),
     };
     // An explicit frame only makes sense for a single camera; at scene scope
     // cameras are sampled at their own keys.
-    let explicit = if shot.is_some() { frame } else { None };
+    let explicit = if camera.is_some() { frame } else { None };
     sources.retain(|(_, _, range)| range.end > range.start);
     for (id, camera, range) in sources {
         let frames = match explicit {
@@ -589,39 +524,35 @@ fn fit_samples(scene: &Scene, shot: Option<ShotId>, frame: Option<Frame>, aspect
             None => coverage_frames(camera, range),
         };
         for f in frames {
-            out.push(FitSample { shot: id, frame: f, fr: Frustum::new(camera, f, aspect) });
+            out.push(FitSample { camera: id, frame: f, fr: phantom_core::camera_frustum(project, scene, id, f, aspect) });
         }
     }
     if out.is_empty() {
-        out.push(FitSample { shot, frame: frame.unwrap_or(scene.range.start), fr: Frustum::new(scene.camera_for_shot(shot), frame.unwrap_or(scene.range.start), aspect) });
+        let f = frame.unwrap_or(scene.range.start);
+        out.push(FitSample { camera, frame: f, fr: phantom_core::camera_frustum(project, scene, camera, f, aspect) });
     }
     out
 }
 
-/// The worst sample of each shot (the one needing the largest arc under
+/// The worst sample of each camera (the one needing the largest arc under
 /// geometry `bg`), in id order; `None` — the scene's legacy camera.
-fn worst_per_shot<'a>(samples: &'a [FitSample], bg: &Background, margin: f32) -> Vec<(Option<ShotId>, &'a FitSample)> {
-    let mut ids: Vec<Option<ShotId>> = samples.iter().map(|s| s.shot).collect();
+fn worst_per_camera<'a>(samples: &'a [FitSample], bg: &Background, margin: f32) -> Vec<(Option<CameraId>, &'a FitSample)> {
+    let mut ids: Vec<Option<CameraId>> = samples.iter().map(|s| s.camera).collect();
     ids.sort_by_key(|id| id.map(|s| s.0));
     ids.dedup();
     ids.into_iter()
         .map(|id| {
             let worst = samples
                 .iter()
-                .filter(|s| s.shot == id)
+                .filter(|s| s.camera == id)
                 .max_by(|a, b| {
-                    let key = |s: &FitSample| needed_arc(bg, &s.fr, margin).unwrap_or(std::f32::consts::TAU);
+                    let key = |s: &FitSample| needed_width(bg, &s.fr, margin).unwrap_or(f32::INFINITY);
                     key(a).total_cmp(&key(b))
                 })
-                .expect("a shot has samples");
+                .expect("a camera has samples");
             (id, worst)
         })
         .collect()
-}
-
-/// Distance from the camera to the screen center in the horizontal plane.
-fn dist_xz(pos: Vec3, center: Vec3) -> f32 {
-    ((pos.x - center.x).powi(2) + (pos.z - center.z).powi(2)).sqrt()
 }
 
 // ---------------------------------------------------------------------------
@@ -643,6 +574,14 @@ fn finding(code: &str, severity: &str, scene: Option<u64>, frame: Option<Frame>,
         "why": why,
         "suggested_fix": suggested_fix,
     })
+}
+
+/// A camera subject as `details` JSON.
+fn subject_json(subject: CameraSubject) -> Value {
+    match subject {
+        CameraSubject::Phantom(id) => json!({"kind": "phantom", "id": id.0}),
+        CameraSubject::Object(id) => json!({"kind": "object", "id": id.0}),
+    }
 }
 
 /// Coverage-check frames: the range ends and the camera keys inside the range.
@@ -678,6 +617,59 @@ pub fn validate(project: &Project, dir: Option<&Path>, scene_filter: Option<u64>
     for scene in scenes {
         let sid = scene.id.0;
 
+        // The camera must look at the scene. A command rejects such a key, so a
+        // finding here means a document written by hand or by an older version;
+        // severity is a warning because no command can produce it, and a camera
+        // nobody keyed (a scene's untouched default camera) is not judged.
+        for camera in scene.cameras.values() {
+            if camera.camera.keys.is_empty() {
+                continue;
+            }
+            for frame in coverage_frames(&camera.camera, camera.range) {
+                let fraction = phantom_core::camera::scene_in_frame_with(project, scene, Some(camera.id), frame, DEFAULT_ASPECT);
+                if fraction < phantom_core::camera::MIN_SCENE_IN_FRAME {
+                    let percent = (fraction as f64 * 100.0 * 10.0).round() / 10.0;
+                    let minimum = phantom_core::camera::MIN_SCENE_IN_FRAME * 100.0;
+                    push(
+                        Some(sid),
+                        "camera_faces_away",
+                        Some(frame),
+                        finding(
+                            "camera_faces_away",
+                            "warning",
+                            Some(sid),
+                            Some(frame),
+                            json!({"camera": camera.id.0, "name": camera.name, "scene_fraction": percent / 100.0, "minimum": phantom_core::camera::MIN_SCENE_IN_FRAME}),
+                            format!("camera {} \"{}\" sees {percent}% of the scene at frame {frame} (minimum {minimum}%)", camera.id.0, camera.name),
+                            "aim the camera at the scene: set look_at to a scene point, or move the key inside the stage".to_string(),
+                        ),
+                    );
+                }
+            }
+        }
+
+        // An attachment whose subject is gone (or has no keys): the camera
+        // falls back to its own world-space keys, silently. Say so.
+        for camera in scene.cameras.values() {
+            let Some(target) = &camera.target else { continue };
+            if phantom_core::camera::subject_transform(scene, target.subject, camera.range.start).is_none() {
+                push(
+                    Some(sid),
+                    "camera_subject_missing",
+                    Some(camera.range.start),
+                    finding(
+                        "camera_subject_missing",
+                        "warning",
+                        Some(sid),
+                        Some(camera.range.start),
+                        json!({"camera": camera.id.0, "name": camera.name, "subject": subject_json(target.subject)}),
+                        format!("camera {} \"{}\" is attached to a subject that has no position (deleted, or without motion keys): it falls back to its own world-space keys", camera.id.0, camera.name),
+                        "camera_target_set with clear, or give the subject a motion key".to_string(),
+                    ),
+                );
+            }
+        }
+
         // Background screen geometry.
         if let Some(bg) = &scene.background {
             if let Some(reason) = background_invalid_reason(bg) {
@@ -692,23 +684,21 @@ pub fn validate(project: &Project, dir: Option<&Path>, scene_filter: Option<u64>
                         None,
                         json!({}),
                         format!("screen geometry is invalid: {reason}"),
-                        "background_set with arc in (0, 2π] rad, radius > 0 m, height > 0 m".to_string(),
+                        "background_set with width > 0 m, height > 0 m and a finite center".to_string(),
                     ),
                 );
             } else {
-                // FOV coverage: the legacy camera over the scene range and the shot cameras.
-                let mut checks: Vec<(Option<u64>, &Camera, FrameRange)> = vec![(None, &scene.camera, scene.range)];
-                for shot in scene.shots.values() {
-                    checks.push((Some(shot.id.0), &shot.camera, shot.range));
-                }
-                for (shot, camera, range) in checks {
+                // FOV coverage: every camera of the scene over its own range.
+                let checks: Vec<(Option<u64>, &Camera, FrameRange)> =
+                    scene.cameras.values().map(|c| (Some(c.id.0), &c.camera, c.range)).collect();
+                for (camera_id, camera, range) in checks {
                     for frame in coverage_frames(camera, range) {
                         let fr = Frustum::new(camera, frame, DEFAULT_ASPECT);
                         let cov = coverage(bg, &fr);
                         if cov.covers_frame {
                             continue;
                         }
-                        let arc_deg = needed_arc(bg, &fr, 0.0).map(deg);
+                        let needed_width_m = needed_width(bg, &fr, 0.0).map(|w| (w as f64 * 100.0).ceil() / 100.0);
                         let suggested = gap_fix_string(bg, &fr, DEFAULT_ASPECT);
                         push(
                             Some(sid),
@@ -719,7 +709,7 @@ pub fn validate(project: &Project, dir: Option<&Path>, scene_filter: Option<u64>
                                 "warning",
                                 Some(sid),
                                 Some(frame),
-                                json!({"shot": shot, "needed_arc_deg": arc_deg.unwrap_or(360.0), "gap_deg": gap_json(&cov)}),
+                                json!({"camera": camera_id, "needed_width_m": needed_width_m, "gap_deg": gap_json(&cov)}),
                                 format!("the screen does not cover the frame at frame {frame}: gaps in degrees {}", gap_json(&cov)),
                                 suggested,
                             ),
@@ -757,16 +747,14 @@ pub fn validate(project: &Project, dir: Option<&Path>, scene_filter: Option<u64>
         // Props: a pure staging check, not a claim about the importer/mesh
         // state. Even a visible background makes an alpha metric useless for
         // this question, so the roots are checked in the same frustum as
-        // camera_coverage, at every camera point of the scene and its shots.
+        // camera_coverage, at every camera point of the scene.
         if !scene.objects.is_empty() {
-            let mut checks: Vec<(Option<u64>, &Camera, FrameRange)> = vec![(None, &scene.camera, scene.range)];
-            for shot in scene.shots.values() {
-                checks.push((Some(shot.id.0), &shot.camera, shot.range));
-            }
+            let checks: Vec<(Option<u64>, &Camera, FrameRange)> =
+                scene.cameras.values().map(|c| (Some(c.id.0), &c.camera, c.range)).collect();
             let any_in_frame = checks.into_iter().any(|(_, camera, range)| {
                 coverage_frames(camera, range).into_iter().any(|frame| {
                     let fr = Frustum::new(camera, frame, DEFAULT_ASPECT);
-                    scene.objects.values().any(|object| fr.contains(evaluate_object(object, &scene.range, frame, false).position))
+                    scene.objects.values().any(|object| fr.contains(evaluate_object(object, frame).position))
                 })
             });
             if !any_in_frame {
@@ -782,22 +770,65 @@ pub fn validate(project: &Project, dir: Option<&Path>, scene_filter: Option<u64>
                         None,
                         json!({"object_count": count, "objects_in_frame": 0, "estimate": "object_root_frustum"}),
                         format!("the scene has {count} objects, but no root lands inside any checked camera"),
-                        "run camera_coverage for the intended shot; move/key the object or change the camera. This estimates object roots, it is not a render result".to_string(),
+                        "run camera_coverage for the intended camera; move/key the object or change the camera. This estimates object roots, it is not a render result".to_string(),
                     ),
                 );
             }
         }
 
-        // Phantom motion: how keys/clips cover the scene range.
+        // Stage bounds (layout mode): every staged entity must fit the box.
+        // Commands clamp, so a finding here means a document that predates the
+        // stage or was written by hand.
         for ph in scene.phantoms.values() {
-            let covering_take = ph
-                .active_take
-                .and_then(|id| ph.takes.iter().find(|t| t.id == id))
-                .is_some_and(|t| t.range.start <= scene.range.start && t.range.end >= scene.range.end);
-            if covering_take {
-                continue;
+            for key in &ph.motion {
+                let footprint = project.phantom_footprint(ph, key.pose);
+                let rotation = glam::Quat::from_rotation_y(key.yaw);
+                if !scene.stage.fits(key.position, footprint, rotation) {
+                    let (clamped, _) = scene.stage.clamp(key.position, footprint, rotation);
+                    push(
+                        Some(sid),
+                        "out_of_stage",
+                        Some(key.frame),
+                        finding(
+                            "out_of_stage",
+                            "error",
+                            Some(sid),
+                            Some(key.frame),
+                            json!({"kind": "phantom", "id": ph.id.0, "frame": key.frame, "position": key.position.to_array(), "clamped": clamped.to_array(), "stage": scene.stage}),
+                            format!("phantom {} frame {} stands outside the stage", ph.id.0, key.frame),
+                            "set the key again (key_set) or grow the stage (stage_set); a command clamps the position automatically".to_string(),
+                        ),
+                    );
+                }
             }
-            if ph.motion.is_empty() && ph.takes.is_empty() && ph.clip.is_none() && ph.clip_track.is_empty() {
+        }
+        for object in scene.objects.values() {
+            for key in &object.keys {
+                let footprint = project.object_footprint(object, key.scale);
+                let rotation = glam::Quat::from_euler(glam::EulerRot::YXZ, key.yaw, key.pitch, key.roll);
+                if !scene.stage.fits(key.position, footprint, rotation) {
+                    let (clamped, _) = scene.stage.clamp(key.position, footprint, rotation);
+                    push(
+                        Some(sid),
+                        "out_of_stage",
+                        Some(key.frame),
+                        finding(
+                            "out_of_stage",
+                            "error",
+                            Some(sid),
+                            Some(key.frame),
+                            json!({"kind": "object", "id": object.id.0, "frame": key.frame, "position": key.position.to_array(), "clamped": clamped.to_array(), "stage": scene.stage}),
+                            format!("object {} frame {} stands outside the stage", object.id.0, key.frame),
+                            "set the key again (object_key_set) or grow the stage (stage_set); a command clamps the position automatically".to_string(),
+                        ),
+                    );
+                }
+            }
+        }
+
+        // Phantom motion: how position keys cover the scene range.
+        for ph in scene.phantoms.values() {
+            if ph.motion.is_empty() {
                 push(
                     Some(sid),
                     "phantom_without_motion",
@@ -808,22 +839,14 @@ pub fn validate(project: &Project, dir: Option<&Path>, scene_filter: Option<u64>
                         Some(sid),
                         None,
                         json!({"phantom": ph.id.0, "name": ph.name}),
-                        format!("phantom {} has no motion keys, takes or clips", ph.id.0),
-                        "key_set/motion_replace, take_add or phantom_clip_set".to_string(),
+                        format!("phantom {} has no motion keys", ph.id.0),
+                        "key_set or motion_replace".to_string(),
                     ),
                 );
                 continue;
             }
-            // Combined coverage: a legacy clip is looped across the whole scene.
-            if ph.clip_track.is_empty() && ph.clip.is_some() {
-                continue; // legacy clip loop covers the whole scene
-            }
-            let mut start_cov: Option<Frame> = ph.motion.first().map(|k| k.frame);
-            let mut end_cov: Option<Frame> = ph.motion.last().map(|k| k.frame + 1);
-            for u in &ph.clip_track {
-                start_cov = Some(start_cov.map_or(u.range.start, |s| s.min(u.range.start)));
-                end_cov = Some(end_cov.map_or(u.range.end, |e| e.max(u.range.end)));
-            }
+            let start_cov: Option<Frame> = ph.motion.first().map(|k| k.frame);
+            let end_cov: Option<Frame> = ph.motion.last().map(|k| k.frame + 1);
             if let (Some(first), Some(last)) = (start_cov, end_cov) {
                 if first > scene.range.start || last < scene.range.end {
                     push(
@@ -840,7 +863,7 @@ pub fn validate(project: &Project, dir: Option<&Path>, scene_filter: Option<u64>
                                 "phantom {} motion covers [{first}, {last}), scene [{}, {})",
                                 ph.id.0, scene.range.start, scene.range.end
                             ),
-                            "add keys/clip across the whole scene range".to_string(),
+                            "add keys across the whole scene range".to_string(),
                         ),
                     );
                 }
@@ -931,12 +954,12 @@ pub fn validate(project: &Project, dir: Option<&Path>, scene_filter: Option<u64>
                         "clip {} [{}, {}) is outside the range of scene {} [{}, {})",
                         clip.id.0, clip.range.start, clip.range.end, clip.scene.0, scene.range.start, scene.range.end
                     ))
-                } else if let Some(shot) = clip.shot {
-                    match scene.shots.get(&shot) {
-                        None => Some(format!("clip {} references a shot that does not exist: shot {} of scene {}", clip.id.0, shot.0, clip.scene.0)),
-                        Some(s) if s.range != clip.range => Some(format!(
-                            "clip {} [{}, {}) does not match the range of shot {} [{}, {})",
-                            clip.id.0, clip.range.start, clip.range.end, shot.0, s.range.start, s.range.end
+                } else if let Some(camera) = clip.camera {
+                    match scene.cameras.get(&camera) {
+                        None => Some(format!("clip {} references a camera that does not exist: camera {} of scene {}", clip.id.0, camera.0, clip.scene.0)),
+                        Some(s) if s.range != clip.range && camera.0 != 0 => Some(format!(
+                            "clip {} [{}, {}) does not match the range of camera {} [{}, {})",
+                            clip.id.0, clip.range.start, clip.range.end, camera.0, s.range.start, s.range.end
                         )),
                         _ => None,
                     }
@@ -955,36 +978,36 @@ pub fn validate(project: &Project, dir: Option<&Path>, scene_filter: Option<u64>
                     "error",
                     None,
                     Some(clip.range.start),
-                    json!({"clip": clip.id.0, "scene": clip.scene.0, "shot": clip.shot.map(|s| s.0), "range": clip.range}),
+                    json!({"clip": clip.id.0, "scene": clip.scene.0, "camera": clip.camera.map(|s| s.0), "range": clip.range}),
                     why,
-                    "film_remove + film_add with a range inside the scene/shot".to_string(),
+                    "film_remove + film_add with a range inside the scene or the camera's own range".to_string(),
                 ),
             );
         }
     }
 
-    // Film assembly (corrective_2 K0.3, the internal part): whether every
-    // shot is assembled, whether scene frames go unshown, and whether ranges
+    // Film assembly (corrective_2 K0.3, the internal part): whether every named
+    // camera is assembled, whether scene frames go unshown, and whether ranges
     // overlap twice. Cross-checking against the storyboard is deliberately
     // not done here — that is the editor's/director's job on their side.
     {
-        let shot_assembly = project.film.iter().any(|clip| clip.shot.is_some());
-        if shot_assembly {
+        let camera_assembly = project.film.iter().any(|clip| clip.camera.is_some_and(|c| c.0 != 0));
+        if camera_assembly {
             for scene in project.scenes.values() {
-                for shot in scene.shots.values() {
-                    if !project.film.iter().any(|clip| clip.scene == scene.id && clip.shot == Some(shot.id)) {
+                for camera in scene.cameras.values().filter(|c| c.id.0 != 0) {
+                    if !project.film.iter().any(|clip| clip.scene == scene.id && clip.camera == Some(camera.id)) {
                         push(
                             Some(scene.id.0),
-                            "shot_not_in_film",
-                            Some(shot.range.start),
+                            "camera_not_in_film",
+                            Some(camera.range.start),
                             finding(
-                                "shot_not_in_film",
+                                "camera_not_in_film",
                                 "warning",
                                 Some(scene.id.0),
-                                Some(shot.range.start),
-                                json!({"shot": shot.id.0, "name": shot.name, "range": shot.range}),
-                                format!("shot {} \"{}\" of scene {} is not assembled into the film", shot.id.0, shot.name, scene.id.0),
-                                "film_add with shot, or delete the shot if it is not needed".to_string(),
+                                Some(camera.range.start),
+                                json!({"camera": camera.id.0, "name": camera.name, "range": camera.range}),
+                                format!("camera {} \"{}\" of scene {} is not assembled into the film", camera.id.0, camera.name, scene.id.0),
+                                "film_add with camera, or delete the camera if it is not needed".to_string(),
                             ),
                         );
                     }
@@ -1385,23 +1408,25 @@ mod audio_tests {
             name: "s".into(),
             range: FrameRange::new(0, 48).unwrap(), // 2 s of video
             background: None,
-            camera: Camera::default(),
+            legacy_camera: Some(Camera::default()),
+            cameras: Default::default(),
+            active_camera: SCENE_CAMERA,
             phantoms: Default::default(),
             layers_2d: vec![],
             audio_tracks: vec![],
             lighting: Default::default(),
             floor: None,
             objects: Default::default(),
-            shots: Default::default(),
             lights: vec![],
             ambient: Default::default(),
             sky: None,
             grade: None,
             fog: None,
             vfx: vec![],
+            stage: phantom_core::Stage::default(),
         };
         let aid = AssetId(2);
-        p.assets.insert(aid, Asset { id: aid, kind: AssetKind::Audio, path: "assets/music.mp3".into() });
+        p.assets.insert(aid, Asset { id: aid, kind: AssetKind::Audio, path: "assets/music.mp3".into(), bounds: None });
         // A 6.34 s clip in a 2-second scene — the A4 case.
         s.audio_tracks.push(AudioTrack {
             id: TrackId(3),
@@ -1410,6 +1435,7 @@ mod audio_tests {
             muted: false,
             clips: vec![AudioClip { id: AudioClipId(4), asset: aid, start: 0, offset_samples: 0, len_samples: 304_320, fade_in_samples: 0, fade_out_samples: 0 }],
         });
+        s.normalize_legacy();
         p.scenes.insert(sid, s);
         (p, sid)
     }
@@ -1500,17 +1526,17 @@ mod tests {
     use super::*;
     use phantom_core::audio::{AudioClip, AudioClipId, AudioTrack, TrackId};
     use phantom_core::film::{ClipId, FilmClip};
-    use phantom_core::project::{BackgroundSource, MotionKey, ObjectKey, Phantom, RigRef, SceneObject, Take, TakeId, TransformKey};
-    use phantom_core::{Action, Asset, AssetId, AssetKind, ObjectId, PhantomId, SceneId};
+    use phantom_core::project::{ActorPose, BackgroundSource, MotionKey, ObjectKey, Phantom, RigRef, SceneObject, TransformKey};
+    use phantom_core::{Asset, AssetId, AssetKind, ObjectId, PhantomId, SceneId};
 
+    /// A deliberately small backdrop: the default camera at (0,1.4,4) sees a
+    /// 9 m gap to its plane, so 8x4 m leaves a coverage gap to measure.
     fn bg() -> Background {
         Background {
             image: BackgroundSource::Image(AssetId(1)),
-            arc_radians: 2.0,
-            radius: 6.0,
+            width: 8.0,
             height: 4.0,
             center: Vec3::new(0.0, 2.0, -5.0),
-            bulge: Default::default(),
             fit: Default::default(),
         }
     }
@@ -1521,23 +1547,39 @@ mod tests {
             name: format!("s{id}"),
             range: FrameRange::new(start, end).unwrap(),
             background: None,
-            camera: Camera::default(),
+            legacy_camera: Some(Camera::default()),
+            cameras: Default::default(),
+            active_camera: SCENE_CAMERA,
             phantoms: Default::default(),
             layers_2d: vec![],
             audio_tracks: vec![],
             lighting: Default::default(),
             floor: None,
             objects: Default::default(),
-            shots: Default::default(),
             lights: vec![],
             ambient: Default::default(),
             sky: None,
             grade: None,
             fog: None,
             vfx: vec![],
+            stage: phantom_core::Stage::default(),
         };
+        // Camera 0 exists in every scene (Scene::new inserts it); a literal
+        // built here gets it from the legacy field, exactly like a loaded
+        // manifest.
+        s.normalize_legacy();
         s.background = Some(bg());
         s
+    }
+
+    /// `camera_coverage` / `background_fit` for a bare scene: they need a
+    /// project only for the camera's attachment, and these scenes have none.
+    fn cam_cov(scene: &Scene, camera: Option<CameraId>, frame: Option<Frame>) -> Value {
+        camera_coverage(&Project::new("t"), scene, camera, frame, DEFAULT_ASPECT)
+    }
+
+    fn bg_fit(scene: &Scene, camera: Option<CameraId>, frame: Option<Frame>, margin: f32) -> Value {
+        background_fit(&Project::new("t"), scene, camera, frame, margin, DEFAULT_ASPECT)
     }
 
     fn phantom(id: u64, keys: Vec<(Frame, [f32; 3])>) -> Phantom {
@@ -1547,12 +1589,8 @@ mod tests {
             rig: RigRef::Builtin,
             motion: keys
                 .into_iter()
-                .map(|(frame, pos)| MotionKey { frame, position: pos.into(), action: Action::Idle, yaw: 0.0 })
+                .map(|(frame, pos)| MotionKey { frame, position: pos.into(), pose: ActorPose::Stand, yaw: 0.0 })
                 .collect(),
-            clip: None,
-            clip_track: vec![],
-            takes: vec![],
-            active_take: None,
             outline_px: 2.0,
             scale: 1.0,
             material_patches: Vec::new(),
@@ -1569,11 +1607,10 @@ mod tests {
     fn validate_clean_scene_has_no_error_findings() {
         let mut p = Project::new("t");
         let mut s = scene(1, 0, 48);
-        // Covering geometry: a 2π arc around the camera at the curvature
-        // center — that is the toward_camera orientation (curvature circle
-        // around the camera).
-        s.camera.keys = vec![TransformKey::at(0, Vec3::new(0.0, 2.0, -11.0), std::f32::consts::PI, 0.0)];
-        s.background = Some(Background { arc_radians: std::f32::consts::TAU, height: 6.0, bulge: phantom_core::project::Bulge::TowardCamera, ..bg() });
+        // Covering geometry: the camera looks at the screen plane from 6 m and
+        // a 20x8 m screen closes both axes.
+        s.cameras.get_mut(&SCENE_CAMERA).unwrap().camera.keys = vec![TransformKey::at(0, Vec3::new(0.0, 2.0, -11.0), std::f32::consts::PI, 0.0)];
+        s.background = Some(Background { width: 20.0, height: 8.0, ..bg() });
         s.phantoms.insert(PhantomId(2), phantom(2, vec![(0, [0.0, 0.0, 0.0]), (47, [1.0, 0.0, 0.0])]));
         p.scenes.insert(SceneId(1), s);
         let findings = validate(&p, None, None).unwrap();
@@ -1587,7 +1624,7 @@ mod tests {
         let mut p = Project::new("t");
         // 1: invalid screen geometry + empty scene.
         let mut s1 = scene(1, 0, 48);
-        s1.background = Some(Background { arc_radians: 0.0, ..bg() });
+        s1.background = Some(Background { width: 0.0, ..bg() });
         p.scenes.insert(SceneId(1), s1);
         // 2: FOV not covered (default geometry, camera at (0,1.4,4)),
         //    motion holes, a phantom without motion, audio out of range and length.
@@ -1602,12 +1639,12 @@ mod tests {
         s2.audio_tracks.push(short);
         p.scenes.insert(SceneId(2), s2);
         // Film: a clip outside the scene range; a film track longer than the film.
-        p.film.push(FilmClip { id: ClipId(10), scene: SceneId(2), range: FrameRange::new(0, 96).unwrap(), shot: None });
+        p.film.push(FilmClip { id: ClipId(10), scene: SceneId(2), range: FrameRange::new(0, 96).unwrap(), camera: None });
         let mut film_track = AudioTrack::new(TrackId(11), "film");
         film_track.clips.push(AudioClip { id: AudioClipId(12), asset: AssetId(7), start: 0, offset_samples: 0, len_samples: 200 * 48_000 , fade_in_samples: 0, fade_out_samples: 0 });
         p.film_audio.push(film_track);
         // Missing asset file (dir exists, the file does not).
-        p.assets.insert(AssetId(7), Asset { id: AssetId(7), kind: AssetKind::Audio, path: "missing.wav".into() });
+        p.assets.insert(AssetId(7), Asset { id: AssetId(7), kind: AssetKind::Audio, path: "missing.wav".into(), bounds: None });
 
         let dir = std::env::temp_dir().join(format!("phantom-analysis-validate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1633,32 +1670,21 @@ mod tests {
     }
 
     #[test]
-    fn rounded_full_circle_is_valid_background_geometry() {
-        let mut p = Project::new("t");
-        let mut s = scene(1, 0, 48);
-        s.background = Some(Background { arc_radians: 6.2832, ..bg() });
-        p.scenes.insert(SceneId(1), s);
-        let findings = validate(&p, None, Some(1)).unwrap();
-        let codes = codes(&findings);
-        assert!(!codes.contains(&"bg_geometry_invalid"), "{codes:?}");
-    }
-
-    #[test]
-    fn validate_checks_film_assembly_shots_gaps_and_overlaps() {
+    fn validate_checks_film_assembly_cameras_gaps_and_overlaps() {
         let mut p = Project::new("t");
         let mut s = scene(1, 0, 96);
-        let assembled = ShotId(2);
-        let forgotten = ShotId(3);
-        s.shots.insert(assembled, phantom_core::project::Shot { id: assembled, name: "kept".into(), range: FrameRange::new(0, 48).unwrap(), camera: Camera::default() });
-        s.shots.insert(forgotten, phantom_core::project::Shot { id: forgotten, name: "lost".into(), range: FrameRange::new(48, 96).unwrap(), camera: Camera::default() });
+        let assembled = CameraId(2);
+        let forgotten = CameraId(3);
+        s.cameras.insert(assembled, SceneCamera { id: assembled, name: "kept".into(), range: FrameRange::new(0, 48).unwrap(), camera: Camera::default(), target: None });
+        s.cameras.insert(forgotten, SceneCamera { id: forgotten, name: "lost".into(), range: FrameRange::new(48, 96).unwrap(), camera: Camera::default(), target: None });
         p.scenes.insert(SceneId(1), s);
-        // The film assembles only the first shot and repeats part of its own frames.
-        p.film.push(FilmClip { id: ClipId(4), scene: SceneId(1), range: FrameRange::new(0, 48).unwrap(), shot: Some(assembled) });
-        p.film.push(FilmClip { id: ClipId(5), scene: SceneId(1), range: FrameRange::new(24, 48).unwrap(), shot: Some(assembled) });
+        // The film assembles only the first camera and repeats part of its own frames.
+        p.film.push(FilmClip { id: ClipId(4), scene: SceneId(1), range: FrameRange::new(0, 48).unwrap(), camera: Some(assembled) });
+        p.film.push(FilmClip { id: ClipId(5), scene: SceneId(1), range: FrameRange::new(24, 48).unwrap(), camera: Some(assembled) });
 
         let findings = validate(&p, None, Some(1)).unwrap();
         let found = codes(&findings);
-        assert!(found.contains(&"shot_not_in_film"), "{found:?}");
+        assert!(found.contains(&"camera_not_in_film"), "{found:?}");
         assert!(found.contains(&"film_coverage_gap"), "frames 48..96 are not shown: {found:?}");
         assert!(found.contains(&"film_overlap"), "frames 24..48 are shown twice: {found:?}");
         let gap = findings.iter().find(|f| f["code"] == "film_coverage_gap").unwrap();
@@ -1666,12 +1692,12 @@ mod tests {
         assert_eq!(gap["where"]["unshown"]["end"], 96);
         let overlap = findings.iter().find(|f| f["code"] == "film_overlap").unwrap();
         assert_eq!(overlap["where"]["overlap"]["start"], 24);
-        // An edit without shot references must not produce a false shot_not_in_film.
+        // An edit without camera references must not produce a false camera_not_in_film.
         let mut scene_level = p.clone();
-        for clip in &mut scene_level.film { clip.shot = None; }
+        for clip in &mut scene_level.film { clip.camera = None; }
         let scene_level_findings = validate(&scene_level, None, Some(1)).unwrap();
         let scene_level_codes = codes(&scene_level_findings);
-        assert!(!scene_level_codes.contains(&"shot_not_in_film"), "{scene_level_codes:?}");
+        assert!(!scene_level_codes.contains(&"camera_not_in_film"), "{scene_level_codes:?}");
     }
 
     #[test]
@@ -1704,82 +1730,68 @@ mod tests {
     }
 
     #[test]
-    fn validate_skips_phantoms_with_covering_take_and_looping_clip() {
+    fn validate_reports_a_motion_gap_but_not_a_covered_scene() {
         let mut p = Project::new("t");
         let mut s = scene(1, 0, 48);
-        let mut ph = phantom(2, vec![(40, [0.0; 3])]); // a hole at the start, but the active take covers it
-        ph.takes.push(Take { id: TakeId(3), name: "t".into(), range: FrameRange::new(0, 48).unwrap(), motion: vec![] });
-        ph.active_take = Some(TakeId(3));
-        s.phantoms.insert(PhantomId(2), ph);
-        let mut ph_clip = phantom(4, vec![]); // legacy clip: looped across the whole scene
-        ph_clip.clip = Some(AssetId(9));
-        s.phantoms.insert(PhantomId(4), ph_clip);
+        // Keys only in the middle: the scene ends are not covered.
+        s.phantoms.insert(PhantomId(2), phantom(2, vec![(40, [0.0; 3])]));
         p.scenes.insert(SceneId(1), s);
         let findings = validate(&p, None, None).unwrap();
-        let codes = codes(&findings);
-        assert!(!codes.contains(&"motion_gap"), "{codes:?}");
-        assert!(!codes.contains(&"phantom_without_motion"), "{codes:?}");
+        let found = codes(&findings);
+        assert!(found.contains(&"motion_gap"), "{found:?}");
+        assert!(!found.contains(&"phantom_without_motion"), "{found:?}");
+
+        // Keys at both ends: no gap, no complaint.
+        let mut p = Project::new("t");
+        let mut s = scene(1, 0, 48);
+        s.phantoms.insert(PhantomId(2), phantom(2, vec![(0, [0.0; 3]), (47, [1.0; 3])]));
+        p.scenes.insert(SceneId(1), s);
+        let findings = validate(&p, None, None).unwrap();
+        let found = codes(&findings);
+        assert!(!found.contains(&"motion_gap"), "{found:?}");
     }
 
     // --- camera_coverage: known geometry ---
 
-    /// A camera at the screen's curvature center looking at the arc midpoint:
-    /// the screen's azimuthal span equals exactly arc.
-    fn centered_scene(arc: f32, height: f32, focal_mm: f32) -> Scene {
-        let mut s = scene(1, 0, 48);
-        // curvature circle: center + (0,·,−R) = (0, 2, −11) — the
-        // toward_camera orientation puts the camera at the arc's curvature center.
-        s.camera = Camera {
-            keys: vec![TransformKey::at(0, Vec3::new(0.0, 2.0, -11.0), std::f32::consts::PI, 0.0)],
-            focal_mm,
-        };
-        s.background = Some(Background { arc_radians: arc, height, bulge: phantom_core::project::Bulge::TowardCamera, ..bg() });
-        s
-    }
-
+    /// The screen seen from the camera is a plane: its angular span is exactly
+    /// `atan((width/2) / distance)` on each side. Pin that number.
     #[test]
-    fn coverage_from_curvature_center_span_equals_arc() {
-        let s = centered_scene(2.0, 6.0, 35.0);
-        let out = camera_coverage(&s, None, Some(0), DEFAULT_ASPECT);
+    fn coverage_span_is_the_plane_seen_from_the_camera() {
+        let mut s = scene(1, 0, 48);
+        // The camera sits on the screen's axis 6 m in front of it.
+        s.cameras.get_mut(&SCENE_CAMERA).unwrap().camera = Camera {
+            keys: vec![TransformKey::at(0, Vec3::new(0.0, 2.0, -11.0), std::f32::consts::PI, 0.0)],
+            focal_mm: 35.0,
+        };
+        s.background = Some(Background { width: 12.0, height: 6.0, ..bg() });
+        let out = cam_cov(&s, None, Some(0));
         let bg = &out["background"];
         let span = &bg["span"]["horizontal_deg"];
-        assert!((span["min"].as_f64().unwrap() + 57.2958).abs() < 0.5, "{span}");
-        assert!((span["max"].as_f64().unwrap() - 57.2958).abs() < 0.5, "{span}");
-        // hfov/2 (35 mm, 16:9) ≈ 31.3° < 57.3°, height 6 m: el=atan2(3,6)=26.6° > vfov/2 ≈ 18.9°.
+        // atan(6/6) = 45° on each side.
+        assert!((span["min"].as_f64().unwrap() + 45.0).abs() < 0.2, "{span}");
+        assert!((span["max"].as_f64().unwrap() - 45.0).abs() < 0.2, "{span}");
+        // hfov/2 (35 mm, 16:9) ≈ 31.3° < 45°, height 6 m: el = atan2(3,6) = 26.6° > vfov/2 ≈ 18.9°.
         assert_eq!(bg["covers_frame"], true, "{bg}");
         assert!(out["findings"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn coverage_offset_camera_reports_gap() {
-        // The default staging from corrective A3(b): camera (0,1.4,4),
-        // screen arc=2.0, radius=6, center=(0,2,−5): the edge sits at ~23.2°,
-        // hfov/2 ≈ 31.3° → a gap on both sides. The measurement was taken on
-        // the toward_camera orientation (pre-A3 render behavior) — pin it explicitly.
-        let mut s = scene(1, 0, 48);
-        s.background = Some(Background { bulge: phantom_core::project::Bulge::TowardCamera, ..bg() });
-        let out = camera_coverage(&s, None, Some(0), DEFAULT_ASPECT);
+    fn coverage_small_screen_reports_gap() {
+        // The default staging: camera (0,1.4,4), an 8x4 m screen at (0,2,−5).
+        // Its edge sits at atan2(4, 9) ≈ 24.0°, hfov/2 ≈ 31.3° → a gap on both
+        // sides, and the screen's 4 m height does not reach the frame either.
+        let s = scene(1, 0, 48);
+        let out = cam_cov(&s, None, Some(0));
         let bg = &out["background"];
         assert_eq!(bg["covers_frame"], false);
         let max = bg["span"]["horizontal_deg"]["max"].as_f64().unwrap();
-        assert!((max - 23.2).abs() < 1.0, "max azimuth {max}");
+        assert!((max - 24.0).abs() < 1.0, "max azimuth {max}");
         assert!(bg["gap_deg"]["left"].as_f64().unwrap() > 4.0);
         assert!(bg["gap_deg"]["right"].as_f64().unwrap() > 4.0);
         assert_eq!(out["findings"][0]["code"], "screen_fov_gap");
-    }
-
-    #[test]
-    fn coverage_default_away_bulge_wraps_edges_closer_to_camera() {
-        // The same staging, but with the default away_from_camera orientation:
-        // the edges come closer and are seen at a larger angle (39° vs 23.2°),
-        // the side gap disappears — this pins the new corrective A3a default.
-        let s = scene(1, 0, 48);
-        assert_eq!(s.background.as_ref().unwrap().bulge, phantom_core::project::Bulge::AwayFromCamera);
-        let out = camera_coverage(&s, None, Some(0), DEFAULT_ASPECT);
-        let bg = &out["background"];
-        let max = bg["span"]["horizontal_deg"]["max"].as_f64().unwrap();
-        assert!((max - 39.0).abs() < 1.5, "away: max azimuth {max}");
-        assert!(bg["gap_deg"]["left"].as_f64().unwrap() < 1.0, "sides are covered: {}", bg["gap_deg"]);
+        // The fix names the width the frame needs, not an arc.
+        let fix = out["findings"][0]["suggested_fix"].as_str().unwrap();
+        assert!(fix.contains("width >="), "{fix}");
     }
 
     #[test]
@@ -1796,9 +1808,10 @@ mod tests {
                 keys: vec![ObjectKey { frame: 0, position: Vec3::new(100.0, 0.0, 0.0), yaw: 0.0, pitch: 0.0, roll: 0.0, scale: Vec3::ONE }],
                 attach: None,
                 material_patches: Vec::new(),
+                scatter: None,
             },
         );
-        let out = camera_coverage(&s, None, Some(0), DEFAULT_ASPECT);
+        let out = cam_cov(&s, None, Some(0));
         assert_eq!(out["background"], Value::Null);
         assert_eq!(out["findings"][0]["code"], "background_absent");
         assert_eq!(out["phantoms"][0]["in_frame"], true, "phantom on the axis in front of the camera");
@@ -1815,8 +1828,9 @@ mod tests {
             ObjectId(3),
             SceneObject {
                 id: ObjectId(3), name: "off-camera".into(), asset: AssetId(1), builtin: None,
-                keys: vec![ObjectKey { frame: 0, position: Vec3::new(100.0, 0.0, 0.0), yaw: 0.0, pitch: 0.0, roll: 0.0, scale: Vec3::ONE }],
+                keys: vec![ObjectKey { frame: 0, position: Vec3::new(10.0, 0.0, -5.0), yaw: 0.0, pitch: 0.0, roll: 0.0, scale: Vec3::ONE }],
                 attach: None, material_patches: Vec::new(),
+                scatter: None,
             },
         );
         p.scenes.insert(SceneId(1), s);
@@ -1845,44 +1859,49 @@ mod tests {
     }
 
     #[test]
-    fn background_fit_scene_scope_covers_every_shot() {
-        // corrective_2 K0.1: without shot the fit must cover ALL scene
-        // cameras, not one. The second shot looks the opposite way.
+    fn background_fit_scene_scope_covers_every_camera() {
+        // corrective_2 K0.1: without camera the fit must cover ALL scene
+        // cameras, not one. The second camera looks the opposite way.
         let mut s = scene(1, 0, 96);
-        let forward = ShotId(2);
-        let backward = ShotId(3);
-        s.shots.insert(
+        let forward = CameraId(2);
+        let backward = CameraId(3);
+        s.cameras.insert(
             forward,
-            phantom_core::project::Shot {
+            SceneCamera {
                 id: forward, name: "fwd".into(), range: FrameRange::new(0, 48).unwrap(),
                 camera: Camera { focal_mm: 35.0, keys: vec![TransformKey::at(0, Vec3::new(0.0, 2.0, -11.0), std::f32::consts::PI, 0.0)] },
+                target: None,
             },
         );
-        s.shots.insert(
+        s.cameras.insert(
             backward,
-            phantom_core::project::Shot {
+            SceneCamera {
                 id: backward, name: "back".into(), range: FrameRange::new(48, 96).unwrap(),
                 camera: Camera { focal_mm: 35.0, keys: vec![TransformKey::at(48, Vec3::new(0.0, 2.0, 11.0), 0.0, 0.0)] },
+                target: None,
             },
         );
 
-        let scene_fit = background_fit(&s, None, None, 5.0, DEFAULT_ASPECT);
+        let scene_fit = bg_fit(&s, None, None, 5.0);
         assert_eq!(scene_fit["scope"], "scene");
-        assert_eq!(scene_fit["cameras"], 3, "legacy camera + two shots: {}", scene_fit["shots"]);
-        // The suggested geometry covers each shot on its own.
-        let arc = (scene_fit["suggested"]["arc_deg"].as_f64().unwrap() as f32).to_radians();
-        let radius = scene_fit["suggested"]["radius"].as_f64().unwrap() as f32;
+        assert_eq!(scene_fit["camera_count"], 3, "the scene's own camera + two named ones");
+        assert_eq!(scene_fit["size_covers"], true);
+        // The suggested size covers each camera on its own.
+        let width = scene_fit["suggested"]["width"].as_f64().unwrap() as f32;
         let height = scene_fit["suggested"]["height"].as_f64().unwrap() as f32;
         let mut fixed = s.clone();
-        fixed.background = Some(Background { arc_radians: arc, radius, height, center: Vec3::new(0.0, 2.0, -5.0), ..bg() });
-        for (shot, frame) in [(None, 0), (Some(forward), 0), (Some(backward), 48)] {
-            let cov = camera_coverage(&fixed, shot, Some(frame), DEFAULT_ASPECT);
-            assert_eq!(cov["background"]["covers_frame"], true, "shot {shot:?} is not covered: {}", cov["background"]);
+        fixed.background = Some(Background { width, height, ..bg() });
+        for (camera, frame) in [(0, 0), (forward.0, 0), (backward.0, 48)] {
+            let cov = cam_cov(&fixed, Some(CameraId(camera)), Some(frame));
+            assert_eq!(cov["background"]["covers_frame"], true, "camera {camera:?} is not covered: {}", cov["background"]);
         }
-        // A fit for a single shot may be narrower than a fit for the whole scene.
-        let shot_fit = background_fit(&s, Some(backward), None, 5.0, DEFAULT_ASPECT);
-        assert_eq!(shot_fit["scope"], "shot");
-        assert!(shot_fit["suggested"]["arc_deg"].as_f64().unwrap() <= scene_fit["suggested"]["arc_deg"].as_f64().unwrap());
+        // A fit for a single camera is never wider than a fit for the whole scene.
+        let camera_fit = bg_fit(&s, Some(backward), None, 5.0);
+        assert_eq!(camera_fit["scope"], "camera");
+        assert!(camera_fit["suggested"]["width"].as_f64().unwrap() <= scene_fit["suggested"]["width"].as_f64().unwrap());
+        // The backward camera is 16 m from the plane and sets the size: it is the
+        // binding sample.
+        assert_eq!(scene_fit["camera_id"].as_u64(), Some(backward.0));
     }
 
     // --- background_fit: roundtrip ---
@@ -1890,43 +1909,58 @@ mod tests {
     #[test]
     fn background_fit_roundtrip_covers_frame() {
         let s = scene(1, 0, 48); // default staging with a coverage gap
-        let fit = background_fit(&s, None, None, 5.0, DEFAULT_ASPECT);
+        let fit = bg_fit(&s, None, None, 5.0);
         assert_eq!(fit["fits"], false, "the current geometry does not cover the frame");
+        assert_eq!(fit["size_covers"], true);
         let suggested = &fit["suggested"];
-        let arc = (suggested["arc_deg"].as_f64().unwrap() as f32).to_radians();
-        assert!(arc > 0.0 && arc <= std::f32::consts::TAU, "arc {arc}");
-        assert_eq!(fit["arc_covers"], true);
-        // radius is not below the starting dist(camera, center) + 0.5 = 9.5 m;
-        // with away_from_camera the starting radius usually already covers the frame.
-        assert!(suggested["radius"].as_f64().unwrap() >= 9.4);
+        let width = suggested["width"].as_f64().unwrap() as f32;
+        let height = suggested["height"].as_f64().unwrap() as f32;
+        assert!(width > 0.0 && height > 0.0);
+        // The camera is 9 m from the plane: with a 5° margin the width must
+        // exceed 2·9·tan(36.28°) ≈ 13.2 m.
+        assert!(width >= 13.0, "width {width}");
         assert!(fit["panorama_aspect"].as_f64().unwrap() > 0.0);
 
         // Apply the suggestion: coverage is closed.
         let mut fixed = s.clone();
-        fixed.background = Some(Background {
-            arc_radians: arc,
-            radius: suggested["radius"].as_f64().unwrap() as f32,
-            height: suggested["height"].as_f64().unwrap() as f32,
-            center: Vec3::new(0.0, 2.0, -5.0),
-            ..bg()
-        });
-        let out = camera_coverage(&fixed, None, Some(0), DEFAULT_ASPECT);
+        fixed.background = Some(Background { width, height, ..bg() });
+        let out = cam_cov(&fixed, None, Some(0));
         assert_eq!(out["background"]["covers_frame"], true, "{}", out["background"]);
 
-        // Geometry that already covers: fits=true, the arc delta is non-negative.
-        let fit2 = background_fit(&fixed, None, Some(0), 5.0, DEFAULT_ASPECT);
+        // Geometry that already covers: fits=true, and the fit does not ask for
+        // more than the margin allows.
+        let fit2 = bg_fit(&fixed, None, Some(0), 5.0);
         assert_eq!(fit2["fits"], true);
-        assert!(fit2["delta"]["arc_deg"].as_f64().unwrap() >= -0.2, "{}", fit2["delta"]);
+        assert!(fit2["delta"]["width"].as_f64().unwrap() <= 0.01, "{}", fit2["delta"]);
+        assert!(fit2["delta"]["height"].as_f64().unwrap() <= 0.01, "{}", fit2["delta"]);
     }
 
     #[test]
     fn background_fit_without_background_uses_defaults() {
         let mut s = scene(1, 0, 48);
         s.background = None;
-        let fit = background_fit(&s, None, None, 5.0, DEFAULT_ASPECT);
+        let fit = bg_fit(&s, None, None, 5.0);
         assert_eq!(fit["current"], Value::Null);
         assert_eq!(fit["fits"], Value::Null);
         assert_eq!(fit["suggested"]["center"], json!([0.0, 2.0, -5.0]));
-        assert!(fit["suggested"]["radius"].as_f64().unwrap() >= 9.0, "the camera is 9 m from the default center");
+        assert!(fit["suggested"]["width"].as_f64().unwrap() > 0.0);
+        assert!(fit["suggested"]["height"].as_f64().unwrap() > 0.0);
+    }
+
+    /// A camera that never faces the screen plane cannot be fixed by size: the
+    /// fit says so instead of inventing a number.
+    #[test]
+    fn background_fit_reports_when_no_size_helps() {
+        let mut s = scene(1, 0, 48);
+        // The camera stands BEHIND the screen plane and looks away from it.
+        s.cameras.get_mut(&SCENE_CAMERA).unwrap().camera = Camera {
+            keys: vec![TransformKey::at(0, Vec3::new(0.0, 2.0, -11.0), 0.0, 0.0)],
+            focal_mm: 35.0,
+        };
+        let fit = bg_fit(&s, None, Some(0), 5.0);
+        assert_eq!(fit["size_covers"], false);
+        assert_eq!(fit["suggested"]["width"].as_f64().unwrap(), 0.0);
+        assert_eq!(fit["suggested"]["height"].as_f64().unwrap(), 0.0);
+        assert!(fit["what_fits"].as_str().unwrap().contains("move the screen"));
     }
 }

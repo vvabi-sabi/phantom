@@ -3,19 +3,24 @@
 
 use std::path::PathBuf;
 
-use glam::Vec3;
+use glam::{EulerRot, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
 use crate::id::*;
 use crate::project::*;
+use crate::stage::{Clamp, ClampKind, Footprint, Stage};
 use crate::time::FrameRange;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
     AddScene { name: String, range: FrameRange },
     SetSceneRange { scene: SceneId, range: FrameRange },
-    RegisterAsset { kind: AssetKind, path: PathBuf },
+    /// Set the scene stage (layout mode): the box actors and props are confined
+    /// to. Everything already staged is clamped into the new box in the same
+    /// undo step, and the moved keys are reported in the output.
+    SetStage { scene: SceneId, stage: crate::stage::Stage },
+    RegisterAsset { kind: AssetKind, path: PathBuf, #[serde(default)] bounds: Option<crate::stage::ModelBounds> },
     SetBackground { scene: SceneId, background: Background },
     ClearBackground { scene: SceneId },
     AddPhantom { scene: SceneId, name: String, rig: RigRef },
@@ -26,22 +31,28 @@ pub enum Command {
     /// Atomically replaces the whole controller track (recording a performance —
     /// one command, one undo step).
     ReplaceMotion { scene: SceneId, phantom: PhantomId, motion: Vec<MotionKey> },
-    SetCameraKeys { scene: SceneId, keys: Vec<TransformKey> },
-    SetCameraFocal { scene: SceneId, focal_mm: f32 },
-    /// Atomically replaces the scene's legacy camera (keys and focal length).
-    SetCamera { scene: SceneId, camera: Camera },
-    /// Add a named shot (camera + range inside a scene).
-    AddShot { scene: SceneId, name: String, range: FrameRange },
-    /// Remove a shot; film clips referencing it are removed by the same command.
-    RemoveShot { scene: SceneId, shot: ShotId },
-    /// Change a shot's range; film clips onto that shot get the new range.
-    SetShotRange { scene: SceneId, shot: ShotId, range: FrameRange },
-    /// Adds or replaces a shot camera key at a frame.
-    SetShotCameraKey { scene: SceneId, shot: ShotId, key: TransformKey },
-    /// Removes a shot camera key at a frame (the last key cannot be removed).
-    RemoveShotCameraKey { scene: SceneId, shot: ShotId, frame: crate::time::Frame },
-    /// Shot camera focal length (mm, 35 mm equivalent).
-    SetShotFocal { scene: SceneId, shot: ShotId, focal_mm: f32 },
+    /// Add a named camera over the given range (default: the whole scene). The
+    /// new camera becomes the scene's active one.
+    AddCamera { scene: SceneId, name: String, #[serde(default)] range: Option<FrameRange> },
+    /// Remove a camera; film clips referencing it go away in the same step.
+    /// The scene's own camera (id 0) cannot be removed.
+    RemoveCamera { scene: SceneId, camera: CameraId },
+    /// Pick the camera the viewport shows and a render without a camera uses.
+    ActivateCamera { scene: SceneId, camera: CameraId },
+    /// Change a camera's range; film clips onto that camera get the new range.
+    SetCameraRange { scene: SceneId, camera: CameraId, range: FrameRange },
+    /// Add or replace a camera key. The key must keep the camera looking at the
+    /// scene (at least [`crate::camera::MIN_SCENE_IN_FRAME`] of its volume).
+    SetCameraKey { scene: SceneId, camera: CameraId, key: TransformKey },
+    /// Remove a camera key at a frame (the last key cannot be removed).
+    RemoveCameraKey { scene: SceneId, camera: CameraId, frame: crate::time::Frame },
+    /// The camera's base lens (mm, 35 mm equivalent).
+    SetCameraLens { scene: SceneId, camera: CameraId, focal_mm: f32 },
+    /// Focus on one key (a zoom inside the shot).
+    SetCameraFocalKey { scene: SceneId, camera: CameraId, frame: crate::time::Frame, focal_mm: f32 },
+    /// Attach the camera to a moving subject (None detaches). The attachment is
+    /// checked against the facing rule at every key.
+    SetCameraTarget { scene: SceneId, camera: CameraId, #[serde(default)] target: Option<CameraTarget> },
     /// Atomically replaces the scene's stage lighting (key/fill/rim).
     SetLighting { scene: SceneId, lighting: SceneLighting },
     /// Add a document light source (B1); the command allocates the id.
@@ -82,9 +93,10 @@ pub enum Command {
     BrushStroke { scene: SceneId, layer: Option<crate::draw::LayerId>, frame: crate::time::Frame, stroke: crate::draw::Stroke },
     /// Remove an exposure entirely.
     RemoveExposure { scene: SceneId, layer: crate::draw::LayerId, frame: crate::time::Frame },
-    /// Add a clip at the end of the film: a scene range (shot = None) or
-    /// a shot (range must match the shot's range).
-    AddFilmClip { scene: SceneId, range: FrameRange, #[serde(default)] shot: Option<ShotId> },
+    /// Add a clip at the end of the film: a scene range, optionally pinned to
+    /// a camera (a named camera's clip must match its range; camera 0 — the
+    /// scene's own — takes any range).
+    AddFilmClip { scene: SceneId, range: FrameRange, #[serde(default)] camera: Option<CameraId> },
     RemoveFilmClip { clip: crate::film::ClipId },
     /// Move a clip to position index.
     MoveFilmClip { clip: crate::film::ClipId, index: usize },
@@ -100,29 +112,26 @@ pub enum Command {
     RemoveAudioClip { track: crate::audio::TrackId, clip: crate::audio::AudioClipId },
     /// Assign/unassign a motion clip of an imported rig (legacy:
     /// the longest stack, looped over the whole scene).
-    SetPhantomClip { scene: SceneId, phantom: PhantomId, clip: Option<AssetId> },
     /// Atomically replace Phantom's whole clip track (the whole sequence is
     /// validated before mutating, one undo step).
-    SetClipTrack { scene: SceneId, phantom: PhantomId, track: Vec<crate::clips::ClipUse> },
     /// Add one clip use to the track.
-    AddClipUse { scene: SceneId, phantom: PhantomId, clip_use: crate::clips::ClipUse },
     /// Remove a clip use from the track.
-    RemoveClipUse { scene: SceneId, phantom: PhantomId, clip_use: crate::id::ClipUseId },
     /// Add a static object (prop) from a model asset.
     AddObject { scene: SceneId, name: String, asset: AssetId },
     /// Object from the metric catalog (K1): the mesh is built procedurally, no
     /// asset file is needed; `key` — the starting transform, if wanted.
     AddBuiltinObject { scene: SceneId, name: String, prop: String, #[serde(default)] key: Option<ObjectKey> },
     RemoveObject { scene: SceneId, object: ObjectId },
+    /// A generated fill stored as one object (the far band of a forest, a hedge
+    /// row): the recipe is validated here — preset exists, and the plan fits the
+    /// instance ceiling — so no session, GUI or hand-written document can store
+    /// a field the renderer would refuse to replay.
+    AddScatterField { scene: SceneId, name: String, field: crate::project::ScatterField, #[serde(default)] key: Option<ObjectKey> },
     /// Adds or replaces an object transform key at a frame.
     SetObjectKey { scene: SceneId, object: ObjectId, key: ObjectKey },
     RemoveObjectKey { scene: SceneId, object: ObjectId, frame: crate::time::Frame },
     /// Atomically replaces the object's whole key track.
     ReplaceObjectMotion { scene: SceneId, object: ObjectId, keys: Vec<ObjectKey> },
-    /// A new recording take (atomic, one undo); it becomes active.
-    AddTake { scene: SceneId, phantom: PhantomId, name: String, range: FrameRange, motion: Vec<MotionKey> },
-    RemoveTake { scene: SceneId, phantom: PhantomId, take: crate::project::TakeId },
-    SetActiveTake { scene: SceneId, phantom: PhantomId, take: Option<crate::project::TakeId> },
     /// An atomic group of commands: all of them are validated and applied on a
     /// draft; if any fails, the document is unchanged; one undo step.
     /// Nested Batch is not allowed.
@@ -144,8 +153,9 @@ pub(crate) enum UndoOp {
     Batch(Vec<UndoOp>),
 }
 
-/// Command result: the identifiers it created.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Command result: the identifiers it created, plus any stage clamps the
+/// command had to perform.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CommandOutput {
     pub scene: Option<SceneId>,
     pub phantom: Option<PhantomId>,
@@ -154,16 +164,16 @@ pub struct CommandOutput {
     pub clip: Option<crate::film::ClipId>,
     pub track: Option<crate::audio::TrackId>,
     pub audio_clip: Option<crate::audio::AudioClipId>,
-    pub take: Option<crate::project::TakeId>,
     pub object: Option<ObjectId>,
-    pub shot: Option<ShotId>,
-    pub clip_use: Option<crate::id::ClipUseId>,
+    pub camera: Option<CameraId>,
     pub light: Option<crate::id::LightId>,
     pub vfx: Option<crate::id::VfxId>,
+    /// Positions the stage clamp corrected (`clamped: true` in the MCP answer).
+    pub clamped: Vec<crate::stage::Clamp>,
 }
 
 impl CommandOutput {
-    /// Merges Batch results: the last id created of each kind.
+    /// Merges Batch results: the last id created of each kind, and every clamp.
     fn merge(&mut self, other: CommandOutput) {
         if other.scene.is_some() { self.scene = other.scene; }
         if other.phantom.is_some() { self.phantom = other.phantom; }
@@ -172,12 +182,11 @@ impl CommandOutput {
         if other.clip.is_some() { self.clip = other.clip; }
         if other.track.is_some() { self.track = other.track; }
         if other.audio_clip.is_some() { self.audio_clip = other.audio_clip; }
-        if other.take.is_some() { self.take = other.take; }
         if other.object.is_some() { self.object = other.object; }
-        if other.shot.is_some() { self.shot = other.shot; }
-        if other.clip_use.is_some() { self.clip_use = other.clip_use; }
+        if other.camera.is_some() { self.camera = other.camera; }
         if other.light.is_some() { self.light = other.light; }
         if other.vfx.is_some() { self.vfx = other.vfx; }
+        self.clamped.extend(other.clamped);
     }
 }
 
@@ -326,29 +335,7 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
         Command::AddScene { name, range } => {
             validate_name(name)?;
             let id: SceneId = project.alloc_id();
-            project.scenes.insert(
-                id,
-                Scene {
-                    id,
-                    name: name.clone(),
-                    range: *range,
-                    background: None,
-                    camera: Camera::default(),
-                    phantoms: Default::default(),
-                    layers_2d: Vec::new(),
-                    audio_tracks: Vec::new(),
-                    lighting: SceneLighting::default(),
-                    floor: None,
-                    objects: Default::default(),
-                    shots: Default::default(),
-                    lights: Vec::new(),
-                    ambient: AmbientMode::default(),
-                    sky: None,
-                    grade: None,
-                    fog: None,
-                    vfx: Vec::new(),
-                },
-            );
+            project.scenes.insert(id, Scene::new(id, name.clone(), *range));
             Ok((UndoOp::SceneInserted(id), CommandOutput { scene: Some(id), ..no_out }))
         }
         Command::SetSceneRange { scene, range } => {
@@ -357,9 +344,21 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
             s.range = *range;
             Ok((UndoOp::SceneReplaced(before), no_out))
         }
-        Command::RegisterAsset { kind, path } => {
+        Command::SetStage { scene, stage } => {
+            stage.validate()?;
+            let clamped = {
+                let s = project.scenes.get(scene).ok_or(CoreError::SceneNotFound(*scene))?;
+                reclamp_scene(project, s, stage)
+            };
+            let s = scene_mut(project, *scene)?;
+            let before = Box::new(s.clone());
+            apply_clamps(s, &clamped);
+            s.stage = *stage;
+            Ok((UndoOp::SceneReplaced(before), CommandOutput { clamped, ..no_out }))
+        }
+        Command::RegisterAsset { kind, path, bounds } => {
             let id: AssetId = project.alloc_id();
-            project.assets.insert(id, Asset { id, kind: *kind, path: path.clone() });
+            project.assets.insert(id, Asset { id, kind: *kind, path: path.clone(), bounds: *bounds });
             Ok((UndoOp::AssetInserted(id), CommandOutput { asset: Some(id), ..no_out }))
         }
         Command::SetBackground { scene, background } => {
@@ -372,10 +371,7 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
                 Some(_) => return Err(CoreError::WrongAssetKind(background.image.asset())),
                 None => return Err(CoreError::AssetNotFound(background.image.asset())),
             }
-            check_finite(background.center, "background.center")?;
-            check_positive(background.arc_radians, "background.arc_radians")?;
-            check_positive(background.radius, "background.radius")?;
-            check_positive(background.height, "background.height")?;
+            background.validate()?;
             let s = scene_mut(project, *scene)?;
             let before = Box::new(s.clone());
             s.background = Some(background.clone());
@@ -400,7 +396,7 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
             let id: ObjectId = project.alloc_id();
             let s = scene_mut(project, *scene)?;
             let before = Box::new(s.clone());
-            s.objects.insert(id, SceneObject { id, name: name.clone(), asset: *asset, builtin: None, keys: Vec::new(), attach: None, material_patches: Vec::new()});
+            s.objects.insert(id, SceneObject { id, name: name.clone(), asset: *asset, builtin: None, keys: Vec::new(), attach: None, material_patches: Vec::new(), scatter: None });
             Ok((UndoOp::SceneReplaced(before), CommandOutput { object: Some(id), ..no_out }))
         }
         Command::AddBuiltinObject { scene, name, prop, key } => {
@@ -414,7 +410,78 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
             if let Some(k) = key {
                 check_finite(k.position, "object.position")?;
             }
+            let entry = crate::catalog::catalog_find(prop).expect("checked above");
             let id: ObjectId = project.alloc_id();
+            let mut clamped = Vec::new();
+            let mut keys: Vec<ObjectKey> = key.into_iter().copied().collect();
+            {
+                let s = project.scenes.get(scene).ok_or(CoreError::SceneNotFound(*scene))?;
+                let base = entry.footprint();
+                for k in keys.iter_mut() {
+                    k.validate()?;
+                    clamp_object_key_base(&s.stage, base, id, k, &mut clamped);
+                }
+            }
+            // A furnished room arrives as a package: the shell plus one object
+            // per furniture piece. The pieces are derived from the shell key
+            // AFTER the stage clamped it, so the furniture never stays behind
+            // the wall of a room that did not fit. Each piece is a plain object
+            // the director can move or delete on its own.
+            let mut package: Vec<(ObjectId, String, &str, Vec<ObjectKey>)> =
+                vec![(id, name.clone(), prop, keys.clone())];
+            if let Some(shell) = keys.first() {
+                for (piece, mut piece_key) in entry.furniture_keys(shell) {
+                    let piece_id: ObjectId = project.alloc_id();
+                    let piece_entry = crate::catalog::catalog_find(piece).expect("the catalog test checks every set");
+                    let stage = project.scenes.get(scene).expect("checked above").stage;
+                    clamp_object_key_base(&stage, piece_entry.footprint(), piece_id, &mut piece_key, &mut clamped);
+                    package.push((piece_id, format!("{name} {piece}"), piece, vec![piece_key]));
+                }
+            }
+            let s = scene_mut(project, *scene)?;
+            let before = Box::new(s.clone());
+            for (object_id, object_name, object_prop, object_keys) in package {
+                s.objects.insert(
+                    object_id,
+                    SceneObject {
+                        id: object_id,
+                        name: object_name,
+                        // No asset needed: runtime builds the mesh from the catalog name.
+                        asset: crate::id::AssetId(0),
+                        builtin: Some(object_prop.to_string()),
+                        keys: object_keys,
+                        attach: None,
+                        material_patches: Vec::new(), scatter: None,
+                    },
+                );
+            }
+            Ok((UndoOp::SceneReplaced(before), CommandOutput { object: Some(id), clamped, ..no_out }))
+        }
+        Command::AddScatterField { scene, name, field, key } => {
+            validate_name(name)?;
+            let preset = crate::scatter::scatter_preset(&field.preset)
+                .ok_or_else(|| CoreError::InvalidScatter(format!(
+                    "unknown fill {preset} (see scatter_presets)",
+                    preset = field.preset
+                )))?;
+            // Replay the plan the renderer will replay. Validating the count
+            // here is what keeps a saved document always renderable.
+            let placed = crate::scatter::plan(preset, &field.shape, field.seed)?;
+            let _ = crate::scatter::band_of(&placed);
+            if let Some(k) = key {
+                check_finite(k.position, "object.position")?;
+            }
+            let id: ObjectId = project.alloc_id();
+            let mut clamped = Vec::new();
+            let mut keys: Vec<ObjectKey> = key.into_iter().copied().collect();
+            {
+                let s = project.scenes.get(scene).ok_or(CoreError::SceneNotFound(*scene))?;
+                let base = crate::scatter::field_footprint(preset, &field.shape);
+                for k in keys.iter_mut() {
+                    k.validate()?;
+                    clamp_object_key_base(&s.stage, base, id, k, &mut clamped);
+                }
+            }
             let s = scene_mut(project, *scene)?;
             let before = Box::new(s.clone());
             s.objects.insert(
@@ -422,15 +489,17 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
                 SceneObject {
                     id,
                     name: name.clone(),
-                    // No asset needed: runtime builds the mesh from the catalog name.
                     asset: crate::id::AssetId(0),
-                    builtin: Some(prop.clone()),
-                    keys: key.into_iter().copied().collect(),
+                    // The family name drives the material groups (trunk/canopy/
+                    // bush/rock), so material_set works on the band as on a prop.
+                    builtin: Some(preset.name.to_string()),
+                    keys,
                     attach: None,
                     material_patches: Vec::new(),
+                    scatter: Some(field.clone()),
                 },
             );
-            Ok((UndoOp::SceneReplaced(before), CommandOutput { object: Some(id), ..no_out }))
+            Ok((UndoOp::SceneReplaced(before), CommandOutput { object: Some(id), clamped, ..no_out }))
         }
         Command::RemoveObject { scene, object } => {
             let s = scene_mut(project, *scene)?;
@@ -441,19 +510,23 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
             s.objects.remove(object);
             Ok((UndoOp::SceneReplaced(before), no_out))
         }
-        Command::SetObjectKey { scene, object, key } => {
+        Command::SetObjectKey { scene: scene_id, object: object_id, key } => {
             key.validate()?;
-            let s = scene_mut(project, *scene)?;
-            if !s.objects.contains_key(object) {
-                return Err(CoreError::ObjectNotFound(*object));
+            let mut key = *key;
+            let mut clamped = Vec::new();
+            {
+                let s = project.scenes.get(scene_id).ok_or(CoreError::SceneNotFound(*scene_id))?;
+                let o = s.objects.get(object_id).ok_or(CoreError::ObjectNotFound(*object_id))?;
+                clamp_object_key(project, &s.stage, o, &mut key, &mut clamped);
             }
+            let s = scene_mut(project, *scene_id)?;
             let before = Box::new(s.clone());
-            let o = s.objects.get_mut(object).expect("checked above");
+            let o = s.objects.get_mut(object_id).expect("checked above");
             match o.keys.binary_search_by_key(&key.frame, |k| k.frame) {
-                Ok(i) => o.keys[i] = *key,
-                Err(i) => o.keys.insert(i, *key),
+                Ok(i) => o.keys[i] = key,
+                Err(i) => o.keys.insert(i, key),
             }
-            Ok((UndoOp::SceneReplaced(before), no_out))
+            Ok((UndoOp::SceneReplaced(before), CommandOutput { clamped, ..no_out }))
         }
         Command::RemoveObjectKey { scene, object, frame } => {
             let s = scene_mut(project, *scene)?;
@@ -465,20 +538,26 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
             o.keys.retain(|k| k.frame != *frame);
             Ok((UndoOp::SceneReplaced(before), no_out))
         }
-        Command::ReplaceObjectMotion { scene, object, keys } => {
+        Command::ReplaceObjectMotion { scene: scene_id, object: object_id, keys } => {
             for k in keys {
                 k.validate()?;
             }
-            let s = scene_mut(project, *scene)?;
-            if !s.objects.contains_key(object) {
-                return Err(CoreError::ObjectNotFound(*object));
+            let mut keys = keys.clone();
+            let mut clamped = Vec::new();
+            {
+                let s = project.scenes.get(scene_id).ok_or(CoreError::SceneNotFound(*scene_id))?;
+                let o = s.objects.get(object_id).ok_or(CoreError::ObjectNotFound(*object_id))?;
+                for k in keys.iter_mut() {
+                    clamp_object_key(project, &s.stage, o, k, &mut clamped);
+                }
             }
+            let s = scene_mut(project, *scene_id)?;
             let before = Box::new(s.clone());
-            let o = s.objects.get_mut(object).expect("checked above");
-            o.keys = keys.clone();
+            let o = s.objects.get_mut(object_id).expect("checked above");
+            o.keys = keys;
             o.keys.sort_by_key(|k| k.frame);
             o.keys.dedup_by_key(|k| k.frame);
-            Ok((UndoOp::SceneReplaced(before), no_out))
+            Ok((UndoOp::SceneReplaced(before), CommandOutput { clamped, ..no_out }))
         }
         Command::AddPhantom { scene, name, rig } => {
             validate_name(name)?;
@@ -497,7 +576,7 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
             let before = Box::new(s.clone());
             s.phantoms.insert(
                 id,
-                Phantom { id, name: name.clone(), rig: rig.clone(), motion: Vec::new(), clip: None, clip_track: Vec::new(), takes: Vec::new(), active_take: None, outline_px: 2.0, scale: 1.0, material_patches: Vec::new()},
+                Phantom { id, name: name.clone(), rig: rig.clone(), motion: Vec::new(), outline_px: 2.0, scale: 1.0, material_patches: Vec::new()},
             );
             Ok((UndoOp::SceneReplaced(before), CommandOutput { phantom: Some(id), ..no_out }))
         }
@@ -510,20 +589,24 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
             s.phantoms.remove(phantom);
             Ok((UndoOp::SceneReplaced(before), no_out))
         }
-        Command::SetMotionKey { scene, phantom, key } => {
+        Command::SetMotionKey { scene: scene_id, phantom: phantom_id, key } => {
             key.validate()?;
-            let s = scene_mut(project, *scene)?;
-            if !s.phantoms.contains_key(phantom) {
-                return Err(CoreError::PhantomNotFound(*phantom));
+            let mut key = *key;
+            let mut clamped = Vec::new();
+            {
+                let s = project.scenes.get(scene_id).ok_or(CoreError::SceneNotFound(*scene_id))?;
+                let p = s.phantoms.get(phantom_id).ok_or(CoreError::PhantomNotFound(*phantom_id))?;
+                p.rig.validate_pose(key.pose)?;
+                clamp_motion_key(project, &s.stage, p, &mut key, &mut clamped);
             }
+            let s = scene_mut(project, *scene_id)?;
             let before = Box::new(s.clone());
-            let p = s.phantoms.get_mut(phantom).expect("checked above");
-            p.rig.validate_action(key.action)?;
+            let p = s.phantoms.get_mut(phantom_id).expect("checked above");
             match p.motion.binary_search_by_key(&key.frame, |k| k.frame) {
-                Ok(i) => p.motion[i] = *key,
-                Err(i) => p.motion.insert(i, *key),
+                Ok(i) => p.motion[i] = key,
+                Err(i) => p.motion.insert(i, key),
             }
-            Ok((UndoOp::SceneReplaced(before), no_out))
+            Ok((UndoOp::SceneReplaced(before), CommandOutput { clamped, ..no_out }))
         }
         Command::RemoveMotionKey { scene, phantom, frame } => {
             let s = scene_mut(project, *scene)?;
@@ -535,142 +618,181 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
             p.motion.retain(|k| k.frame != *frame);
             Ok((UndoOp::SceneReplaced(before), no_out))
         }
-        Command::ReplaceMotion { scene, phantom, motion } => {
+        Command::ReplaceMotion { scene: scene_id, phantom: phantom_id, motion } => {
             for k in motion {
                 k.validate()?;
             }
-            let s = scene_mut(project, *scene)?;
-            if !s.phantoms.contains_key(phantom) {
-                return Err(CoreError::PhantomNotFound(*phantom));
-            }
-            let before = Box::new(s.clone());
-            let p = s.phantoms.get_mut(phantom).expect("checked above");
-            for k in motion {
-                p.rig.validate_action(k.action)?;
-            }
-            p.motion = motion.clone();
-            p.motion.sort_by_key(|k| k.frame);
-            p.motion.dedup_by_key(|k| k.frame);
-            Ok((UndoOp::SceneReplaced(before), no_out))
-        }
-        Command::SetCameraKeys { scene, keys } => {
-            if keys.is_empty() {
-                return Err(CoreError::InvalidRange { start: 0, end: 0 });
-            }
-            for k in keys {
-                check_camera_key(k)?;
-            }
-            let s = scene_mut(project, *scene)?;
-            let before = Box::new(s.clone());
-            s.camera.keys = keys.clone();
-            s.camera.keys.sort_by_key(|k| k.frame);
-            Ok((UndoOp::SceneReplaced(before), no_out))
-        }
-        Command::SetCameraFocal { scene, focal_mm } => {
-            check_positive(*focal_mm, "camera.focal_mm")?;
-            let s = scene_mut(project, *scene)?;
-            let before = Box::new(s.clone());
-            s.camera.focal_mm = *focal_mm;
-            Ok((UndoOp::SceneReplaced(before), no_out))
-        }
-        Command::SetCamera { scene, camera } => {
-            if camera.keys.is_empty() {
-                return Err(CoreError::InvalidRange { start: 0, end: 0 });
-            }
-            for k in &camera.keys {
-                check_finite(k.translation, "camera.translation")?;
-                if !k.yaw.is_finite() || !k.pitch.is_finite() {
-                    return Err(CoreError::NonFinite("camera.rotation"));
+            let mut motion = motion.clone();
+            let mut clamped = Vec::new();
+            {
+                let s = project.scenes.get(scene_id).ok_or(CoreError::SceneNotFound(*scene_id))?;
+                let p = s.phantoms.get(phantom_id).ok_or(CoreError::PhantomNotFound(*phantom_id))?;
+                for k in motion.iter_mut() {
+                    p.rig.validate_pose(k.pose)?;
+                    clamp_motion_key(project, &s.stage, p, k, &mut clamped);
                 }
             }
-            check_positive(camera.focal_mm, "camera.focal_mm")?;
-            let s = scene_mut(project, *scene)?;
+            let s = scene_mut(project, *scene_id)?;
             let before = Box::new(s.clone());
-            s.camera = camera.clone();
-            s.camera.keys.sort_by_key(|k| k.frame);
-            s.camera.keys.dedup_by_key(|k| k.frame);
-            Ok((UndoOp::SceneReplaced(before), no_out))
+            let p = s.phantoms.get_mut(phantom_id).expect("checked above");
+            p.motion = motion;
+            p.motion.sort_by_key(|k| k.frame);
+            p.motion.dedup_by_key(|k| k.frame);
+            Ok((UndoOp::SceneReplaced(before), CommandOutput { clamped, ..no_out }))
         }
-        Command::AddShot { scene, name, range } => {
+        Command::AddCamera { scene, name, range } => {
             validate_name(name)?;
             let s = project.scenes.get(scene).ok_or(CoreError::SceneNotFound(*scene))?;
+            // The camera's range is the scene's unless the caller narrows it.
+            let range = range.unwrap_or(s.range);
             if range.start < s.range.start || range.end > s.range.end {
-                return Err(CoreError::ShotOutOfScene);
+                return Err(CoreError::CameraOutOfScene);
             }
-            let id: ShotId = project.alloc_id();
+            let id: CameraId = project.alloc_id();
             let s = scene_mut(project, *scene)?;
             let before = Box::new(s.clone());
-            s.shots.insert(id, Shot { id, name: name.clone(), range: *range, camera: Camera::default() });
-            Ok((UndoOp::SceneReplaced(before), CommandOutput { shot: Some(id), ..no_out }))
+            s.cameras.insert(id, SceneCamera::new(id, name.clone(), range));
+            // A freshly added camera is the one the director is looking through.
+            s.active_camera = id;
+            Ok((UndoOp::SceneReplaced(before), CommandOutput { camera: Some(id), ..no_out }))
         }
-        Command::RemoveShot { scene, shot } => {
+        Command::RemoveCamera { scene, camera } => {
+            if *camera == SCENE_CAMERA {
+                return Err(CoreError::CameraFacesAway { camera: *camera, frame: 0, fraction: 0.0, minimum: 0.0 });
+            }
             let s = project.scenes.get(scene).ok_or(CoreError::SceneNotFound(*scene))?;
-            if !s.shots.contains_key(shot) {
-                return Err(CoreError::ShotNotFound(*shot));
+            if !s.cameras.contains_key(camera) {
+                return Err(CoreError::CameraNotFound(*camera));
             }
             let before_scene = Box::new(s.clone());
             let before_film = project.film.clone();
             let s = scene_mut(project, *scene)?;
-            s.shots.remove(shot);
-            // Clip references to a shot are meaningless without it — they leave via the same command.
-            project.film.retain(|c| !(c.scene == *scene && c.shot == Some(*shot)));
+            s.cameras.remove(camera);
+            if s.active_camera == *camera {
+                s.active_camera = SCENE_CAMERA;
+            }
+            // Clip references to a camera are meaningless without it — they leave
+            // via the same command.
+            project.film.retain(|c| !(c.scene == *scene && c.camera == Some(*camera)));
             Ok((UndoOp::SceneAndFilmReplaced(before_scene, before_film), no_out))
         }
-        Command::SetShotRange { scene, shot, range } => {
+        Command::ActivateCamera { scene, camera } => {
+            let s = scene_mut(project, *scene)?;
+            if !s.cameras.contains_key(camera) {
+                return Err(CoreError::CameraNotFound(*camera));
+            }
+            let before = Box::new(s.clone());
+            s.active_camera = *camera;
+            Ok((UndoOp::SceneReplaced(before), no_out))
+        }
+        Command::SetCameraRange { scene, camera, range } => {
             let s = project.scenes.get(scene).ok_or(CoreError::SceneNotFound(*scene))?;
-            if !s.shots.contains_key(shot) {
-                return Err(CoreError::ShotNotFound(*shot));
+            if !s.cameras.contains_key(camera) {
+                return Err(CoreError::CameraNotFound(*camera));
             }
             if range.start < s.range.start || range.end > s.range.end {
-                return Err(CoreError::ShotOutOfScene);
+                return Err(CoreError::CameraOutOfScene);
+            }
+            if *camera == SCENE_CAMERA {
+                return Err(CoreError::InvalidRange { start: range.start, end: range.end });
             }
             let before_scene = Box::new(s.clone());
             let before_film = project.film.clone();
             let s = scene_mut(project, *scene)?;
-            s.shots.get_mut(shot).expect("checked above").range = *range;
-            // A shot clip's range must match the shot's range.
+            s.cameras.get_mut(camera).expect("checked above").range = *range;
+            // A clip's range must match its camera's range.
             for c in &mut project.film {
-                if c.scene == *scene && c.shot == Some(*shot) {
+                if c.scene == *scene && c.camera == Some(*camera) {
                     c.range = *range;
                 }
             }
             Ok((UndoOp::SceneAndFilmReplaced(before_scene, before_film), no_out))
         }
-        Command::SetShotCameraKey { scene, shot, key } => {
+        Command::SetCameraKey { scene, camera, key } => {
             check_camera_key(key)?;
+            let s = project.scenes.get(scene).ok_or(CoreError::SceneNotFound(*scene))?;
+            if !s.cameras.contains_key(camera) {
+                return Err(CoreError::CameraNotFound(*camera));
+            }
+            // Validate on a draft: the facing rule needs the camera WITH this key.
+            let mut draft = s.clone();
+            insert_camera_key(&mut draft, *camera, *key);
+            check_camera_facing(project, &draft, *camera, key.frame)?;
             let s = scene_mut(project, *scene)?;
-            if !s.shots.contains_key(shot) {
-                return Err(CoreError::ShotNotFound(*shot));
-            }
             let before = Box::new(s.clone());
-            let keys = &mut s.shots.get_mut(shot).expect("checked above").camera.keys;
-            match keys.binary_search_by_key(&key.frame, |k| k.frame) {
-                Ok(i) => keys[i] = *key,
-                Err(i) => keys.insert(i, *key),
-            }
+            insert_camera_key(s, *camera, *key);
             Ok((UndoOp::SceneReplaced(before), no_out))
         }
-        Command::RemoveShotCameraKey { scene, shot, frame } => {
+        Command::RemoveCameraKey { scene, camera, frame } => {
             let s = scene_mut(project, *scene)?;
-            if !s.shots.contains_key(shot) {
-                return Err(CoreError::ShotNotFound(*shot));
+            if !s.cameras.contains_key(camera) {
+                return Err(CoreError::CameraNotFound(*camera));
             }
-            if s.shots[shot].camera.keys.len() <= 1 {
+            if s.cameras[camera].camera.keys.len() <= 1 {
                 return Err(CoreError::InvalidRange { start: 0, end: 0 });
             }
             let before = Box::new(s.clone());
-            let keys = &mut s.shots.get_mut(shot).expect("checked above").camera.keys;
-            keys.retain(|k| k.frame != *frame);
+            s.cameras.get_mut(camera).expect("checked above").camera.keys.retain(|k| k.frame != *frame);
             Ok((UndoOp::SceneReplaced(before), no_out))
         }
-        Command::SetShotFocal { scene, shot, focal_mm } => {
+        Command::SetCameraLens { scene, camera, focal_mm } => {
             check_positive(*focal_mm, "camera.focal_mm")?;
             let s = scene_mut(project, *scene)?;
-            if !s.shots.contains_key(shot) {
-                return Err(CoreError::ShotNotFound(*shot));
+            if !s.cameras.contains_key(camera) {
+                return Err(CoreError::CameraNotFound(*camera));
             }
             let before = Box::new(s.clone());
-            s.shots.get_mut(shot).expect("checked above").camera.focal_mm = *focal_mm;
+            let entry = s.cameras.get_mut(camera).expect("checked above");
+            entry.camera.focal_mm = *focal_mm;
+            // A zoom is a framing choice, not a direction: the facing rule
+            // deliberately does not police the lens (a long lens from close by
+            // sees little of a big stage, which is what a long lens is for).
+            Ok((UndoOp::SceneReplaced(before), no_out))
+        }
+        Command::SetCameraFocalKey { scene, camera, frame, focal_mm } => {
+            check_positive(*focal_mm, "camera.focal_mm")?;
+            let s = project.scenes.get(scene).ok_or(CoreError::SceneNotFound(*scene))?;
+            if !s.cameras.contains_key(camera) {
+                return Err(CoreError::CameraNotFound(*camera));
+            }
+            // A focal key never moves the camera: without a key at that frame
+            // the pose is sampled from the track, so a zoom can be added
+            // anywhere inside the range. The facing rule does not apply — a
+            // longer lens is a framing choice, not a direction.
+            let pose = s.cameras.get(camera).expect("checked above").camera.sample(*frame);
+            let fresh = TransformKey::at(*frame, pose.translation, pose.yaw, pose.pitch);
+            let s = scene_mut(project, *scene)?;
+            let before = Box::new(s.clone());
+            let entry = s.cameras.get_mut(camera).expect("checked above");
+            match entry.camera.keys.binary_search_by_key(frame, |k| k.frame) {
+                Ok(i) => entry.camera.keys[i].focal_mm = Some(*focal_mm),
+                Err(i) => {
+                    entry.camera.keys.insert(i, TransformKey { roll: pose.roll, focal_mm: Some(*focal_mm), ..fresh });
+                }
+            }
+            Ok((UndoOp::SceneReplaced(before), no_out))
+        }
+        Command::SetCameraTarget { scene, camera, target } => {
+            let s = project.scenes.get(scene).ok_or(CoreError::SceneNotFound(*scene))?;
+            if !s.cameras.contains_key(camera) {
+                return Err(CoreError::CameraNotFound(*camera));
+            }
+            if let Some(t) = target {
+                match t.subject {
+                    CameraSubject::Phantom(id) if !s.phantoms.contains_key(&id) => return Err(CoreError::PhantomNotFound(id)),
+                    CameraSubject::Object(id) if !s.objects.contains_key(&id) => return Err(CoreError::ObjectNotFound(id)),
+                    _ => {}
+                }
+            }
+            // The attachment changes the world pose at every key — check them all.
+            let mut draft = s.clone();
+            draft.cameras.get_mut(camera).expect("checked above").target = *target;
+            for key in &draft.cameras[camera].camera.keys {
+                check_camera_facing(project, &draft, *camera, key.frame)?;
+            }
+            let s = scene_mut(project, *scene)?;
+            let before = Box::new(s.clone());
+            s.cameras.get_mut(camera).expect("checked above").target = *target;
             Ok((UndoOp::SceneReplaced(before), no_out))
         }
         Command::SetLighting { scene, lighting } => {
@@ -795,17 +917,31 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
             }
             Ok((UndoOp::SceneReplaced(before), no_out))
         }
-        Command::SetPhantomScale { scene, phantom, scale } => {
+        Command::SetPhantomScale { scene: scene_id, phantom: phantom_id, scale } => {
             if !scale.is_finite() || *scale <= 0.0 {
                 return Err(CoreError::NonFinite("phantom.scale"));
             }
-            let s = scene_mut(project, *scene)?;
-            if !s.phantoms.contains_key(phantom) {
-                return Err(CoreError::PhantomNotFound(*phantom));
+            let mut clamped = Vec::new();
+            {
+                let s = project.scenes.get(scene_id).ok_or(CoreError::SceneNotFound(*scene_id))?;
+                let p = s.phantoms.get(phantom_id).ok_or(CoreError::PhantomNotFound(*phantom_id))?;
+                // A bigger actor may no longer fit where it stood.
+                for key in p.motion.iter() {
+                    let base = project.phantom_footprint_at(p, key.pose, *scale);
+                    let mut key = *key;
+                    clamp_motion_key_base(&s.stage, base, p.id, &mut key, &mut clamped);
+                }
             }
+            let s = scene_mut(project, *scene_id)?;
             let before = Box::new(s.clone());
-            s.phantoms.get_mut(phantom).expect("checked above").scale = *scale;
-            Ok((UndoOp::SceneReplaced(before), no_out))
+            let p = s.phantoms.get_mut(phantom_id).expect("checked above");
+            p.scale = *scale;
+            for c in &clamped {
+                if let Some(k) = p.motion.iter_mut().find(|k| k.frame == c.frame) {
+                    k.position = Vec3::from(c.to);
+                }
+            }
+            Ok((UndoOp::SceneReplaced(before), CommandOutput { clamped, ..no_out }))
         }
         Command::SetGrade { scene, grade } => {
             if let Some(g) = grade {
@@ -946,13 +1082,18 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
             l.exposures.entry(*frame).or_default().strokes.push(stroke.clone());
             Ok((UndoOp::SceneReplaced(before), CommandOutput { layer: Some(layer_id), ..no_out }))
         }
-        Command::AddFilmClip { scene, range, shot } => {
+        Command::AddFilmClip { scene, range, camera } => {
             let s = project.scenes.get(scene).ok_or(CoreError::SceneNotFound(*scene))?;
-            match shot {
-                Some(shot_id) => {
-                    let shot_ref = s.shots.get(shot_id).ok_or(CoreError::ShotNotFound(*shot_id))?;
-                    if *range != shot_ref.range {
-                        return Err(CoreError::ShotRangeMismatch);
+            match camera {
+                Some(camera_id) => {
+                    let camera_ref = s.cameras.get(camera_id).ok_or(CoreError::CameraNotFound(*camera_id))?;
+                    // Camera 0 covers the whole scene, so a clip may take any
+                    // range of it; a named camera's clip matches its range.
+                    if *camera_id != SCENE_CAMERA && *range != camera_ref.range {
+                        return Err(CoreError::CameraRangeMismatch);
+                    }
+                    if range.start < s.range.start || range.end > s.range.end {
+                        return Err(CoreError::ClipOutOfScene);
                     }
                 }
                 None => {
@@ -963,7 +1104,7 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
             }
             let id: crate::film::ClipId = project.alloc_id();
             let before = project.film.clone();
-            project.film.push(crate::film::FilmClip { id, scene: *scene, range: *range, shot: *shot });
+            project.film.push(crate::film::FilmClip { id, scene: *scene, range: *range, camera: *camera });
             Ok((UndoOp::FilmReplaced(before), CommandOutput { clip: Some(id), ..no_out }))
         }
         Command::RemoveFilmClip { clip } => {
@@ -989,18 +1130,17 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
                 return Err(CoreError::ClipNotFound(*clip));
             };
             let s = project.scenes.get(&c.scene).ok_or(CoreError::SceneNotFound(c.scene))?;
-            match c.shot {
-                Some(shot_id) => {
-                    let shot_ref = s.shots.get(&shot_id).ok_or(CoreError::ShotNotFound(shot_id))?;
-                    if *range != shot_ref.range {
-                        return Err(CoreError::ShotRangeMismatch);
+            match c.camera {
+                Some(camera_id) if camera_id != SCENE_CAMERA => {
+                    let camera_ref = s.cameras.get(&camera_id).ok_or(CoreError::CameraNotFound(camera_id))?;
+                    if *range != camera_ref.range {
+                        return Err(CoreError::CameraRangeMismatch);
                     }
                 }
-                None => {
-                    if range.start < s.range.start || range.end > s.range.end {
-                        return Err(CoreError::ClipOutOfScene);
-                    }
-                }
+                _ => {}
+            }
+            if range.start < s.range.start || range.end > s.range.end {
+                return Err(CoreError::ClipOutOfScene);
             }
             let before = project.film.clone();
             let c = project.film.iter_mut().find(|c| c.id == *clip).expect("checked above");
@@ -1103,125 +1243,6 @@ pub(crate) fn apply(project: &mut Project, cmd: &Command) -> Result<(UndoOp, Com
         Command::RemoveAudioClip { track, clip } => {
             with_track_mut(project, *track, |t| t.clips.retain(|c| c.id != *clip))
         }
-        Command::SetClipTrack { scene, phantom, track } => {
-            for u in track {
-                match project.assets.get(&u.asset) {
-                    Some(a) if a.kind == AssetKind::MotionFbx => {}
-                    Some(_) => return Err(CoreError::WrongAssetKind(u.asset)),
-                    None => return Err(CoreError::AssetNotFound(u.asset)),
-                }
-            }
-            let s = scene_mut(project, *scene)?;
-            let p = s.phantoms.get(phantom).ok_or(CoreError::PhantomNotFound(*phantom))?;
-            if !matches!(p.rig, RigRef::Imported { .. }) {
-                return Err(CoreError::NotImportedRig);
-            }
-            for u in track {
-                crate::clips::validate_clip_use(u, track, &s.range)?;
-            }
-            let before = Box::new(s.clone());
-            let mut track = track.clone();
-            track.sort_by_key(|u| u.range.start);
-            s.phantoms.get_mut(phantom).expect("checked above").clip_track = track;
-            Ok((UndoOp::SceneReplaced(before), no_out))
-        }
-        Command::AddClipUse { scene, phantom, clip_use } => {
-            match project.assets.get(&clip_use.asset) {
-                Some(a) if a.kind == AssetKind::MotionFbx => {}
-                Some(_) => return Err(CoreError::WrongAssetKind(clip_use.asset)),
-                None => return Err(CoreError::AssetNotFound(clip_use.asset)),
-            }
-            let s = project.scenes.get(scene).ok_or(CoreError::SceneNotFound(*scene))?;
-            let p = s.phantoms.get(phantom).ok_or(CoreError::PhantomNotFound(*phantom))?;
-            if !matches!(p.rig, RigRef::Imported { .. }) {
-                return Err(CoreError::NotImportedRig);
-            }
-            crate::clips::validate_clip_use(clip_use, &p.clip_track, &s.range)?;
-            let id: crate::id::ClipUseId = project.alloc_id();
-            let s = scene_mut(project, *scene)?;
-            let before = Box::new(s.clone());
-            let p = s.phantoms.get_mut(phantom).expect("checked above");
-            let mut u = clip_use.clone();
-            u.id = id;
-            p.clip_track.push(u);
-            p.clip_track.sort_by_key(|u| u.range.start);
-            Ok((UndoOp::SceneReplaced(before), CommandOutput { clip_use: Some(id), ..no_out }))
-        }
-        Command::RemoveClipUse { scene, phantom, clip_use } => {
-            let s = scene_mut(project, *scene)?;
-            let p = s.phantoms.get(phantom).ok_or(CoreError::PhantomNotFound(*phantom))?;
-            if !p.clip_track.iter().any(|u| u.id == *clip_use) {
-                return Err(CoreError::ClipUseNotFound(*clip_use));
-            }
-            let before = Box::new(s.clone());
-            s.phantoms.get_mut(phantom).expect("checked above").clip_track.retain(|u| u.id != *clip_use);
-            Ok((UndoOp::SceneReplaced(before), no_out))
-        }
-        Command::SetPhantomClip { scene, phantom, clip } => {
-            if let Some(a) = clip {
-                match project.assets.get(a) {
-                    Some(a) if matches!(a.kind, AssetKind::ModelFbx | AssetKind::MotionFbx) => {}
-                    Some(_) => return Err(CoreError::WrongAssetKind(*a)),
-                    None => return Err(CoreError::AssetNotFound(*a)),
-                }
-            }
-            let s = scene_mut(project, *scene)?;
-            let p = s.phantoms.get(phantom).ok_or(CoreError::PhantomNotFound(*phantom))?;
-            if !matches!(p.rig, RigRef::Imported { .. }) {
-                return Err(CoreError::NotImportedRig);
-            }
-            let before = Box::new(s.clone());
-            s.phantoms.get_mut(phantom).expect("checked above").clip = *clip;
-            Ok((UndoOp::SceneReplaced(before), no_out))
-        }
-        Command::AddTake { scene, phantom, name, range, motion } => {
-            validate_name(name)?;
-            for k in motion {
-                k.validate()?;
-            }
-            if !project.scenes.get(scene).map(|s| s.phantoms.contains_key(phantom)).unwrap_or(false) {
-                return Err(CoreError::PhantomNotFound(*phantom));
-            }
-            let rig = &project.scenes[scene].phantoms[phantom].rig;
-            for k in motion {
-                rig.validate_action(k.action)?;
-            }
-            let id: crate::project::TakeId = project.alloc_id();
-            let s = scene_mut(project, *scene)?;
-            let before = Box::new(s.clone());
-            let p = s.phantoms.get_mut(phantom).expect("checked above");
-            let mut motion = motion.clone();
-            motion.sort_by_key(|k| k.frame);
-            p.takes.push(crate::project::Take { id, name: name.clone(), range: *range, motion });
-            p.active_take = Some(id);
-            Ok((UndoOp::SceneReplaced(before), CommandOutput { take: Some(id), ..no_out }))
-        }
-        Command::RemoveTake { scene, phantom, take } => {
-            let s = scene_mut(project, *scene)?;
-            let p = s.phantoms.get(phantom).ok_or(CoreError::PhantomNotFound(*phantom))?;
-            if !p.takes.iter().any(|t| t.id == *take) {
-                return Err(CoreError::TakeNotFound(*take));
-            }
-            let before = Box::new(s.clone());
-            let p = s.phantoms.get_mut(phantom).expect("checked above");
-            p.takes.retain(|t| t.id != *take);
-            if p.active_take == Some(*take) {
-                p.active_take = None;
-            }
-            Ok((UndoOp::SceneReplaced(before), no_out))
-        }
-        Command::SetActiveTake { scene, phantom, take } => {
-            let s = scene_mut(project, *scene)?;
-            let p = s.phantoms.get(phantom).ok_or(CoreError::PhantomNotFound(*phantom))?;
-            if let Some(t) = take {
-                if !p.takes.iter().any(|x| x.id == *t) {
-                    return Err(CoreError::TakeNotFound(*t));
-                }
-            }
-            let before = Box::new(s.clone());
-            s.phantoms.get_mut(phantom).expect("checked above").active_take = *take;
-            Ok((UndoOp::SceneReplaced(before), no_out))
-        }
         Command::RemoveExposure { scene, layer, frame } => {
             let s = scene_mut(project, *scene)?;
             if !s.layers_2d.iter().any(|l| l.id == *layer) {
@@ -1292,8 +1313,141 @@ fn with_track_mut(
     Err(CoreError::TrackNotFound(id))
 }
 
+/// Insert or replace a camera key, keeping the key list sorted (the invariant
+/// `Camera::sample` relies on).
+fn insert_camera_key(scene: &mut Scene, camera: CameraId, key: TransformKey) {
+    let entry = scene.cameras.get_mut(&camera).expect("camera checked by the caller");
+    match entry.camera.keys.binary_search_by_key(&key.frame, |k| k.frame) {
+        Ok(i) => entry.camera.keys[i] = key,
+        Err(i) => entry.camera.keys.insert(i, key),
+    }
+}
+
+/// The camera-facing rule: a camera must look at the scene. A camera standing
+/// inside the scene volume passes by definition; otherwise at least
+/// [`crate::camera::MIN_SCENE_IN_FRAME`] of the scene's volume must be inside
+/// its frame. Lives in the document layer so GUI, CLI, MCP and `batch` all
+/// refuse the same camera, and `validate` reports the same number.
+fn check_camera_facing(project: &Project, scene: &Scene, camera: CameraId, frame: crate::time::Frame) -> Result<(), CoreError> {
+    let fraction = crate::camera::scene_in_frame(project, scene, Some(camera), frame);
+    if fraction < crate::camera::MIN_SCENE_IN_FRAME {
+        return Err(CoreError::CameraFacesAway {
+            camera,
+            frame,
+            fraction,
+            minimum: crate::camera::MIN_SCENE_IN_FRAME,
+        });
+    }
+    Ok(())
+}
+
 fn scene_mut(project: &mut Project, id: SceneId) -> Result<&mut Scene, CoreError> {
     project.scenes.get_mut(&id).ok_or(CoreError::SceneNotFound(id))
+}
+
+// --- stage clamp (layout mode) -------------------------------------------
+//
+// Every command that sets a position clamps the entity's whole bounding box to
+// the scene stage, so nothing can be staged outside the scene. The clamp lives
+// here, in the document layer, because GUI, CLI, MCP and `batch` must behave
+// identically and undo has to store the coordinate that is really on stage.
+
+/// Clamp one Phantom key and record the move.
+fn clamp_motion_key(
+    project: &Project,
+    stage: &Stage,
+    phantom: &Phantom,
+    key: &mut MotionKey,
+    out: &mut Vec<Clamp>,
+) {
+    let base = project.phantom_footprint(phantom, key.pose);
+    clamp_motion_key_base(stage, base, phantom.id, key, out);
+}
+
+/// Clamp one Phantom key against an already known box.
+fn clamp_motion_key_base(stage: &Stage, base: Footprint, id: PhantomId, key: &mut MotionKey, out: &mut Vec<Clamp>) {
+    let (position, moved) = stage.clamp(key.position, base, Quat::from_rotation_y(key.yaw));
+    if moved {
+        out.push(Clamp {
+            kind: ClampKind::Phantom,
+            id: id.0,
+            frame: key.frame,
+            from: key.position.to_array(),
+            to: position.to_array(),
+        });
+        key.position = position;
+    }
+}
+
+/// Clamp one object key and record the move.
+fn clamp_object_key(
+    project: &Project,
+    stage: &Stage,
+    object: &SceneObject,
+    key: &mut ObjectKey,
+    out: &mut Vec<Clamp>,
+) {
+    let base = match object.builtin.as_deref().and_then(crate::catalog::catalog_find) {
+        Some(entry) => entry.footprint(),
+        None => project.object_footprint(object, Vec3::ONE),
+    };
+    clamp_object_key_base(stage, base, object.id, key, out);
+}
+
+/// Clamp one object key against an already known base box (a prop being created).
+fn clamp_object_key_base(stage: &Stage, base: Footprint, id: ObjectId, key: &mut ObjectKey, out: &mut Vec<Clamp>) {
+    let rotation = Quat::from_euler(EulerRot::YXZ, key.yaw, key.pitch, key.roll);
+    let (position, moved) = stage.clamp(key.position, base.scaled(key.scale), rotation);
+    if moved {
+        out.push(Clamp {
+            kind: ClampKind::Object,
+            id: id.0,
+            frame: key.frame,
+            from: key.position.to_array(),
+            to: position.to_array(),
+        });
+        key.position = position;
+    }
+}
+
+/// What a stage change would move: every staged entity re-clamped into `stage`.
+fn reclamp_scene(project: &Project, scene: &Scene, stage: &Stage) -> Vec<Clamp> {
+    let mut out = Vec::new();
+    for phantom in scene.phantoms.values() {
+        for key in &phantom.motion {
+            let mut key = *key;
+            clamp_motion_key(project, stage, phantom, &mut key, &mut out);
+        }
+    }
+    for object in scene.objects.values() {
+        for key in &object.keys {
+            let mut key = *key;
+            clamp_object_key(project, stage, object, &mut key, &mut out);
+        }
+    }
+    out
+}
+
+/// Apply the clamps a stage change computed (the stage itself is set by the caller).
+fn apply_clamps(scene: &mut Scene, clamps: &[Clamp]) {
+    for c in clamps {
+        match c.kind {
+            ClampKind::Phantom => {
+                if let Some(p) = scene.phantoms.get_mut(&PhantomId(c.id)) {
+                    if let Some(k) = p.motion.iter_mut().find(|k| k.frame == c.frame) {
+                        k.position = Vec3::from(c.to);
+                    }
+                }
+            }
+            ClampKind::Object => {
+                if let Some(o) = scene.objects.get_mut(&ObjectId(c.id)) {
+                    if let Some(k) = o.keys.iter_mut().find(|k| k.frame == c.frame) {
+                        k.position = Vec3::from(c.to);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn validate_name(name: &str) -> Result<(), CoreError> {

@@ -34,11 +34,6 @@ impl FrameRange {
     }
 }
 
-/// Quantization "on twos": the pose updates 12 times/s, anchored to the scene start.
-pub fn on_twos(frame: Frame, scene_start: Frame) -> Frame {
-    scene_start + (frame - scene_start).div_euclid(2) * 2
-}
-
 /// Frame → seconds.
 pub fn frame_to_secs(frame: Frame) -> f64 {
     frame as f64 / FPS as f64
@@ -55,13 +50,4 @@ mod tests {
         assert!(FrameRange::new(10, 0).is_err());
     }
 
-    #[test]
-    fn twos_anchor_to_scene_start() {
-        assert_eq!(on_twos(0, 0), 0);
-        assert_eq!(on_twos(1, 0), 0);
-        assert_eq!(on_twos(2, 0), 2);
-        assert_eq!(on_twos(5, 1), 5);
-        assert_eq!(on_twos(6, 1), 5);
-        assert_eq!(on_twos(7, 1), 7);
-    }
 }

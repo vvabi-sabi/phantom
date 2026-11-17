@@ -4,9 +4,9 @@
 
 use glam::Vec3;
 
-use crate::project::{Action, Phantom};
+use crate::project::{ActorPose, Phantom};
 use crate::rig::{self, Pose};
-use crate::time::{frame_to_secs, Frame, FrameRange};
+use crate::time::Frame;
 
 /// Computed Phantom state at a frame.
 #[derive(Clone, Debug)]
@@ -15,59 +15,42 @@ pub struct PhantomPose {
     pub root: Vec3,
     /// Root rotation about +Y, radians.
     pub yaw: f32,
-    /// Current action.
-    pub action: Action,
-    /// Skeleton pose in controller space.
-    pub pose: Pose,
+    /// The pose the actor holds at this frame.
+    pub pose: ActorPose,
+    /// Skeleton pose in controller space. For an imported rig this is the
+    /// humanoid rest — an imported model has no named poses and the renderer
+    /// keeps its bind pose, so nothing here reaches the frame.
+    pub skeleton: Pose,
 }
 
 /// Computes the Phantom state at `frame`.
 ///
-/// `on_twos` — "on twos" mode: pose and position quantize to even frames
-/// from the scene start; the camera and background are not affected.
-pub fn evaluate(phantom: &Phantom, scene: &FrameRange, frame: Frame, on_twos: bool) -> PhantomPose {
-    let frame = if on_twos {
-        crate::time::on_twos(frame, scene.start)
-    } else {
-        frame
+/// The pose switches at its key — a held pose is placed, not played, so there
+/// is no half-way blend to hide. Position and yaw interpolate between keys and
+/// hold outside them.
+pub fn evaluate(phantom: &Phantom, frame: Frame) -> PhantomPose {
+    let (root, yaw, pose) = sample_motion(&phantom.motion, frame);
+    let skeleton = match phantom.rig.builtin_actor() {
+        Some(actor) => rig::sample_actor_pose(actor, pose)
+            // A hand-written document may name a pose the actor does not have;
+            // the commands refuse it, and an external file falls back to the
+            // standing pose instead of failing the frame.
+            .unwrap_or_else(|_| rig::sample_actor_pose(actor, actor.default_pose()).expect("the default pose is always valid")),
+        None => rig::Pose::rest(),
     };
-
-    // The active take overrides the manual track within its range.
-    let keys = phantom
-        .active_take
-        .and_then(|id| phantom.takes.iter().find(|t| t.id == id))
-        .filter(|t| t.range.contains(frame))
-        .map(|t| &t.motion)
-        .unwrap_or(&phantom.motion);
-
-    let (root, yaw, mut action, t_action) = sample_motion(keys, frame);
-    let pose = if let Some(actor) = phantom.rig.builtin_actor() {
-        // Empty/pre-roll tracks use the profile's rest action. Invalid externally
-        // authored documents remain safe; command and renderer validation diagnose them.
-        if keys.first().is_none_or(|k| frame < k.frame) || !actor.actions().contains(&action) {
-            action = actor.default_action();
-        }
-        rig::sample_actor_action(actor, action, t_action).expect("supported action")
-    } else {
-        rig::sample_action(action, t_action)
-    };
-    PhantomPose { root, yaw, action, pose }
+    PhantomPose { root, yaw, pose, skeleton }
 }
 
-/// Interpolates controller keys. Returns (position, action,
-/// local action time in seconds).
-fn sample_motion(keys: &[crate::project::MotionKey], frame: Frame) -> (Vec3, f32, Action, f32) {
+/// Interpolates controller keys: position and yaw between neighbours, the pose
+/// of the key in force.
+fn sample_motion(keys: &[crate::project::MotionKey], frame: Frame) -> (Vec3, f32, ActorPose) {
     if keys.is_empty() {
-        return (Vec3::ZERO, 0.0, Action::Idle, 0.0);
+        return (Vec3::ZERO, 0.0, ActorPose::Stand);
     }
-
-    // Position: linear interpolation between neighbouring keys; before the
-    // first key and after the last one — we stand where that key stands.
     let idx = match keys.binary_search_by_key(&frame, |k| k.frame) {
         Ok(i) => i,
-        Err(0) => {
-            return (floor(keys[0].position), keys[0].yaw, Action::Idle, 0.0);
-        }
+        // Before the first key the value is held, not extrapolated backwards.
+        Err(0) => return (floor(keys[0].position), keys[0].yaw, keys[0].pose),
         Err(i) => i - 1,
     };
     let from = keys[idx];
@@ -79,26 +62,7 @@ fn sample_motion(keys: &[crate::project::MotionKey], frame: Frame) -> (Vec3, f32
         }
         None => (floor(from.position), from.yaw),
     };
-
-    // Action: idle before the first key; after that a key's action starts
-    // at the middle of the transition from the previous key (smooth switching).
-    // Local action time runs from the last such boundary.
-    let mut seg_start = keys[0].frame;
-    let mut action = Action::Idle;
-    if keys[0].frame <= frame {
-        action = keys[0].action;
-    }
-    for w in keys.windows(2) {
-        let mid = w[0].frame + (w[1].frame - w[0].frame) / 2;
-        if mid <= frame {
-            seg_start = mid;
-            action = w[1].action;
-        } else {
-            break;
-        }
-    }
-    let t_action = frame_to_secs((frame - seg_start).max(0)) as f32;
-    (pos, yaw, action, t_action)
+    (pos, yaw, from.pose)
 }
 
 /// The floor clamps movement downward.
@@ -109,7 +73,7 @@ fn floor(p: Vec3) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project::{MotionKey, RigRef};
+    use crate::project::{ActorPose, MotionKey, RigRef};
 
     fn phantom(keys: Vec<MotionKey>) -> Phantom {
         Phantom {
@@ -117,26 +81,25 @@ mod tests {
             name: "p".into(),
             rig: RigRef::Builtin,
             motion: keys,
-            clip: None,
-            clip_track: Vec::new(),
-            takes: Vec::new(),
-            active_take: None,
             outline_px: 2.0,
             scale: 1.0,
             material_patches: Vec::new(),
         }
     }
 
+    fn key(frame: Frame, position: Vec3, pose: ActorPose) -> MotionKey {
+        MotionKey { yaw: 0.0, frame, position, pose }
+    }
+
     #[test]
     fn seek_matches_playback() {
         let p = phantom(vec![
-            MotionKey { yaw: 0.0, frame: 0, position: Vec3::ZERO, action: Action::Idle },
-            MotionKey { yaw: 0.0, frame: 48, position: Vec3::new(2.0, 0.0, 0.0), action: Action::Walk },
+            key(0, Vec3::ZERO, ActorPose::Stand),
+            key(48, Vec3::new(2.0, 0.0, 0.0), ActorPose::Sit),
         ]);
-        let scene = FrameRange::new(0, 96).unwrap();
         let mut last = None;
         for f in 0..96 {
-            let e = evaluate(&p, &scene, f, false);
+            let e = evaluate(&p, f);
             if let Some(prev) = last {
                 // Continuity: the root does not teleport between adjacent frames.
                 let prev: Vec3 = prev;
@@ -146,29 +109,45 @@ mod tests {
         }
         // A direct seek gives the same values.
         for f in [0, 1, 24, 47, 48, 95] {
-            let a = evaluate(&p, &scene, f, false);
-            let b = evaluate(&p, &scene, f, false);
-            assert_eq!(a.root, b.root);
+            assert_eq!(evaluate(&p, f).root, evaluate(&p, f).root);
         }
-        // End of movement.
-        let end = evaluate(&p, &scene, 48, false);
+        // End of movement, and the pose in force is the key's own.
+        let end = evaluate(&p, 48);
         assert!((end.root - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-4);
-        assert_eq!(end.action, Action::Walk);
+        assert_eq!(end.pose, ActorPose::Sit);
+        assert_eq!(end.skeleton.bones[0].translation.y, 0.95 - 0.50, "the sitting pose reaches the skeleton");
+        // The pose switches at its key, not half-way.
+        assert_eq!(evaluate(&p, 47).pose, ActorPose::Stand);
+        assert_eq!(evaluate(&p, 48).pose, ActorPose::Sit);
     }
 
     #[test]
-    fn twos_quantize_pose_but_not_below_floor() {
+    fn the_floor_clamps_movement_and_an_empty_track_stands() {
         let p = phantom(vec![
-            MotionKey { yaw: 0.0, frame: 0, position: Vec3::new(0.0, -5.0, 0.0), action: Action::Idle },
-            MotionKey { yaw: 0.0, frame: 24, position: Vec3::new(1.0, 0.0, 0.0), action: Action::Walk },
+            key(0, Vec3::new(0.0, -5.0, 0.0), ActorPose::Lie),
+            key(24, Vec3::new(1.0, 0.0, 0.0), ActorPose::Stand),
         ]);
-        let scene = FrameRange::new(0, 48).unwrap();
-        let a = evaluate(&p, &scene, 10, true);
-        let b = evaluate(&p, &scene, 11, true);
-        assert_eq!(a.root, b.root, "on twos adjacent odd/even frames match");
-        assert_eq!(a.root.y, 0.0, "the floor clamps movement downward");
-        let c = evaluate(&p, &scene, 12, true);
-        assert_ne!(a.root, c.root);
+        // Below the floor at the first key: the root is held at ground level.
+        for f in [0, 6, 12] {
+            assert_eq!(evaluate(&p, f).root.y, 0.0, "frame {f}");
+            assert_eq!(evaluate(&p, f).pose, ActorPose::Lie);
+        }
+        // An empty track: the actor stands at the origin in the default pose.
+        let empty = phantom(Vec::new());
+        let e = evaluate(&empty, 7);
+        assert_eq!(e.root, Vec3::ZERO);
+        assert_eq!(e.pose, ActorPose::Stand);
+    }
+
+    /// An imported rig has no named poses: it renders in bind pose, so nothing
+    /// in the skeleton matters — but evaluation must not fail.
+    #[test]
+    fn an_imported_rig_evaluates_to_the_rest_skeleton() {
+        let mut p = phantom(vec![key(0, Vec3::new(1.0, 0.0, 2.0), ActorPose::Stand)]);
+        p.rig = RigRef::Imported { asset: crate::id::AssetId(3) };
+        let e = evaluate(&p, 0);
+        assert_eq!(e.root, Vec3::new(1.0, 0.0, 2.0));
+        assert_eq!(e.skeleton.bones.len(), crate::rig::BONES.len());
     }
 }
 

@@ -56,7 +56,6 @@ pub fn run_editor(project_dir: PathBuf) -> Result<()> {
     app.init_resource::<SceneCache>();
     app.init_resource::<phantom_runtime::render::DrawCache>();
     app.init_resource::<phantom_runtime::render::VideoCache>();
-    app.init_resource::<phantom_runtime::render::ClipCache>();
 
     // The viewport texture is created in Startup (needs Assets<Image> and egui textures).
     app.add_systems(Startup, startup_viewport);
@@ -85,7 +84,6 @@ pub fn run_editor(project_dir: PathBuf) -> Result<()> {
     // EditorState is not a Bevy Resource (it holds a std::process::Child etc.),
     // so it lives in a NonSend.
     app.insert_non_send_resource(state);
-    app.insert_non_send_resource(FrameInput::default());
     app.insert_non_send_resource(FontsLoaded::default());
 
     app.add_systems(Update, bridge_drain);
@@ -125,11 +123,7 @@ fn bridge_drain(world: &mut World) {
     let Some(mut state) = world.remove_non_send_resource::<EditorState>() else { return };
     for req in requests {
         let result: Result<serde_json::Value, crate::session::SessionError> =
-            if state.recording.is_some()
-                && !matches!(req.op, crate::session::Op::StateGet | crate::session::Op::JobStatus { .. })
             {
-                Err(crate::session::SessionError::BridgeBusy)
-            } else {
                 match req.op {
                     crate::session::Op::ProjectOpen { dir, .. }
                         if bridge_dir.as_ref().is_some_and(|current| {
@@ -205,13 +199,6 @@ fn startup_viewport(world: &mut World) {
 // Editor state
 // ---------------------------------------------------------------------------
 
-struct Recording {
-    phantom: PhantomId,
-    /// First frame not yet recorded.
-    next_frame: Frame,
-    keys: Vec<MotionKey>,
-}
-
 struct ExportJob {
     child: Child,
     rx: std::sync::mpsc::Receiver<String>,
@@ -229,12 +216,7 @@ struct EditorState {
     selected: Option<PhantomId>,
     frame: Frame,
     playing: bool,
-    on_twos: bool,
     play_accum: f64,
-
-    control: ControlState,
-    control_active: bool,
-    recording: Option<Recording>,
 
     live: LiveSync,
     status: String,
@@ -255,9 +237,6 @@ struct EditorState {
     stroke_in_progress: Option<Vec<[f32; 2]>>,
 
     // Panel fields.
-    /// Active shot: its camera is used in the viewport and in scene export;
-    /// None — the scene's legacy camera.
-    active_shot: Option<ShotId>,
     cam_pos: [f32; 3],
     cam_yaw: f32,
     cam_pitch: f32,
@@ -266,14 +245,21 @@ struct EditorState {
     lighting: SceneLighting,
     floor_on: bool,
     floor_color: [f32; 3],
+    // Scene stage (layout mode): the box actors and props are confined to.
+    stage: Stage,
     import_path: String,
     bg_asset: u64,
+    // Flat backdrop geometry (editable copies of the active scene's screen).
+    bg_width: f32,
+    bg_height: f32,
+    bg_center: [f32; 3],
     export_out: String,
     film_out: String,
     trim_edit: Option<(ClipId, Frame, Frame)>,
-    clip_track: u64,
-    clip_asset: u64,
-    clip_start: Frame,
+    // Audio clip editor: target track, source asset and start frame.
+    audio_track: u64,
+    audio_asset: u64,
+    audio_start: Frame,
     bg_is_video: bool,
     // Builtin actor chosen when creating a Phantom.
     new_actor: phantom_core::project::BuiltinActor,
@@ -285,17 +271,6 @@ struct EditorState {
     obj_pos: [f32; 3],
     obj_yaw: f32,
     obj_scale: [f32; 3],
-    // Clip track of the selected Phantom: fields for a new use.
-    cu_asset: u64,
-    cu_stack: String,
-    cu_start: Frame,
-    cu_end: Frame,
-    cu_speed: f32,
-    cu_blend_in: f32,
-    cu_blend_out: f32,
-    cu_root_clip: bool,
-    // Retargeting profile for the new use: 0 = none, 1 = humanoid, 2 = quadruped.
-    cu_retarget: usize,
 }
 
 impl EditorState {
@@ -311,11 +286,7 @@ impl EditorState {
             selected: None,
             frame: 0,
             playing: false,
-            on_twos: false,
             play_accum: 0.0,
-            control: ControlState::default(),
-            control_active: false,
-            recording: None,
             live: LiveSync::default(),
             status: String::new(),
             export: None,
@@ -329,7 +300,6 @@ impl EditorState {
             draw_width: 6.0,
             onion_skin: true,
             stroke_in_progress: None,
-            active_shot: None,
             cam_pos: [0.0, 1.4, 4.0],
             cam_yaw: 0.0,
             cam_pitch: 0.0,
@@ -337,14 +307,18 @@ impl EditorState {
             lighting: SceneLighting::default(),
             floor_on: false,
             floor_color: SceneFloor::default().color,
+            stage: Stage::default(),
             import_path: String::new(),
             bg_asset: 0,
+            bg_width: 24.0,
+            bg_height: 8.0,
+            bg_center: [0.0, 4.0, -5.0],
             export_out: "render_out".into(),
             film_out: "film.mp4".into(),
             trim_edit: None,
-            clip_track: 0,
-            clip_asset: 0,
-            clip_start: 0,
+            audio_track: 0,
+            audio_asset: 0,
+            audio_start: 0,
             bg_is_video: false,
             new_actor: phantom_core::project::BuiltinActor::Humanoid,
             new_phantom_asset: 0,
@@ -353,15 +327,6 @@ impl EditorState {
             obj_pos: [0.0, 0.0, 0.0],
             obj_yaw: 0.0,
             obj_scale: [1.0, 1.0, 1.0],
-            cu_asset: 0,
-            cu_stack: String::new(),
-            cu_start: 0,
-            cu_end: 48,
-            cu_speed: 1.0,
-            cu_blend_in: 0.0,
-            cu_blend_out: 0.0,
-            cu_root_clip: false,
-            cu_retarget: 0,
         };
         s.set_scene(scene);
         s
@@ -379,25 +344,30 @@ impl EditorState {
         self.scene = id;
         self.selected = None;
         self.selected_object = None;
-        self.active_shot = None;
-        self.recording = None;
         self.playing = false;
         let snapshot = self.scene().map(|scene| {
+            let active = scene.camera_for(Some(scene.active_camera));
             (
                 scene.range,
-                scene.camera.keys.first().copied(),
-                scene.camera.focal_mm,
+                active.keys.first().copied(),
+                active.focal_mm,
                 scene.phantoms.keys().next().copied(),
                 scene.phantoms.values().next().and_then(|p| p.motion.first().map(|m| (m.position, m.yaw))),
-                scene.background.as_ref().map(|b| b.image.asset().0),
+                scene.background.as_ref().map(|b| (b.image.asset().0, b.width, b.height, b.center.to_array())),
                 scene.lighting,
                 scene.floor,
+                scene.stage,
             )
         });
-        if let Some((range, cam_key, focal, first_phantom, first_pos, bg, lighting, floor)) = snapshot {
+        if let Some((range, cam_key, focal, first_phantom, first_pos, bg, lighting, floor, stage)) = snapshot {
+            let (bg_asset, bg_width, bg_height, bg_center) = match bg {
+                Some((asset, width, height, center)) => (asset, width, height, center),
+                None => (0, self.bg_width, self.bg_height, self.bg_center),
+            };
             self.lighting = lighting;
             self.floor_on = floor.is_some();
             self.floor_color = floor.map(|f| f.color).unwrap_or_else(|| SceneFloor::default().color);
+            self.stage = stage;
             self.frame = range.start;
             let k = cam_key.unwrap_or(TransformKey::at(0, glam::Vec3::new(0.0, 1.4, 4.0), 0.0, 0.0));
             self.cam_pos = k.translation.to_array();
@@ -405,24 +375,29 @@ impl EditorState {
             self.cam_pitch = k.pitch;
             self.cam_focal = focal;
             self.selected = first_phantom;
-            if let Some(start) = first_pos {
-                self.control.position = start.0;
-                self.control.yaw = start.1;
-            }
-            self.bg_asset = bg.unwrap_or(0);
+            let _ = first_pos;
+            self.bg_asset = bg_asset;
+            self.bg_width = bg_width;
+            self.bg_height = bg_height;
+            self.bg_center = bg_center;
         }
         // Structure changed — LiveSync rebuilds by scene id.
     }
 
-    /// Viewport's active shot: its camera is loaded into the panel fields;
-    /// None — the scene's legacy camera. The frame is clamped to the shot range.
-    fn set_active_shot(&mut self, shot: Option<ShotId>) {
-        self.active_shot = shot;
+    /// Switches the scene's active camera: the document records it, the panel
+    /// fields take the camera's first key, and the frame is clamped to its range.
+    fn set_active_camera(&mut self, camera: CameraId) {
+        let Some(scene_id) = self.scene else { return };
+        // AddCamera already activates the new camera, so only an explicit
+        // switch issues a command (and an undo step).
+        if self.scene().map(|s| s.active_camera) != Some(camera) {
+            self.apply(DocCommand::ActivateCamera { scene: scene_id, camera });
+        }
         let Some(scene) = self.scene() else { return };
-        let cam = scene.camera_for_shot(shot);
+        let cam = scene.camera_for(Some(camera));
         let key = cam.keys.first().map(|k| (k.translation.to_array(), k.yaw, k.pitch));
         let focal = cam.focal_mm;
-        let range = scene.range_for_shot(shot);
+        let range = scene.range_for(Some(camera));
         if let Some((pos, yaw, pitch)) = key {
             self.cam_pos = pos;
             self.cam_yaw = yaw;
@@ -455,17 +430,8 @@ impl EditorState {
 }
 
 // ---------------------------------------------------------------------------
-// Per-frame scene update (input, recording, world sync)
+// Per-frame scene update (timeline advance and world sync)
 // ---------------------------------------------------------------------------
-
-/// Keyboard input gathered by the UI system during the previous frame.
-#[derive(Default)]
-struct FrameInput {
-    move_x: f32,
-    move_z: f32,
-    jump: bool,
-    viewport_focused: bool,
-}
 
 /// Debug viewport dump: PHANTOM_DEBUG_SHOT=/path.png — after 90 frames
 /// save the viewport to PNG and exit the process (GUI check without a screenshot tool).
@@ -516,11 +482,9 @@ fn scene_update(world: &mut World) {
         return;
     }
     let dt = world.resource::<Time>().delta_secs_f64().min(0.1);
-    let input = world.remove_non_send_resource::<FrameInput>().unwrap_or_default();
     let Some(mut state) = world.remove_non_send_resource::<EditorState>() else { return };
     {
             let Some(scene_id) = state.scene else {
-                world.insert_non_send_resource(input);
                 world.insert_non_send_resource(state);
                 return;
             };
@@ -530,7 +494,7 @@ fn scene_update(world: &mut World) {
             };
 
             // Timeline advance.
-            let advancing = state.playing || state.recording.is_some();
+            let advancing = state.playing;
             if advancing && state.playback.is_none() && state.audio_note.is_none() {
                 // Start preview; without a device — silent fallback with a note.
                 match phantom_runtime::audio::Playback::start() {
@@ -575,45 +539,6 @@ fn scene_update(world: &mut World) {
                     }
                     if state.frame >= range.end - 1 {
                         state.playing = false;
-                        if state.recording.is_some() {
-                            stop_recording(&mut state);
-                        }
-                    }
-                }
-            }
-
-            // Live control of the selected Phantom: always while recording,
-            // otherwise when the viewport is focused (off in draw mode).
-            // The live controller emits humanoid Walk/Jump only; other rigs
-            // remain timeline-driven, without incompatible joints or actions.
-            let live_humanoid = state.selected
-                .and_then(|id| state.scene()?.phantoms.get(&id))
-                .and_then(|p| p.rig.builtin_actor()) == Some(phantom_core::project::BuiltinActor::Humanoid);
-            let controlling = live_humanoid
-                && !state.draw_mode
-                && (state.recording.is_some() || (input.viewport_focused && !state.playing));
-            state.control_active = controlling;
-            if controlling {
-                let mut acc = dt;
-                let step = 1.0 / CONTROL_HZ as f64;
-                while acc > 0.0 {
-                    let h = acc.min(step) as f32;
-                    step_control(
-                        &mut state.control,
-                        &ControlInput { move_x: input.move_x, move_z: input.move_z, jump: input.jump },
-                        h,
-                    );
-                    acc -= h as f64;
-                }
-                // Recording: capture every frame passed.
-                if let Some(rec) = &mut state.recording {
-                    while rec.next_frame <= state.frame {
-                        rec.keys.push(MotionKey {
-                            yaw: state.control.yaw, frame: rec.next_frame,
-                            position: state.control.position,
-                            action: state.control.action,
-                        });
-                        rec.next_frame += 1;
                     }
                 }
             }
@@ -625,68 +550,19 @@ fn scene_update(world: &mut World) {
                 let project_ref = state.session.project.as_ref().expect("project open");
                 if let Err(e) = state.live.ensure(world, project_ref, revision_scene, &project_dir, &target) {
                     state.status = e.to_string();
-                    world.insert_non_send_resource(input);
                     world.insert_non_send_resource(state);
                     return;
                 }
             }
-            let control_override = if controlling {
-                Some((state.selected.unwrap(), state.control.position, state.control.yaw, control_pose(&state.control)))
-            } else {
-                None
-            };
             {
-                if let Some(scene) = state.session.project.as_ref().and_then(|p| p.scenes.get(&revision_scene)) {
-                    state.live.apply(world, scene, state.frame, state.on_twos, control_override, state.onion_skin, state.active_shot);
+                if let Some(project_ref) = state.session.project.as_ref() {
+                    if let Some(scene) = project_ref.scenes.get(&revision_scene) {
+                        state.live.apply(world, project_ref, scene, state.frame, state.onion_skin, Some(scene.active_camera));
+                    }
                 }
             }
     }
-    world.insert_non_send_resource(input);
     world.insert_non_send_resource(state);
-}
-
-fn start_recording(state: &mut EditorState) {
-    let Some(phantom) = state.selected else {
-        state.status = "select a Phantom to record".into();
-        return;
-    };
-    if state.scene().and_then(|s| s.phantoms.get(&phantom)).and_then(|p| p.rig.builtin_actor())
-        != Some(phantom_core::project::BuiltinActor::Humanoid)
-    {
-        state.status = "Live recording supports only the builtin humanoid; use keys for other rigs".into();
-        return;
-    }
-    if let Some(scene) = state.scene() {
-        let pose = evaluate(&scene.phantoms[&phantom], &scene.range, state.frame, state.on_twos);
-        state.control = ControlState { position: pose.root, yaw: pose.yaw, ..Default::default() };
-    }
-    state.recording = Some(Recording { phantom, next_frame: state.frame, keys: Vec::new() });
-    state.play_accum = 0.0;
-}
-
-fn stop_recording(state: &mut EditorState) {
-    let Some(rec) = state.recording.take() else { return };
-    if rec.keys.is_empty() {
-        return;
-    }
-    let Some(scene_id) = state.scene else { return };
-    // Re-recording — a new take; the previous one is not destroyed. One
-    // command — one undo step; the take becomes active.
-    let start = rec.keys.first().unwrap().frame;
-    let end = rec.keys.last().unwrap().frame + 1;
-    let n = state
-        .scene()
-        .and_then(|s| s.phantoms.get(&rec.phantom))
-        .map(|p| p.takes.len() + 1)
-        .unwrap_or(1);
-    let Some(range) = FrameRange::new(start, end).ok() else { return };
-    state.apply(DocCommand::AddTake {
-        scene: scene_id,
-        phantom: rec.phantom,
-        name: format!("Take {n}"),
-        range,
-        motion: rec.keys,
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -719,15 +595,13 @@ fn ui_system(world: &mut World) {
         world.insert_non_send_resource(fonts_added);
     }
 
-    let mut input = FrameInput::default();
     if let Some(mut state) = world.remove_non_send_resource::<EditorState>() {
         top_panel(&ctx, &mut state);
         right_panel(&ctx, &mut state);
         bottom_panel(&ctx, &mut state);
-        viewport_panel(&ctx, &mut state, viewport_tex, &mut input);
+        viewport_panel(&ctx, &mut state, viewport_tex);
         world.insert_non_send_resource(state);
     }
-    world.insert_non_send_resource(input);
 }
 
 #[derive(Default)]
@@ -848,9 +722,10 @@ fn start_export(state: &mut EditorState) {
         "--out".into(),
         out.into(),
     ];
-    if let Some(shot) = state.active_shot {
-        args.push("--shot".into());
-        args.push(shot.to_string().into());
+    if let Some(scene) = state.scene() {
+        // The render child uses the scene's active camera, as the viewport does.
+        args.push("--camera".into());
+        args.push(scene.active_camera.to_string().into());
     }
     spawn_export(state, args);
 }
@@ -935,167 +810,6 @@ fn right_panel(ctx: &egui::Context, state: &mut EditorState) {
         }
         if select != state.selected {
             state.selected = select;
-            if let (Some(scene), Some(pid)) = (state.scene(), select) {
-                let start =
-                    scene.phantoms[&pid].motion.first().map(|m| (m.position, m.yaw)).unwrap_or_default();
-                state.control = ControlState { position: start.0, yaw: start.1, ..Default::default() };
-            }
-        }
-        // Takes of the selected Phantom.
-        if let Some(pid) = state.selected {
-            let takes: Vec<(phantom_core::project::TakeId, String, bool)> = state
-                .scene()
-                .and_then(|s| s.phantoms.get(&pid))
-                .map(|p| {
-                    p.takes
-                        .iter()
-                        .map(|t| (t.id, format!("{} [{}, {})", t.name, t.range.start, t.range.end), p.active_take == Some(t.id)))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if !takes.is_empty() {
-                ui.label("Takes:");
-                for (tid, label, active) in takes {
-                    ui.horizontal(|ui| {
-                        if ui.radio(active, "").clicked() && !active {
-                            if let Some(sid) = state.scene {
-                                state.apply(DocCommand::SetActiveTake { scene: sid, phantom: pid, take: Some(tid) });
-                            }
-                        }
-                        ui.label(label);
-                        if ui.small_button("✕").clicked() {
-                            if let Some(sid) = state.scene {
-                                state.apply(DocCommand::RemoveTake { scene: sid, phantom: pid, take: tid });
-                            }
-                        }
-                    });
-                }
-            }
-        }
-        // Clip track of the selected Phantom (imported rig only).
-        if let Some(pid) = state.selected {
-            let imported = state
-                .scene()
-                .and_then(|s| s.phantoms.get(&pid))
-                .is_some_and(|p| matches!(p.rig, RigRef::Imported { .. }));
-            if imported {
-                let uses: Vec<(phantom_core::ClipUseId, String)> = state
-                    .scene()
-                    .and_then(|s| s.phantoms.get(&pid))
-                    .map(|p| {
-                        p.clip_track
-                            .iter()
-                            .map(|u| {
-                                (
-                                    u.id,
-                                    format!(
-                                        "clip {} {} [{}, {}) ×{:.2}{}",
-                                        u.asset,
-                                        u.stack.as_deref().unwrap_or("(longest)"),
-                                        u.range.start,
-                                        u.range.end,
-                                        u.speed,
-                                        u.retarget.map(|r| format!(" ↺{}", r.name())).unwrap_or_default(),
-                                    ),
-                                )
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let legacy = state.scene().and_then(|s| s.phantoms.get(&pid)).and_then(|p| p.clip);
-                ui.collapsing("Clip track", |ui| {
-                    if let Some(a) = legacy {
-                        ui.label(format!("legacy clip {} (looped)", a));
-                    }
-                    let mut remove = None;
-                    for (id, label) in uses {
-                        ui.horizontal(|ui| {
-                            ui.label(label);
-                            if ui.small_button("✕").clicked() {
-                                remove = Some(id);
-                            }
-                        });
-                    }
-                    if let (Some(sid), Some(id)) = (state.scene, remove) {
-                        state.apply(DocCommand::RemoveClipUse { scene: sid, phantom: pid, clip_use: id });
-                    }
-                    let motion_assets: Vec<(u64, String)> = state
-                        .project()
-                        .assets
-                        .values()
-                        .filter(|a| a.kind == phantom_core::AssetKind::MotionFbx)
-                        .map(|a| (a.id.0, format!("{}: {}", a.id, a.path.display())))
-                        .collect();
-                    if !motion_assets.is_empty() {
-                        if !motion_assets.iter().any(|(id, _)| *id == state.cu_asset) {
-                            state.cu_asset = motion_assets[0].0;
-                        }
-                        ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt("cu_asset")
-                                .selected_text(
-                                    motion_assets.iter().find(|(id, _)| *id == state.cu_asset).map(|(_, l)| l.clone()).unwrap_or_default(),
-                                )
-                                .show_ui(ui, |ui| {
-                                    for (id, label) in &motion_assets {
-                                        ui.selectable_value(&mut state.cu_asset, *id, label);
-                                    }
-                                });
-                            ui.label("stack:");
-                            ui.add(egui::TextEdit::singleline(&mut state.cu_stack).desired_width(90.0).hint_text("(longest)"));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("frames");
-                            ui.add(egui::DragValue::new(&mut state.cu_start));
-                            ui.add(egui::DragValue::new(&mut state.cu_end));
-                            ui.label("×");
-                            ui.add(egui::DragValue::new(&mut state.cu_speed).speed(0.05));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("in/out, s");
-                            ui.add(egui::DragValue::new(&mut state.cu_blend_in).speed(0.05));
-                            ui.add(egui::DragValue::new(&mut state.cu_blend_out).speed(0.05));
-                            ui.checkbox(&mut state.cu_root_clip, "clip root motion");
-                            ui.label("retargeting:");
-                            egui::ComboBox::from_id_salt("cu_retarget")
-                                .selected_text(["none", "humanoid", "quadruped"][state.cu_retarget])
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut state.cu_retarget, 0, "none");
-                                    ui.selectable_value(&mut state.cu_retarget, 1, "humanoid");
-                                    ui.selectable_value(&mut state.cu_retarget, 2, "quadruped");
-                                });
-                        });
-                        if ui.button("Add clip").clicked() {
-                            if let (Some(sid), Ok(range)) = (state.scene, FrameRange::new(state.cu_start, state.cu_end)) {
-                                let stack = if state.cu_stack.trim().is_empty() { None } else { Some(state.cu_stack.trim().to_string()) };
-                                let clip_use = phantom_core::ClipUse {
-                                    id: phantom_core::ClipUseId(0), // assigned by the command
-                                    asset: AssetId(state.cu_asset),
-                                    stack,
-                                    range,
-                                    speed: state.cu_speed,
-                                    blend_in: state.cu_blend_in,
-                                    blend_out: state.cu_blend_out,
-                                    root_motion: if state.cu_root_clip {
-                                        phantom_core::RootMotion::Clip
-                                    } else {
-                                        phantom_core::RootMotion::Controller
-                                    },
-                                    retarget: match state.cu_retarget {
-                                        1 => Some(phantom_core::RetargetProfile::Humanoid),
-                                        2 => Some(phantom_core::RetargetProfile::Quadruped),
-                                        _ => None,
-                                    },
-                                };
-                                state.apply(DocCommand::AddClipUse { scene: sid, phantom: pid, clip_use });
-                            } else {
-                                state.status = "invalid frame range".into();
-                            }
-                        }
-                    } else {
-                        ui.label("no MotionFbx assets");
-                    }
-                });
-            }
         }
         ui.horizontal(|ui| {
             ui.label("Actor:");
@@ -1169,7 +883,7 @@ fn right_panel(ctx: &egui::Context, state: &mut EditorState) {
                 state.selected_object = select_obj;
                 // Key fields come from the computed transform at the current frame.
                 if let (Some(scene), Some(oid)) = (state.scene(), select_obj) {
-                    let t = phantom_core::evaluate_object(&scene.objects[&oid], &scene.range, state.frame, false);
+                    let t = phantom_core::evaluate_object(&scene.objects[&oid], state.frame);
                     state.obj_pos = t.position.to_array();
                     state.obj_yaw = t.yaw;
                     state.obj_scale = t.scale.to_array();
@@ -1258,71 +972,126 @@ fn right_panel(ctx: &egui::Context, state: &mut EditorState) {
         }
 
         ui.separator();
-        ui.heading("Shots");
+        ui.heading("Cameras");
         if let Some(scene_id) = state.scene {
-            let shots: Vec<(ShotId, String)> = state
+            let cameras: Vec<(CameraId, String)> = state
                 .scene()
-                .map(|s| s.shots.values().map(|sh| (sh.id, sh.name.clone())).collect())
+                .map(|s| s.cameras.values().map(|c| (c.id, c.name.clone())).collect())
                 .unwrap_or_default();
-            let mut select_shot: Option<Option<ShotId>> = None;
-            let mut remove_shot = None;
-            let selected_name = state
-                .active_shot
-                .and_then(|id| shots.iter().find(|(sid, _)| *sid == id).map(|(_, n)| n.clone()))
-                .unwrap_or_else(|| "— (scene camera)".into());
-            egui::ComboBox::from_label("Active shot").selected_text(selected_name).show_ui(ui, |ui| {
-                if ui.selectable_label(state.active_shot.is_none(), "— (scene camera)").clicked() {
-                    select_shot = Some(None);
-                }
-                for (id, name) in &shots {
-                    if ui.selectable_label(state.active_shot == Some(*id), name).clicked() {
-                        select_shot = Some(Some(*id));
+            let active = state.scene().map(|s| s.active_camera).unwrap_or(SCENE_CAMERA);
+            let mut select_camera: Option<CameraId> = None;
+            let mut remove_camera = None;
+            let selected_name = cameras
+                .iter()
+                .find(|(id, _)| *id == active)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_else(|| "—".into());
+            egui::ComboBox::from_label("Active camera").selected_text(selected_name).show_ui(ui, |ui| {
+                for (id, name) in &cameras {
+                    let label = if *id == SCENE_CAMERA { format!("{name} (scene)") } else { name.clone() };
+                    if ui.selectable_label(active == *id, label).clicked() {
+                        select_camera = Some(*id);
                     }
                 }
             });
-            if let Some(sel) = select_shot {
-                state.set_active_shot(sel);
+            if let Some(id) = select_camera {
+                state.set_active_camera(id);
             }
-            // Active shot range: edited through SetShotRange.
-            if let Some(active) = state.active_shot {
-                let cur = state.scene().and_then(|s| s.shots.get(&active)).map(|sh| (sh.range.start, sh.range.end));
+            // Camera 0 covers the whole scene and cannot be narrowed.
+            if active != SCENE_CAMERA {
+                let cur = state.scene().and_then(|s| s.cameras.get(&active)).map(|c| (c.range.start, c.range.end));
                 if let Some((mut start, mut end)) = cur {
                     ui.horizontal(|ui| {
-                        ui.label("Shot range");
+                        ui.label("Camera range");
                         let rs = ui.add(egui::DragValue::new(&mut start));
                         let re = ui.add(egui::DragValue::new(&mut end));
                         if rs.changed() || re.changed() {
                             match FrameRange::new(start, end) {
-                                Ok(range) => state.apply(DocCommand::SetShotRange { scene: scene_id, shot: active, range }),
+                                Ok(range) => state.apply(DocCommand::SetCameraRange { scene: scene_id, camera: active, range }),
                                 Err(e) => state.status = e.to_string(),
                             }
                         }
                     });
                 }
             }
+            // Target picker: none | track | follow plus the tracked subject.
+            {
+                let current = state.scene().and_then(|s| s.cameras.get(&active)).and_then(|c| c.target);
+                let subjects: Vec<(CameraSubject, String)> = state
+                    .scene()
+                    .map(|s| {
+                        let mut v: Vec<(CameraSubject, String)> = s
+                            .phantoms
+                            .values()
+                            .map(|p| (CameraSubject::Phantom(p.id), format!("actor {} ({})", p.id.0, p.name)))
+                            .collect();
+                        v.extend(
+                            s.objects
+                                .values()
+                                .map(|o| (CameraSubject::Object(o.id), format!("object {} ({})", o.id.0, o.name))),
+                        );
+                        v
+                    })
+                    .unwrap_or_default();
+                let mut mode: Option<CameraTargetMode> = current.map(|t| t.mode);
+                let mut subject = current.map(|t| t.subject);
+                let mode_label = match mode {
+                    None => "none",
+                    Some(CameraTargetMode::Track) => "track",
+                    Some(CameraTargetMode::Follow) => "follow",
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Target");
+                    egui::ComboBox::from_id_salt("camera_target_mode").selected_text(mode_label).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut mode, None, "none");
+                        ui.selectable_value(&mut mode, Some(CameraTargetMode::Track), "track");
+                        ui.selectable_value(&mut mode, Some(CameraTargetMode::Follow), "follow");
+                    });
+                    if mode.is_some() {
+                        let subject_label = subject
+                            .and_then(|s| subjects.iter().find(|(cs, _)| *cs == s).map(|(_, n)| n.clone()))
+                            .unwrap_or_else(|| "—".into());
+                        egui::ComboBox::from_id_salt("camera_target_subject").selected_text(subject_label).show_ui(ui, |ui| {
+                            for (cs, name) in &subjects {
+                                ui.selectable_value(&mut subject, Some(*cs), name);
+                            }
+                        });
+                    }
+                });
+                let changed = mode != current.map(|t| t.mode) || subject != current.map(|t| t.subject);
+                if changed {
+                    let target = match (mode, subject) {
+                        (Some(mode), Some(subject)) => Some(CameraTarget { mode, subject }),
+                        _ => None,
+                    };
+                    state.apply(DocCommand::SetCameraTarget { scene: scene_id, camera: active, target });
+                }
+            }
             ui.horizontal(|ui| {
-                if ui.button("Add shot").clicked() {
+                if ui.button("Add camera").clicked() {
                     if let Some(scene) = state.scene() {
-                        let (range, n) = (scene.range, scene.shots.len() + 1);
-                        match state.apply_full(DocCommand::AddShot { scene: scene_id, name: format!("Shot {n}"), range }) {
+                        let n = scene.cameras.len() + 1;
+                        // None — the new camera covers the whole scene and becomes active.
+                        match state.apply_full(DocCommand::AddCamera { scene: scene_id, name: format!("Camera {n}"), range: None }) {
                             Ok(o) => {
-                                state.set_active_shot(o.shot);
+                                if let Some(id) = o.camera {
+                                    state.set_active_camera(id);
+                                }
                                 state.status.clear();
                             }
                             Err(e) => state.status = e.to_string(),
                         }
                     }
                 }
-                if let Some(active) = state.active_shot {
-                    if ui.button("Remove shot").clicked() {
-                        remove_shot = Some(active);
-                    }
+                if active != SCENE_CAMERA && ui.button("Remove camera").clicked() {
+                    remove_camera = Some(active);
                 }
             });
-            if let Some(id) = remove_shot {
-                state.apply(DocCommand::RemoveShot { scene: scene_id, shot: id });
+            if let Some(id) = remove_camera {
+                state.apply(DocCommand::RemoveCamera { scene: scene_id, camera: id });
+                // The document falls back to camera 0 — reload the panel fields.
                 if state.status.is_empty() {
-                    state.active_shot = None;
+                    state.set_active_camera(SCENE_CAMERA);
                 }
             }
         }
@@ -1346,25 +1115,54 @@ fn right_panel(ctx: &egui::Context, state: &mut EditorState) {
         });
         if ui.button("Key camera at current frame").clicked() {
             if let Some(scene_id) = state.scene {
+                let active = state.scene().map(|s| s.active_camera).unwrap_or(SCENE_CAMERA);
                 let key = TransformKey::at(
                     state.frame,
                     glam::Vec3::from_array(state.cam_pos),
                     state.cam_yaw,
                     state.cam_pitch,
                 );
-                match state.active_shot {
-                    Some(shot) => {
-                        state.apply(DocCommand::SetShotCameraKey { scene: scene_id, shot, key });
-                        state.apply(DocCommand::SetShotFocal { scene: scene_id, shot, focal_mm: state.cam_focal });
+                state.apply(DocCommand::SetCameraKey { scene: scene_id, camera: active, key });
+                state.apply(DocCommand::SetCameraLens { scene: scene_id, camera: active, focal_mm: state.cam_focal });
+            }
+        }
+
+        ui.separator();
+        ui.heading("Stage");
+        {
+            // The stage is the boundary actors and props are confined to; a
+            // size change clamps everything already staged (one undo step).
+            let mut stage = state.stage;
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.label("Preset");
+                for preset in StagePreset::ALL {
+                    let selected = stage.preset == Some(preset);
+                    if ui.selectable_label(selected, preset.name()).clicked() && !selected {
+                        stage = Stage::from_preset(preset);
+                        changed = true;
                     }
-                    None => {
-                        let mut keys = state.scene().map(|s| s.camera.keys.clone()).unwrap_or_default();
-                        match keys.binary_search_by_key(&key.frame, |k| k.frame) {
-                            Ok(i) => keys[i] = key,
-                            Err(i) => keys.insert(i, key),
-                        }
-                        state.apply(DocCommand::SetCameraKeys { scene: scene_id, keys });
-                        state.apply(DocCommand::SetCameraFocal { scene: scene_id, focal_mm: state.cam_focal });
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Size W×H×D");
+                changed |= ui.add(egui::DragValue::new(&mut stage.size.width).speed(0.5).range(0.1..=1000.0)).changed();
+                changed |= ui.add(egui::DragValue::new(&mut stage.size.height).speed(0.5).range(0.1..=1000.0)).changed();
+                changed |= ui.add(egui::DragValue::new(&mut stage.size.depth).speed(0.5).range(0.1..=1000.0)).changed();
+                if changed {
+                    stage.preset = None;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Center x,z");
+                changed |= ui.add(egui::DragValue::new(&mut stage.center[0]).speed(0.5)).changed();
+                changed |= ui.add(egui::DragValue::new(&mut stage.center[1]).speed(0.5)).changed();
+            });
+            if changed {
+                if let Some(sid) = state.scene {
+                    state.apply(DocCommand::SetStage { scene: sid, stage });
+                    if state.status.is_empty() {
+                        state.stage = stage;
                     }
                 }
             }
@@ -1462,18 +1260,18 @@ fn right_panel(ctx: &egui::Context, state: &mut EditorState) {
         });
         ui.horizontal(|ui| {
             ui.label("clip track:");
-            ui.add(egui::DragValue::new(&mut state.clip_track));
+            ui.add(egui::DragValue::new(&mut state.audio_track));
             ui.label("asset");
-            ui.add(egui::DragValue::new(&mut state.clip_asset));
+            ui.add(egui::DragValue::new(&mut state.audio_asset));
             ui.label("frame");
-            ui.add(egui::DragValue::new(&mut state.clip_start));
+            ui.add(egui::DragValue::new(&mut state.audio_start));
             if ui.button("Add").clicked() {
                 // Length is the whole asset: only the decoder knows the exact
                 // length, so take a covering value — the mixer trims to reality.
                 state.apply(DocCommand::AddAudioClip {
-                    track: TrackId(state.clip_track),
-                    asset: AssetId(state.clip_asset),
-                    start: state.clip_start,
+                    track: TrackId(state.audio_track),
+                    asset: AssetId(state.audio_asset),
+                    start: state.audio_start,
                     offset_samples: 0,
                     len_samples: 96 * 48000,
                     fade_in_samples: 0,
@@ -1501,11 +1299,11 @@ fn right_panel(ctx: &egui::Context, state: &mut EditorState) {
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| "?".into());
             ui.horizontal(|ui| {
-                let shot_name = clip.shot.and_then(|sid| {
-                    state.project().scenes.get(&clip.scene).and_then(|s| s.shots.get(&sid)).map(|sh| sh.name.clone())
+                let camera_name = clip.camera.and_then(|cid| {
+                    state.project().scenes.get(&clip.scene).and_then(|s| s.cameras.get(&cid)).map(|c| c.name.clone())
                 });
-                let shot_suffix = shot_name.map(|n| format!(" shot \"{n}\"")).unwrap_or_default();
-                ui.label(format!("{}: {}{} [{}, {})", i, scene_name, shot_suffix, clip.range.start, clip.range.end));
+                let camera_suffix = camera_name.map(|n| format!(" camera \"{n}\"")).unwrap_or_default();
+                ui.label(format!("{}: {}{} [{}, {})", i, scene_name, camera_suffix, clip.range.start, clip.range.end));
                 if ui.small_button("↑").clicked() && i > 0 {
                     film_action = Some(("move", clip.id, i - 1));
                 }
@@ -1550,8 +1348,9 @@ fn right_panel(ctx: &egui::Context, state: &mut EditorState) {
         }
         if ui.button("Add scene to film").clicked() {
             if let Some(scene) = state.scene() {
-                let (id, range) = (scene.id, scene.range_for_shot(state.active_shot));
-                state.apply(DocCommand::AddFilmClip { scene: id, range, shot: state.active_shot });
+                let camera = scene.active_camera;
+                let (id, range) = (scene.id, scene.range_for(Some(camera)));
+                state.apply(DocCommand::AddFilmClip { scene: id, range, camera: Some(camera) });
             }
         }
         ui.label(format!("film length: {} frames", film_len_frames));
@@ -1569,6 +1368,9 @@ fn right_panel(ctx: &egui::Context, state: &mut EditorState) {
             ui.label("Image (asset id)");
             ui.add(egui::DragValue::new(&mut state.bg_asset));
             ui.checkbox(&mut state.bg_is_video, "video");
+            ui.label("W×H");
+            ui.add(egui::DragValue::new(&mut state.bg_width).speed(0.5).range(0.1..=1000.0));
+            ui.add(egui::DragValue::new(&mut state.bg_height).speed(0.5).range(0.1..=1000.0));
             if ui.button("Apply").clicked() {
                 if let Some(scene_id) = state.scene {
                     state.apply(DocCommand::SetBackground {
@@ -1579,11 +1381,9 @@ fn right_panel(ctx: &egui::Context, state: &mut EditorState) {
                             } else {
                                 BackgroundSource::Image(AssetId(state.bg_asset))
                             },
-                            arc_radians: 2.0,
-                            radius: 6.0,
-                            height: 4.0,
-                            center: glam::Vec3::new(0.0, 2.0, -5.0),
-                            bulge: Default::default(),
+                            width: state.bg_width,
+                            height: state.bg_height,
+                            center: glam::Vec3::from(state.bg_center),
                             fit: Default::default(),
                         },
                     });
@@ -1594,19 +1394,15 @@ fn right_panel(ctx: &egui::Context, state: &mut EditorState) {
             ui.label("Import");
             ui.add(egui::TextEdit::singleline(&mut state.import_path).desired_width(120.0));
             if ui.button("File…").clicked() {
-                import_asset(state, None);
-            }
-            if ui.button("Import motion (FBX)…").clicked() {
-                import_asset(state, Some(AssetKind::MotionFbx));
+                import_asset(state);
             }
         });
     });
 }
 
-/// Import a file from the `import_path` field into the project. `kind_override`
-/// sets the registration AssetKind (motion-fbx for motion clips); the import
-/// route is unchanged: obj/fbx — bundle import with MTL and textures, anything else as a single file.
-fn import_asset(state: &mut EditorState, kind_override: Option<AssetKind>) {
+/// Import a file from the `import_path` field into the project: obj/fbx go
+/// through bundle import with MTL and textures, anything else is a single file.
+fn import_asset(state: &mut EditorState) {
     let path = PathBuf::from(state.import_path.trim());
     if !path.exists() {
         state.status = "file does not exist".into();
@@ -1616,32 +1412,28 @@ fn import_asset(state: &mut EditorState, kind_override: Option<AssetKind>) {
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
-    if kind_override == Some(AssetKind::MotionFbx) && ext.as_deref() != Some("fbx") {
-        state.status = "motion import: expected a .fbx file".into();
-        return;
-    }
     let is_model = matches!(ext.as_deref(), Some("obj") | Some("fbx"));
     // Models — bundle import with MTL and textures inside the project.
     let mut import_diags: Vec<String> = Vec::new();
-    let imported: Result<PathBuf, String> = if is_model {
+    let imported: Result<(PathBuf, Option<phantom_core::ModelBounds>), String> = if is_model {
         match phantom_runtime::import::import_model_bundle(&state.project_dir, &path) {
             Ok(b) => {
                 import_diags = b.diagnostics;
-                Ok(b.model)
+                Ok((b.model, b.bounds))
             }
             Err(e) => Err(e.to_string()),
         }
     } else {
-        storage::import_file(&state.project_dir, &path).map_err(|e| e.to_string())
+        storage::import_file(&state.project_dir, &path).map(|p| (p, None)).map_err(|e| e.to_string())
     };
     match imported {
-        Ok(rel) => {
-            let kind = kind_override.unwrap_or(match ext.as_deref() {
+        Ok((rel, bounds)) => {
+            let kind = match ext.as_deref() {
                 Some("obj") => AssetKind::ModelObj,
                 Some("fbx") => AssetKind::ModelFbx,
                 _ => AssetKind::Image,
-            });
-            match state.apply_full(DocCommand::RegisterAsset { kind, path: rel }) {
+            };
+            match state.apply_full(DocCommand::RegisterAsset { kind, path: rel, bounds }) {
                 Ok(o) => {
                     state.bg_asset = o.asset.map(|a| a.0).unwrap_or(0);
                     state.status = format!("imported asset {}", state.bg_asset);
@@ -1670,37 +1462,17 @@ fn bottom_panel(ctx: &egui::Context, state: &mut EditorState) {
             }
             let play_label = if state.playing { "⏸ Pause" } else { "▶ Play" };
             if ui.button(play_label).clicked() {
-                if state.recording.is_none() {
-                    state.playing = !state.playing;
-                    state.play_accum = 0.0;
-                }
-            }
-            let rec = state.recording.is_some();
-            let rec_label = if rec { "■ Stop" } else { "● Record" };
-            if ui
-                .add_enabled(state.selected.is_some(), egui::Button::new(rec_label).selected(rec))
-                .clicked()
-            {
-                if rec {
-                    stop_recording(state);
-                    state.playing = false;
-                } else {
-                    start_recording(state);
-                }
+                state.playing = !state.playing;
+                state.play_accum = 0.0;
             }
             if ui.button("✚ Key").clicked() {
                 if let (Some(scene_id), Some(pid)) = (state.scene, state.selected) {
-                    let key = if state.control_active {
-                        MotionKey { frame: state.frame, position: state.control.position, yaw: state.control.yaw, action: state.control.action }
-                    } else {
-                        let scene = state.scene().unwrap();
-                        let pose = evaluate(&scene.phantoms[&pid], &scene.range, state.frame, false);
-                        MotionKey { frame: state.frame, position: pose.root, yaw: pose.yaw, action: pose.action }
-                    };
+                    let scene = state.scene().unwrap();
+                    let pose = evaluate(&scene.phantoms[&pid], state.frame);
+                    let key = MotionKey { frame: state.frame, position: pose.root, yaw: pose.yaw, pose: pose.pose };
                     state.apply(DocCommand::SetMotionKey { scene: scene_id, phantom: pid, key });
                 }
             }
-            ui.checkbox(&mut state.on_twos, "on twos");
             ui.separator();
             // Drawing tools.
             if ui.selectable_label(state.draw_mode, "✏ Draw").clicked() {
@@ -1768,27 +1540,28 @@ fn bottom_panel(ctx: &egui::Context, state: &mut EditorState) {
         if let (Some(scene_id), Some(pid)) = (state.scene, state.selected) {
             if let Some(scene) = state.scene() {
                 if let Some(phantom) = scene.phantoms.get(&pid) {
-                    let pose = evaluate(phantom, &scene.range, state.frame, false);
-                    let mut key = MotionKey { frame: state.frame, position: pose.root, yaw: pose.yaw, action: pose.action };
+                    let pose = evaluate(phantom, state.frame);
+                    let mut key = MotionKey { frame: state.frame, position: pose.root, yaw: pose.yaw, pose: pose.pose };
                     let mut changed = false;
                     ui.horizontal(|ui| {
                         ui.label("Key: XYZ (m), yaw (rad)");
                         for value in [&mut key.position.x, &mut key.position.y, &mut key.position.z, &mut key.yaw] {
                             changed |= ui.add(egui::DragValue::new(value).speed(0.01)).changed();
                         }
-                        // Actions are filtered by the actor profile; imported rigs are clip-driven.
+                        // Poses are filtered by the actor profile; an imported rig
+                        // has none and renders in bind pose.
                         if let Some(actor) = phantom.rig.builtin_actor() {
-                            egui::ComboBox::from_id_salt("key_action")
-                                .selected_text(crate::builtin::action_name(key.action))
+                            egui::ComboBox::from_id_salt("key_pose")
+                                .selected_text(crate::builtin::pose_name(key.pose))
                                 .show_ui(ui, |ui| {
-                                    for &action in actor.actions() {
+                                    for &pose in actor.poses() {
                                         changed |= ui
-                                            .selectable_value(&mut key.action, action, crate::builtin::action_name(action))
+                                            .selectable_value(&mut key.pose, pose, crate::builtin::pose_name(pose))
                                             .changed();
                                     }
                                 });
                         } else {
-                            ui.label("(clip)");
+                            ui.label("(bind pose)");
                         }
                     });
                     if changed {
@@ -1837,7 +1610,7 @@ fn bottom_panel(ctx: &egui::Context, state: &mut EditorState) {
     });
 }
 
-fn viewport_panel(ctx: &egui::Context, state: &mut EditorState, tex: egui::TextureId, input: &mut FrameInput) {
+fn viewport_panel(ctx: &egui::Context, state: &mut EditorState, tex: egui::TextureId) {
     egui::CentralPanel::default().show(ctx, |ui| {
         let available = ui.available_size();
         let scale = (available.x / VIEWPORT_W as f32).min(available.y / VIEWPORT_H as f32);
@@ -1924,35 +1697,9 @@ fn viewport_panel(ctx: &egui::Context, state: &mut EditorState, tex: egui::Textu
             }
         }
 
-        input.viewport_focused = response.hovered() || response.has_focus();
-        let wants_kb = ctx.wants_keyboard_input();
-        if input.viewport_focused && !wants_kb {
-            let (mx, mz, jump) = ctx.input(|i| {
-                let x = (i.key_down(egui::Key::D) || i.key_down(egui::Key::ArrowRight)) as i8
-                    - (i.key_down(egui::Key::A) || i.key_down(egui::Key::ArrowLeft)) as i8;
-                // The camera looks down -Z: W moves forward (-Z), S toward the camera (+Z).
-                let z = (i.key_down(egui::Key::S) || i.key_down(egui::Key::ArrowDown)) as i8
-                    - (i.key_down(egui::Key::W) || i.key_down(egui::Key::ArrowUp)) as i8;
-                (x as f32, z as f32, i.key_down(egui::Key::Space))
-            });
-            input.move_x = mx;
-            input.move_z = mz;
-            input.jump = jump;
-        }
-
         // Hint and status.
-        let hint = if state.recording.is_some() {
-            format!("● RECORDING frame {}  (WASD — move, Space — jump, ■ — stop)", state.frame)
-        } else if state.control_active {
-            "WASD — move, Space — jump ● control active".to_string()
-        } else {
-            "hover the viewport to control the Phantom (WASD, Space)".to_string()
-        };
-        let color = if state.recording.is_some() {
-            egui::Color32::from_rgb(255, 90, 90)
-        } else {
-            egui::Color32::from_gray(200)
-        };
+        let hint = format!("frame {} — the timeline places actors and the camera", state.frame);
+        let color = egui::Color32::from_gray(200);
         ui.painter().text(
             rect.left_bottom() + egui::vec2(8.0, -8.0),
             egui::Align2::LEFT_BOTTOM,

@@ -64,8 +64,8 @@ struct RenderStillOutput {
     scene: u64,
     /// Integer scene frame rendered at fixed 24 fps.
     frame: i64,
-    /// Optional shot ID whose camera was used.
-    shot: Option<u64>,
+    /// Optional camera ID whose view was used.
+    camera: Option<u64>,
     /// PNG width in pixels.
     width: u32,
     /// PNG height in pixels.
@@ -210,12 +210,42 @@ impl PhantomMcp {
         })
     }
 
-    fn exec_render_still(&self, op: Op) -> Result<CallToolResult, ErrorData> {
-        Ok(render_still_result(self.backend_exec(op)))
+    /// Run an operation whose result carries `png_base64` and turn it into an
+    /// image block plus structuredContent (shared by render_still and look).
+    fn exec_image(&self, op: Op) -> Result<CallToolResult, ErrorData> {
+        Ok(image_result(self.backend_exec(op)))
     }
 }
 
-fn render_still_result(result: Result<serde_json::Value, StructuredError>) -> CallToolResult {
+/// A review direction from the wire: a view name or an `[x,y,z]` direction.
+fn parse_view(v: &serde_json::Value) -> Result<crate::session::ViewSpec, String> {
+    match v {
+        serde_json::Value::String(name) => Ok(crate::session::ViewSpec::Name(name.clone())),
+        serde_json::Value::Array(a) if a.len() == 3 => {
+            let mut out = [0.0f32; 3];
+            for (i, item) in a.iter().enumerate() {
+                let value = item.as_f64().ok_or_else(|| format!("view direction entries must be numbers, got {item}"))?;
+                if !value.is_finite() {
+                    return Err(format!("view direction must be finite, got {value}"));
+                }
+                out[i] = value as f32;
+            }
+            if out.iter().all(|v| v.abs() < 1e-6) {
+                return Err("view direction must not be the zero vector".into());
+            }
+            Ok(crate::session::ViewSpec::Direction(out))
+        }
+        other => Err(format!(
+            "views: a view name (front|back|left|right|top|three_quarter) or [x,y,z], got {other}"
+        )),
+    }
+}
+
+fn parse_views(views: Option<&[serde_json::Value]>) -> Result<Vec<crate::session::ViewSpec>, String> {
+    views.unwrap_or(&[]).iter().map(parse_view).collect()
+}
+
+fn image_result(result: Result<serde_json::Value, StructuredError>) -> CallToolResult {
     match result {
         Ok(mut value) => {
             let Some(object) = value.as_object_mut() else {
@@ -548,6 +578,14 @@ impl PhantomMcp {
                 "shadows": { "supported": true, "current": "enabled_for_staging_lights" },
                 "tonemapping": "tony_mc_mapface",
                 "render_still_bridge": true,
+                "stage": {
+                    "tools": ["stage_set", "stage_get"],
+                    "presets": phantom_core::StagePreset::ALL.iter().map(|p| {
+                        let s = p.size();
+                        serde_json::json!({ "preset": p.name(), "width_m": s.width, "height_m": s.height, "depth_m": s.depth })
+                    }).collect::<Vec<_>>(),
+                    "clamp": "every placement command keeps the entity's bounding box inside the stage and reports clamped/clamps"
+                },
                 "pure_diagnostics": ["validate", "camera_coverage", "background_fit"],
                 "formats": { "still": ["png"], "scene": ["png_sequence"], "film": ["mp4_h264_aac"] }
             },
@@ -610,15 +648,9 @@ impl PhantomMcp {
         })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Set an asset as the scene background (arc screen); video — video background; arc/radius/height/center — screen geometry (defaults 2.0 rad, 6.0 m, 4.0 m, [0,2,-5])")]
+    #[tool(output_schema = structured_object_schema(), description = "Set an asset as the scene background (a flat screen facing the camera side); video — video background; width/height/center — screen geometry (defaults 24 m, 8 m, [0,4,-5]); use background_fit for the size that closes the frame")]
     async fn background_set(&self, Parameters(p): Parameters<PBackground>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        let bulge = match p.bulge.as_deref() {
-            None => None,
-            Some("toward_camera") => Some(phantom_core::project::Bulge::TowardCamera),
-            Some("away_from_camera") => Some(phantom_core::project::Bulge::AwayFromCamera),
-            Some(other) => return Ok(invalid_input(format!("bulge: toward_camera|away_from_camera, got {other}"))),
-        };
         let fit = match p.fit.as_deref() {
             None => None,
             Some("cover") => Some(phantom_core::project::BackgroundFit::Cover),
@@ -630,11 +662,9 @@ impl PhantomMcp {
             scene: scene,
             asset: p.asset,
             video: p.video.unwrap_or(false),
-            arc: p.arc.unwrap_or(2.0),
-            radius: p.radius.unwrap_or(6.0),
-            height: p.height.unwrap_or(4.0),
-            center: p.center.unwrap_or([0.0, 2.0, -5.0]),
-            bulge,
+            width: p.width.unwrap_or(24.0),
+            height: p.height.unwrap_or(8.0),
+            center: p.center.unwrap_or([0.0, 4.0, -5.0]),
             fit,
         })
     }
@@ -657,12 +687,12 @@ impl PhantomMcp {
         self.exec(Op::PhantomAdd { scene: scene, name: p.name, rig_asset: p.rig_asset, rig_actor: p.rig_actor })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Builtin actor catalog: profiles, supported actions and the default action")]
+    #[tool(output_schema = structured_object_schema(), description = "Builtin actor catalog: actor profiles with the poses each one can hold, the metric prop table, human reference lines and stage presets")]
     async fn builtin_catalog(&self) -> Result<CallToolResult, ErrorData> {
         self.exec(Op::BuiltinCatalog)
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Set a Phantom controller key: frame, position [x,y,z], action from the actor profile in builtin_catalog")]
+    #[tool(output_schema = structured_object_schema(), description = "Set a Phantom controller key: frame, position [x,y,z], pose from the actor's profile in builtin_catalog (stand|sit|lie); omitted fields are preserved from the exact key or the evaluated state")]
     async fn key_set(&self, Parameters(p): Parameters<PKey>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
         let preserve = p.preserve.unwrap_or(true);
@@ -674,25 +704,25 @@ impl PhantomMcp {
             Err(error) => return Ok(structured_failure(error)),
         };
         let Some(phantom) = snapshot.phantoms.get(&phantom_core::PhantomId(p.phantom)) else {
-            return self.exec(Op::KeySet { scene, phantom: p.phantom, frame: p.frame, pos: [0.0; 3], action: phantom_core::Action::Idle, yaw: 0.0 });
+            return self.exec(Op::KeySet { scene, phantom: p.phantom, frame: p.frame, pos: [0.0; 3], pose: phantom_core::ActorPose::Stand, yaw: 0.0 });
         };
         let base = phantom.motion.iter().find(|key| key.frame == p.frame).copied();
-        let evaluated = phantom_core::pose::evaluate(phantom, &snapshot.range, p.frame, false);
-        let default_action = phantom.rig.builtin_actor().map(|actor| actor.default_action()).unwrap_or(phantom_core::Action::Idle);
-        let action = match p.action {
-            Some(action) => match crate::builtin::parse_action(&action) {
-                Ok(action) => action,
+        let evaluated = phantom_core::pose::evaluate(phantom, p.frame);
+        let default_pose = phantom.rig.builtin_actor().map(|actor| actor.default_pose()).unwrap_or(phantom_core::ActorPose::Stand);
+        let pose = match p.pose {
+            Some(pose) => match crate::builtin::parse_pose(&pose) {
+                Ok(pose) => pose,
                 Err(e) => return Ok(invalid_input(e)),
             },
-            None if preserve => base.map(|k| k.action).unwrap_or(evaluated.action),
-            None => default_action,
+            None if preserve => base.map(|k| k.pose).unwrap_or(evaluated.pose),
+            None => default_pose,
         };
         let pos = p.pos.unwrap_or_else(|| if preserve { base.map(|k| k.position.to_array()).unwrap_or(evaluated.root.to_array()) } else { [0.0; 3] });
         let yaw = p.yaw_deg.map(f32::to_radians).unwrap_or_else(|| if preserve { base.map(|k| k.yaw).unwrap_or(evaluated.yaw) } else { 0.0 });
-        self.exec(Op::KeySet { scene, phantom: p.phantom, frame: p.frame, pos, action, yaw })
+        self.exec(Op::KeySet { scene, phantom: p.phantom, frame: p.frame, pos, pose, yaw })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Remove a Phantom from the scene (its keys, takes and clip track go away with it)")]
+    #[tool(output_schema = structured_object_schema(), description = "Remove a Phantom from the scene (its keys go away with it)")]
     async fn phantom_remove(&self, Parameters(p): Parameters<PPhantomRef>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
         self.exec(Op::PhantomRemove { scene: scene, phantom: p.phantom })
@@ -704,26 +734,20 @@ impl PhantomMcp {
         self.exec(Op::MotionKeyRemove { scene: scene, phantom: p.phantom, frame: p.frame })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Atomically replace the whole Phantom controller track; motion — typed keys {frame,pos,action,yaw_deg?}, MCP angles in degrees")]
+    #[tool(output_schema = structured_object_schema(), description = "Atomically replace the whole Phantom controller track; motion — typed keys {frame,pos,pose,yaw_deg?}, MCP angles in degrees, an empty array clears the track")]
     async fn motion_replace(&self, Parameters(p): Parameters<PMotion>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
         let mut motion = Vec::with_capacity(p.motion.len());
         let mut yaws = Vec::with_capacity(p.motion.len());
         for key in p.motion {
-            let action = match crate::builtin::parse_action(&key.action) {
-                Ok(action) => action,
+            let pose = match crate::builtin::parse_pose(&key.pose) {
+                Ok(pose) => pose,
                 Err(e) => return Ok(invalid_input(e)),
             };
-            motion.push((key.frame, key.pos, action));
+            motion.push((key.frame, key.pos, pose));
             yaws.push(key.yaw_deg.unwrap_or(0.0).to_radians());
         }
         self.exec(Op::MotionReplace { scene, phantom: p.phantom, motion, yaws: Some(yaws) })
-    }
-
-    #[tool(output_schema = structured_object_schema(), description = "Set a camera key: integer frame at 24 fps, position in meters, yaw_deg/pitch_deg in degrees, focal length in mm")]
-    async fn camera_set(&self, Parameters(p): Parameters<PCamera>) -> Result<CallToolResult, ErrorData> {
-        let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        self.exec(Op::CameraSet { scene, frame: p.frame, pos: p.pos, yaw: p.yaw_deg.to_radians(), pitch: p.pitch_deg.to_radians(), focal_mm: p.focal_mm })
     }
 
     #[tool(output_schema = structured_object_schema(), description = "Add a static object (prop) from a model asset (ModelObj/ModelFbx without animation; a skinned model renders in bind pose)")]
@@ -798,6 +822,18 @@ impl PhantomMcp {
         self.exec(Op::FloorGet { scene: scene })
     }
 
+    #[tool(output_schema = structured_object_schema(), description = "Set the scene stage (layout mode): the box actors and props are confined to. Give preset small|medium|large and/or width+height+depth in meters; anything already staged that no longer fits is clamped in the same step and reported as clamped/clamps. Without center the stage keeps its current center.")]
+    async fn stage_set(&self, Parameters(p): Parameters<PStageSet>) -> Result<CallToolResult, ErrorData> {
+        let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
+        self.exec(Op::StageSet { scene: scene, preset: p.preset, width: p.width, height: p.height, depth: p.depth, center: p.center })
+    }
+
+    #[tool(output_schema = structured_object_schema(), description = "Current scene stage: preset, size (width/height/depth, meters) and floor-plane center")]
+    async fn stage_get(&self, Parameters(p): Parameters<PSceneRef>) -> Result<CallToolResult, ErrorData> {
+        let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
+        self.exec(Op::StageGet { scene: scene })
+    }
+
     #[tool(output_schema = structured_object_schema(), description = "Brush/eraser stroke of a 2D layer at a frame (points in 1920x1080 canvas coordinates)")]
     async fn brush_stroke(&self, Parameters(p): Parameters<PStroke>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
@@ -808,70 +844,68 @@ impl PhantomMcp {
         self.exec(Op::BrushStroke { scene, frame: p.frame, points, color: p.color, width: p.width, erase: p.erase })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Append a film clip from a scene range (at the end); shot — a shot clip (start/end must equal the shot range)")]
+    #[tool(output_schema = structured_object_schema(), description = "Append a film clip from a scene range (at the end); camera — clip a camera's range (start/end must equal the camera range)")]
     async fn film_add(&self, Parameters(p): Parameters<PFilmAdd>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        self.exec(Op::FilmAdd { scene: scene, start: p.start, end: p.end, shot: p.shot })
+        self.exec(Op::FilmAdd { scene: scene, start: p.start, end: p.end, camera: p.camera })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Add a named scene shot: range [start, end) inside the scene, default camera")]
-    async fn shot_add(&self, Parameters(p): Parameters<PShotAdd>) -> Result<CallToolResult, ErrorData> {
+    #[tool(output_schema = structured_object_schema(), description = "Add a named scene camera: range [start, end) inside the scene (omitted — the whole scene); the new camera becomes the scene's active camera")]
+    async fn camera_add(&self, Parameters(p): Parameters<PCameraAdd>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        self.exec(Op::ShotAdd { scene: scene, name: p.name, start: p.start, end: p.end })
+        self.exec(Op::CameraAdd { scene: scene, name: p.name, start: p.start, end: p.end })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Remove a shot camera key at a frame (the last key cannot be removed)")]
-    async fn shot_camera_key_remove(&self, Parameters(p): Parameters<PShotKeyRef>) -> Result<CallToolResult, ErrorData> {
+    #[tool(output_schema = structured_object_schema(), description = "Remove a camera; film clips referencing it are removed by the same command")]
+    async fn camera_remove(&self, Parameters(p): Parameters<PCameraRef>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        self.exec(Op::ShotCameraKeyRemove { scene: scene, shot: p.shot, frame: p.frame })
+        self.exec(Op::CameraRemove { scene: scene, camera: p.camera })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Remove a shot; film clips targeting that shot are removed by the same command")]
-    async fn shot_remove(&self, Parameters(p): Parameters<PShotRef>) -> Result<CallToolResult, ErrorData> {
+    #[tool(output_schema = structured_object_schema(), description = "Select the scene's active camera: the one the viewport shows and a render without a camera uses")]
+    async fn camera_select(&self, Parameters(p): Parameters<PCameraRef>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        self.exec(Op::ShotRemove { scene: scene, shot: p.shot })
+        self.exec(Op::CameraSelect { scene: scene, camera: p.camera })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Change the shot range [start, end) (inside the scene); film clips targeting that shot get the new range")]
-    async fn shot_range_set(&self, Parameters(p): Parameters<PShotRange>) -> Result<CallToolResult, ErrorData> {
+    #[tool(output_schema = structured_object_schema(), description = "Change a camera's range [start, end) (inside the scene); film clips targeting that camera get the new range")]
+    async fn camera_range_set(&self, Parameters(p): Parameters<PCameraRange>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        self.exec(Op::ShotRangeSet { scene: scene, shot: p.shot, start: p.start, end: p.end })
+        self.exec(Op::CameraRangeSet { scene: scene, camera: p.camera, start: p.start, end: p.end })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Camera key (C1): without shot — the legacy scene camera, with shot — the shot camera. pos + yaw_deg/pitch_deg OR look_at; roll_deg (tilt), focal_mm/focal_preset (zoom), ease (smoothing toward the next key)")]
+    #[tool(output_schema = structured_object_schema(), description = "Camera key (C1): camera omitted — the scene's active camera. pos + yaw_deg/pitch_deg OR look_at (aim at a point — the program computes yaw/pitch); roll_deg (tilted horizon), focal_mm/focal_preset (zoom), ease (smoothing toward the next key). The key must keep at least 20 % of the scene volume in frame")]
     async fn camera_key_set(&self, Parameters(p): Parameters<PCameraKey>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
         let key = match camera_key_input(p.frame, p.pos, p.yaw_deg, p.pitch_deg, p.roll_deg, p.look_at, p.focal_mm, p.focal_preset.as_deref(), p.ease.as_deref()) {
             Ok(key) => key,
             Err(result) => return Ok(result),
         };
-        self.exec(Op::CameraKeySet { scene, shot: p.shot, key })
+        self.exec(Op::CameraKeySet { scene, camera: p.camera, key })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Shot camera key (C1): pos + yaw_deg/pitch_deg OR look_at (aim at a point — the program computes yaw/pitch), roll_deg (tilted horizon), focal_mm/focal_preset (zoom inside the shot), ease (smoothing toward the next key)")]
-    async fn shot_camera_key_set(&self, Parameters(p): Parameters<PShotCamKey>) -> Result<CallToolResult, ErrorData> {
+    #[tool(output_schema = structured_object_schema(), description = "Remove a camera key at a frame (the last key cannot be removed)")]
+    async fn camera_key_remove(&self, Parameters(p): Parameters<PCameraKeyRef>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        let key = match camera_key_input(p.frame, p.pos, p.yaw_deg, p.pitch_deg, p.roll_deg, p.look_at, p.focal_mm, p.focal_preset.as_deref(), p.ease.as_deref()) {
-            Ok(key) => key,
-            Err(result) => return Ok(result),
-        };
-        self.exec(Op::ShotCameraKeySetKey { scene, shot: p.shot, key })
+        self.exec(Op::CameraKeyRemove { scene: scene, camera: p.camera, frame: p.frame })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Shot camera focal length in mm (35-mm equivalent) — the base for keys without their own focal_mm")]
-    async fn shot_focal_set(&self, Parameters(p): Parameters<PShotFocal>) -> Result<CallToolResult, ErrorData> {
+    #[tool(output_schema = structured_object_schema(), description = "Camera base lens in mm (35-mm equivalent) — the base for keys without their own focal_mm")]
+    async fn camera_lens_set(&self, Parameters(p): Parameters<PCameraLens>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        self.exec(Op::ShotFocalSet { scene: scene, shot: p.shot, focal_mm: p.focal_mm })
+        self.exec(Op::CameraLensSet { scene: scene, camera: p.camera, focal_mm: p.focal_mm })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Shot focal-length key (C1.2): zoom/crash-zoom inside a shot without changing the pose")]
-    async fn shot_focal_key_set(&self, Parameters(p): Parameters<PShotFocalKey>) -> Result<CallToolResult, ErrorData> {
+    #[tool(output_schema = structured_object_schema(), description = "Camera focal-length key (C1.2): zoom/crash-zoom inside the camera's range without changing the pose")]
+    async fn camera_focal_key_set(&self, Parameters(p): Parameters<PCameraFocalKey>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        let focal_mm = match lens_mm(p.focal_mm, p.focal_preset.as_deref()) {
-            Ok(mm) => mm,
-            Err(result) => return Ok(result),
-        };
-        self.exec(Op::ShotFocalKeySet { scene, shot: p.shot, frame: p.frame, focal_mm })
+        self.exec(Op::CameraFocalKeySet { scene, camera: p.camera, frame: p.frame, focal_mm: p.focal_mm })
+    }
+
+    #[tool(output_schema = structured_object_schema(), description = "Attach the camera to a moving subject — track: the camera stands where its keys put it and turns to keep the subject in view; follow: the camera is attached to the subject and its keys are read in the subject's frame, so it travels and turns with it (a third-person view). subject — phantom:<id> or object:<id>; clear: true detaches")]
+    async fn camera_target_set(&self, Parameters(p): Parameters<PCameraTargetSet>) -> Result<CallToolResult, ErrorData> {
+        let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
+        self.exec(Op::CameraTargetSet { scene, camera: p.camera, mode: p.mode, subject: p.subject, clear: p.clear.unwrap_or(false) })
     }
 
     #[tool(output_schema = structured_object_schema(), description = "Move a film clip to position index")]
@@ -887,69 +921,6 @@ impl PhantomMcp {
     #[tool(output_schema = structured_object_schema(), description = "Remove a film clip")]
     async fn film_remove(&self, Parameters(p): Parameters<PFilmMove>) -> Result<CallToolResult, ErrorData> {
         self.exec(Op::FilmRemove { clip: p.clip })
-    }
-
-    #[tool(output_schema = structured_object_schema(), description = "Add an active take from non-empty typed motion keys; start/end are optional and resolve to [min_frame,max_frame+1), yaw_deg in degrees")]
-    async fn take_add(&self, Parameters(p): Parameters<PTakeAdd>) -> Result<CallToolResult, ErrorData> {
-        let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        if p.motion.is_empty() { return Ok(invalid_input("take_add.motion must not be empty")); }
-        let inferred_start = p.motion.iter().map(|key| key.frame).min().unwrap();
-        let inferred_end = match p.motion.iter().map(|key| key.frame).max().unwrap().checked_add(1) {
-            Some(end) => end,
-            None => return Ok(invalid_input("take_add inferred end frame overflows")),
-        };
-        let mut motion = Vec::with_capacity(p.motion.len());
-        let mut yaws = Vec::with_capacity(p.motion.len());
-        for key in p.motion {
-            let action = match crate::builtin::parse_action(&key.action) {
-                Ok(action) => action,
-                Err(e) => return Ok(invalid_input(e)),
-            };
-            motion.push((key.frame, key.pos, action));
-            yaws.push(key.yaw_deg.unwrap_or(0.0).to_radians());
-        }
-        self.exec(Op::TakeAdd { scene, phantom: p.phantom, name: p.name, start: p.start.unwrap_or(inferred_start), end: p.end.unwrap_or(inferred_end), motion, yaws: Some(yaws) })
-    }
-
-    #[tool(output_schema = structured_object_schema(), description = "Select the active Phantom take (take = null — manual track only)")]
-    async fn take_active(&self, Parameters(p): Parameters<PTakeActive>) -> Result<CallToolResult, ErrorData> {
-        let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        self.exec(Op::TakeActive { scene: scene, phantom: p.phantom, take: p.take })
-    }
-
-    #[tool(output_schema = structured_object_schema(), description = "Remove a take")]
-    async fn take_remove(&self, Parameters(p): Parameters<PTakeActive>) -> Result<CallToolResult, ErrorData> {
-        let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        self.exec(Op::TakeRemove { scene: scene, phantom: p.phantom, take: p.take.unwrap_or(0) })
-    }
-
-    #[tool(output_schema = structured_object_schema(), description = "Motion clip for an imported rig: legacy — clip only (null clears it, the longest stack is looped); track — clip+start+end (+speed/blend_in/blend_out/stack/root_motion/retarget) adds a clip use")]
-    async fn phantom_clip_set(&self, Parameters(p): Parameters<PPhantomClip>) -> Result<CallToolResult, ErrorData> {
-        let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        self.exec(Op::PhantomClipSet {
-            scene: scene,
-            phantom: p.phantom,
-            clip: p.clip,
-            start: p.start,
-            end: p.end,
-            speed: p.speed,
-            blend_in: p.blend_in,
-            blend_out: p.blend_out,
-            stack: p.stack,
-            root_motion: p.root_motion,
-            retarget: p.retarget,
-        })
-    }
-
-    #[tool(output_schema = structured_object_schema(), description = "Remove a clip use from a Phantom track")]
-    async fn clip_use_remove(&self, Parameters(p): Parameters<PClipUseRef>) -> Result<CallToolResult, ErrorData> {
-        let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        self.exec(Op::ClipUseRemove { scene: scene, phantom: p.phantom, clip_use: p.clip_use })
-    }
-
-    #[tool(output_schema = structured_object_schema(), description = "List the animation stacks of a clip asset (name, duration in seconds and in frames at 24 fps)")]
-    async fn clip_list(&self, Parameters(p): Parameters<PAssetRef>) -> Result<CallToolResult, ErrorData> {
-        self.exec(Op::ClipList { asset: p.asset })
     }
 
     #[tool(output_schema = structured_object_schema(), description = "Add an audio track to a scene (scene given) or to the film (scene = null)")]
@@ -1033,10 +1004,10 @@ impl PhantomMcp {
         self.exec(Op::AudioClipRemove { track: p.track, clip: p.clip })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Start exporting a scene to a PNG sequence (job); frames — half-open range [start,end), so 84-85 renders frame 84 only; twos — on-twos mode for the Phantom pose")]
+    #[tool(output_schema = structured_object_schema(), description = "Start exporting a scene to a PNG sequence (job); frames — half-open range [start,end), so 84-85 renders frame 84 only; frames is half-open")]
     async fn render_scene(&self, Parameters(p): Parameters<PRenderScene>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        let result = self.backend_exec(Op::RenderScene { scene, out: render_scene_output(p.out), width: p.width.unwrap_or(1280), height: p.height.unwrap_or(720), frames: p.frames.map(|r| (r.start, r.end)), shot: p.shot, twos: p.twos.unwrap_or(false) });
+        let result = self.backend_exec(Op::RenderScene { scene, out: render_scene_output(p.out), width: p.width.unwrap_or(1280), height: p.height.unwrap_or(720), frames: p.frames.map(|r| (r.start, r.end)), camera: p.camera });
         Ok(match result {
             Ok(mut value) => { if let Some(object) = value.as_object_mut() { object.insert("allowed_root".into(), serde_json::json!(self.active_root())); } structured_success(value) },
             Err(error) => structured_failure(error),
@@ -1063,16 +1034,16 @@ impl PhantomMcp {
         self.exec(Op::JobList)
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Full snapshot of one scene: phantoms, objects, shots, 2D layers, audio tracks, background, camera")]
+    #[tool(output_schema = structured_object_schema(), description = "Full snapshot of one scene: phantoms, objects, cameras (with the active camera), 2D layers, audio tracks, background")]
     async fn scene_get(&self, Parameters(p): Parameters<PSceneRef>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
         self.exec(Op::SceneGet { scene: scene })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Full canonical snapshot of a shot plus the revision of its parent scene; scene may be omitted for the active scene")]
-    async fn shot_get(&self, Parameters(p): Parameters<PShotRef>) -> Result<CallToolResult, ErrorData> {
+    #[tool(output_schema = structured_object_schema(), description = "Full canonical snapshot of one camera (id, name, range, keys and focal_mm, target) plus the revision of its parent scene; scene may be omitted for the active scene")]
+    async fn camera_get(&self, Parameters(p): Parameters<PCameraRef>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        self.exec(Op::ShotGet { scene, shot: p.shot })
+        self.exec(Op::CameraGet { scene, camera: p.camera })
     }
 
     #[tool(output_schema = structured_object_schema(), description = "Pure document check without render and GPU: screen invariants (bg_geometry_invalid), camera FOV coverage (screen_fov_gap), motion gaps (motion_gap), audio and editing ranges (audio_out_of_range/audio_length_mismatch/film_clip_out_of_scene), missing files (asset_missing); returns {ok, revision, findings:[{code, severity, where, why, suggested_fix}]} with a deterministic order (scene, code, frame); ok=false on error severity")]
@@ -1335,21 +1306,21 @@ impl PhantomMcp {
     #[tool(output_schema = structured_object_schema(), description = "Frame coverage by the background screen at a frame, without rendering: camera pose (degrees), FOV (degrees), the screen's azimuthal/vertical span and the uncovered gap_deg per side, in_frame for every phantom/object; without a background covers_frame=null plus a finding")]
     async fn camera_coverage(&self, Parameters(p): Parameters<PCameraCoverage>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        self.exec(Op::CameraCoverage { scene, frame: p.frame, shot: p.shot, aspect: p.aspect })
+        self.exec(Op::CameraCoverage { scene, frame: p.frame, camera: p.camera, aspect: p.aspect })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Fit the screen geometry without rendering. Without shot — over ALL cameras of the scene (legacy plus every shot) so one arc covers every shot; shots[] shows each shot's worst frame and what is not covered now. Response: suggested {arc_deg, radius m, height m, center m} with a margin_deg safety margin, panorama_aspect (arc length/height) for a panorama generator, current/delta, fits, scope, cameras/samples")]
+    #[tool(output_schema = structured_object_schema(), description = "Fit the flat screen to the cameras without rendering. Without camera — over ALL cameras of the scene, so one size covers every camera; cameras[] shows each camera's worst frame and what is not covered now. Response: suggested {width m, height m, center m} at the current plane with a margin_deg safety margin, panorama_aspect (width/height) for a panorama generator, size_covers (false — no size helps, the screen must be moved), current/delta, fits, scope, cameras/samples")]
     async fn background_fit(&self, Parameters(p): Parameters<PBackgroundFit>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        self.exec(Op::BackgroundFit { scene, frame: p.frame, shot: p.shot, margin_deg: p.margin_deg, aspect: p.aspect })
+        self.exec(Op::BackgroundFit { scene, frame: p.frame, camera: p.camera, margin_deg: p.margin_deg, aspect: p.aspect })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Search the metric prop catalog (K1): kind primitive|furniture|interior and/or a name substring; entries[{name, size m, origin, materials, open_sides, note}] — placement without opening the mesh")]
+    #[tool(output_schema = structured_object_schema(), description = "Search the metric prop catalog (K1): kind primitive|furniture|interior|animal|street|exterior and/or a name substring; entries[{name, size m, origin, materials, open_sides, furniture, note}] — placement without opening the mesh")]
     async fn catalog_query(&self, Parameters(p): Parameters<PCatalogQuery>) -> Result<CallToolResult, ErrorData> {
         self.exec(Op::CatalogQuery { kind: p.kind, query: p.query })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Place a catalog item (K1): the mesh is built procedurally, no asset file needed; pos/yaw/pitch/roll/scale — the start key (degrees), then object_key_set. Materials are edited with material_set using the group names from catalog_query")]
+    #[tool(output_schema = structured_object_schema(), description = "Place a catalog item (K1): the mesh is built procedurally, no asset file needed; pos/yaw/pitch/roll/scale — the start key (degrees), then object_key_set. Materials are edited with material_set using the group names from catalog_query. A furnished room (kind interior with a furniture set) arrives as one undoable package: the shell plus one object per piece — the answer lists every id under `objects`")]
     async fn prop_add(&self, Parameters(p): Parameters<PPropAdd>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
         self.exec(Op::PropAdd {
@@ -1399,20 +1370,86 @@ impl PhantomMcp {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
         let report = p.report.unwrap_or(false);
         let (width, height) = still_size(p.width, p.height, report);
-        self.exec_render_still(Op::RenderStill {
+        self.exec_image(Op::RenderStill {
             scene: scene,
             frame: p.frame,
             width,
             height,
-            shot: p.shot,
+            camera: p.camera,
             report,
         })
     }
 
-    #[tool(output_schema = structured_object_schema(), description = "Shot report (K0.2): renders a sample of the shot's frames (without every — up to 5 evenly spaced, with every — every Nth, at most 12) and returns rows[{frame, mean_luma, luma_p5/p95, empty_coverage, objects_in_frame}], aggregate and findings (empty_frame/shot_empty/objects_out_of_frame). Requires a GPU; default 480x270")]
-    async fn shot_report(&self, Parameters(p): Parameters<PShotReport>) -> Result<CallToolResult, ErrorData> {
+    #[tool(output_schema = structured_object_schema(), description = "Camera report (K0.2): renders a sample of the camera's frames (without every — up to 5 evenly spaced, with every — every Nth, at most 12) and returns rows[{frame, mean_luma, luma_p5/p95, empty_coverage, objects_in_frame}], aggregate and findings (empty_frame/camera_empty/objects_out_of_frame). Requires a GPU; default 480x270")]
+    async fn camera_report(&self, Parameters(p): Parameters<PCameraReport>) -> Result<CallToolResult, ErrorData> {
         let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
-        self.exec(Op::ShotReport { scene, shot: p.shot, every: p.every, width: p.width, height: p.height })
+        self.exec(Op::CameraReport { scene, camera: p.camera, every: p.every, width: p.width, height: p.height })
+    }
+
+    #[tool(output_schema = structured_object_schema(), description = "Review sheet — the agent's eyes on the whole staging: render several directions around the scene at one frame (mode=angles, default) or a strip of frames through one camera (mode=frames) and return them tiled into ONE image. Each tile also carries mean_luma/empty_coverage/objects_in_frame, and empty tiles are findings. target — actor/object names (or phantom:<id>/object:<id>), default everything staged; views — front|back|left|right|top|three_quarter or an [x,y,z] direction from the target (default front,right,top,three_quarter); distance — metres from the target, default auto-framed by the target's size. Requires a GPU; default tile 480x270.")]
+    async fn look(&self, Parameters(p): Parameters<PLook>) -> Result<CallToolResult, ErrorData> {
+        let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
+        let views = match parse_views(p.views.as_deref()) {
+            Ok(views) => views,
+            Err(e) => return Ok(invalid_input(e)),
+        };
+        let view = match p.view.as_ref().map(parse_view).transpose() {
+            Ok(view) => view,
+            Err(e) => return Ok(invalid_input(e)),
+        };
+        self.exec_image(Op::Look {
+            scene,
+            mode: p.mode,
+            target: p.target,
+            views: Some(views),
+            distance: p.distance,
+            frame: p.frame,
+            camera: p.camera,
+            frames: p.frames,
+            every: p.every,
+            count: p.count,
+            view,
+            width: p.width,
+            height: p.height,
+        })
+    }
+
+    #[tool(output_schema = structured_object_schema(), description = "Place a grid of catalog props in ONE atomic step (one undo): rows along +Z, cols along +X from origin, each object clamped into the stage. The step defaults to the prop's own size times gap (1.2), so \"a row of 6 chairs\" needs no arithmetic; an explicit step [dx,dz] in meters overrides it. Angles in degrees. Returns the created object ids.")]
+    async fn prop_grid(&self, Parameters(p): Parameters<PPropGrid>) -> Result<CallToolResult, ErrorData> {
+        let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
+        self.exec(Op::PropGrid {
+            scene,
+            prop: p.prop,
+            prefix: p.prefix,
+            rows: p.rows,
+            cols: p.cols,
+            origin: p.origin,
+            step: p.step,
+            gap: p.gap,
+            yaw: p.yaw_deg.unwrap_or(0.0).to_radians(),
+            pitch: p.pitch_deg.unwrap_or(0.0).to_radians(),
+            roll: p.roll_deg.unwrap_or(0.0).to_radians(),
+            scale: p.scale,
+        })
+    }
+
+    #[tool(output_schema = structured_object_schema(), description = "Fill an area or a line with a catalog mix in ONE atomic step (one undo), from a preset: `forest` (pines + broadleaf + bush + rock, 0.2/m2), `grove` (2.5/m2), `undergrowth` (bush + rock, 1.2/m2), `hedge` (bush every ~0.45 m), `street_row` (tree, streetlight, bin repeating every ~8 m), `pole_row` (a lamp every ~25 m). Give an area as a [x0,z0,x1,z1] rectangle, or a ground plate's object id (the plate is the ground and the margin), or from/to endpoints for a line preset. Inside the optional action box (the zone the scene is shot in) the fill places REAL objects you can move, turn and delete afterwards; the ring beyond it becomes ONE band object whose mesh is a deterministic replay of the same seed, so the answer's numbers and the render never disagree. Over the per-fill caps the call fails with a concrete fix (raise --inset, lower density, shrink the area) instead of thinning the fill in front of the director. The seed is stored in the document: the same seed and shape rebuild the same wood; omit it and the drawn seed comes back in the answer. Angles in degrees.")]
+    async fn scatter(&self, Parameters(p): Parameters<PScatter>) -> Result<CallToolResult, ErrorData> {
+        let scene = match self.resolve_scene(p.scene) { Ok(scene) => scene, Err(result) => return Ok(result) };
+        self.exec(Op::Scatter {
+            scene,
+            preset: p.preset,
+            area: p.area,
+            plate: p.plate,
+            inset: p.inset,
+            action: p.action,
+            density: p.density,
+            from: p.from,
+            to: p.to,
+            step: p.step,
+            seed: p.seed,
+            prefix: p.prefix,
+        })
     }
 
     #[tool(output_schema = structured_object_schema(), description = "Cancel a job (the process is killed and temporary files are deleted)")]
@@ -1469,7 +1506,7 @@ struct PLightKey {
     pitch_deg: Option<f32>,
     /// Intensity override on this key; omitted inherits the light body value.
     intensity: Option<f32>,
-    /// On/off step on this key (e.g. a lantern switched on mid-shot); omitted inherits.
+    /// On/off step on this key (e.g. a lantern switched on mid-scene); omitted inherits.
     enabled: Option<bool>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1684,10 +1721,10 @@ struct PAudioReport {
 struct PCameraCoverage {
     /// Scene ID; omit to use the active scene.
     scene: Option<u64>,
-    /// Integer frame at fixed 24 fps; default = start of the scene/shot range.
+    /// Integer frame at fixed 24 fps; default = start of the camera's range, or of the scene range without a camera.
     frame: Option<i64>,
-    /// Shot ID; its camera and range are used instead of the scene camera.
-    shot: Option<u64>,
+    /// Camera ID; its view and range are used instead of the scene's active camera.
+    camera: Option<u64>,
     /// Frame aspect (width/height); default 1.7778 (16:9). Angles in the response are degrees.
     aspect: Option<f64>,
 }
@@ -1696,10 +1733,10 @@ struct PCameraCoverage {
 struct PBackgroundFit {
     /// Scene ID; omit to use the active scene.
     scene: Option<u64>,
-    /// Integer frame at fixed 24 fps; only valid together with `shot` (default = start of that shot's range).
+    /// Integer frame at fixed 24 fps; only valid together with `camera` (default = start of that camera's range).
     frame: Option<i64>,
-    /// Shot ID; omit to fit the screen for ALL cameras of the scene (legacy camera plus every shot), so one arc covers every shot.
-    shot: Option<u64>,
+    /// Camera ID; omit to fit the screen for ALL cameras of the scene, so one size covers every camera.
+    camera: Option<u64>,
     /// Safety margin added to the frustum on every side, in degrees; default 5.0, range [0, 45).
     margin_deg: Option<f64>,
     /// Frame aspect (width/height); default 1.7778 (16:9). Suggested angles are degrees, lengths meters.
@@ -1754,16 +1791,12 @@ struct PBackground {
     asset: u64,
     /// True for a video background; false/default for an image.
     video: Option<bool>,
-    /// Angular width in radians (>0); retained in radians for background geometry.
-    arc: Option<f32>,
-    /// Arc radius in meters (>0).
-    radius: Option<f32>,
-    /// Screen height in meters (>0).
+    /// Screen width in meters (>0); the flat backdrop spans x ∈ center.x ± width/2.
+    width: Option<f32>,
+    /// Screen height in meters (>0); it spans y ∈ center.y ± height/2.
     height: Option<f32>,
-    /// Screen center [x,y,z] in meters; Y is up.
+    /// Screen center [x,y,z] in meters; Y is up. The screen faces +Z (the camera side).
     center: Option<[f32; 3]>,
-    /// Arc bulge orientation: `away_from_camera` (default, screen wraps the scene) or `toward_camera` (backdrop screen).
-    bulge: Option<String>,
     /// Panorama UV mode: `cover` (default, crop overflow), `contain` (whole image, clamped bands) or `stretch` (legacy distortion).
     fit: Option<String>,
 }
@@ -1775,9 +1808,9 @@ struct PSceneRange { /// Scene ID; omit to use the active scene.
     end: i64 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct PShotKeyRef { /// Scene ID; omit to use the active scene.
-    scene: Option<u64>, /// Shot ID in the scene.
-    shot: u64, /// Integer frame at fixed 24 fps.
+struct PCameraKeyRef { /// Scene ID; omit to use the active scene.
+    scene: Option<u64>, /// Camera ID in the scene.
+    camera: u64, /// Integer frame at fixed 24 fps.
     frame: i64 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1797,8 +1830,8 @@ struct MotionEntry {
     frame: i64,
     /// Controller position [x,y,z] in meters; Y is up.
     pos: [f32; 3],
-    /// Action name supported by the actor's builtin_catalog profile.
-    action: String,
+    /// Pose this actor can hold (stand|sit|lie), from its builtin_catalog profile.
+    pose: String,
     /// Optional root yaw in degrees about +Y; 0 faces +Z, positive turns toward +X.
     yaw_deg: Option<f32>,
 }
@@ -1841,8 +1874,9 @@ struct PKey {
     frame: i64,
     /// Optional controller position [x,y,z] in meters; Y is up.
     pos: Option<[f32; 3]>,
-    /// Optional action from builtin_catalog for this actor.
-    action: Option<String>,
+    /// Optional pose for this actor (stand|sit|lie); a pose the species cannot
+    /// hold is rejected with unsupported_pose.
+    pose: Option<String>,
     /// Optional root yaw in degrees about +Y; 0 faces +Z, positive turns toward +X.
     yaw_deg: Option<f32>,
     /// Preserve omitted fields from an exact key or evaluated state; defaults true.
@@ -1850,20 +1884,18 @@ struct PKey {
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct PCamera { /// Scene ID; omit to use the active scene.
-    scene: Option<u64>, /// Integer key frame at fixed 24 fps.
-    frame: i64, /// Camera position [x,y,z] in meters; Y is up.
-    pos: [f32; 3], /// Yaw in degrees about +Y; 0 looks along -Z.
-    yaw_deg: f32, /// Pitch in degrees; 0 is level, positive looks upward.
-    pitch_deg: f32, /// Focal length in millimeters (>0), 35-mm camera model.
-    focal_mm: f32 }
+struct PCameraAdd { /// Scene ID; omit to use the active scene.
+    scene: Option<u64>, /// Non-empty human-readable camera name.
+    name: String, /// Optional first integer scene frame at 24 fps; the range [start,end) defaults to the whole scene.
+    start: Option<i64>, /// Optional end-exclusive integer scene frame at 24 fps; start and end come together.
+    end: Option<i64> }
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PCameraKey {
     /// Scene ID; omit to use the active scene.
     scene: Option<u64>,
-    /// Shot ID; omit to key the legacy scene camera.
-    shot: Option<u64>,
+    /// Camera ID; omit to key the scene's active camera.
+    camera: Option<u64>,
     /// Integer key frame at fixed 24 fps.
     frame: i64,
     /// Camera position [x,y,z] in meters; Y is up.
@@ -1876,7 +1908,7 @@ struct PCameraKey {
     roll_deg: Option<f32>,
     /// Aim point [x,y,z] in meters: yaw/pitch are derived from pos toward it, so orbit/follow keys need no trigonometry.
     look_at: Option<[f32; 3]>,
-    /// Focal length in millimeters (>0) on this key: zoom/crash-zoom inside a shot.
+    /// Focal length in millimeters (>0) on this key: zoom/crash-zoom inside the camera's range.
     focal_mm: Option<f32>,
     /// Named lens preset, used when focal_mm is omitted: ultrawide 16 | wide 24 | normal 35 | portrait 50 | portrait_tele 85 | tele 135 | super_tele 200.
     focal_preset: Option<String>,
@@ -1885,17 +1917,15 @@ struct PCameraKey {
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct PShotFocalKey {
+struct PCameraFocalKey {
     /// Scene ID; omit to use the active scene.
     scene: Option<u64>,
-    /// Shot ID in the scene.
-    shot: u64,
+    /// Camera ID in the scene.
+    camera: u64,
     /// Integer key frame at fixed 24 fps.
     frame: i64,
     /// Focal length in millimeters (>0) on this key.
-    focal_mm: Option<f32>,
-    /// Named lens preset used when focal_mm is omitted: ultrawide 16 | wide 24 | normal 35 | portrait 50 | portrait_tele 85 | tele 135 | super_tele 200.
-    focal_preset: Option<String>,
+    focal_mm: f32,
 }
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -1949,50 +1979,46 @@ struct PFloorSet { /// Scene ID; omit to use the active scene.
     color: Option<[f32; 3]> }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct PStageSet { /// Scene ID; omit to use the active scene.
+    scene: Option<u64>, /// Stage preset: small (10x10x4 m) | medium (30x20x8) | large (80x60x20).
+    preset: Option<String>, /// Stage width in meters (with a preset it overrides that axis).
+    width: Option<f32>, /// Stage height in meters: the ceiling above the y=0 floor.
+    height: Option<f32>, /// Stage depth in meters (with a preset it overrides that axis).
+    depth: Option<f32>, /// Center of the box on the floor plane [x, z]; default — the current center.
+    center: Option<[f32; 2]> }
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct PFilmAdd { /// Scene ID; omit to use the active scene.
     scene: Option<u64>, /// First integer scene frame; range is [start,end).
     start: i64, /// End-exclusive integer scene frame at 24 fps.
-    end: i64, /// Optional shot ID; range must equal the shot's [start,end).
-    shot: Option<u64> }
+    end: i64, /// Optional camera ID; range must equal the camera's [start,end).
+    camera: Option<u64> }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct PShotAdd { /// Scene ID; omit to use the active scene.
-    scene: Option<u64>, /// Non-empty human-readable shot name.
-    name: String, /// First integer scene frame; range is [start,end).
+struct PCameraRef { /// Scene ID; omit to use the active scene.
+    scene: Option<u64>, /// Camera ID in the scene.
+    camera: u64 }
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PCameraRange { /// Scene ID; omit to use the active scene.
+    scene: Option<u64>, /// Camera ID in the scene.
+    camera: u64, /// First integer scene frame; range is [start,end).
     start: i64, /// End-exclusive integer scene frame at 24 fps.
     end: i64 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct PShotRef { /// Scene ID; omit to use the active scene.
-    scene: Option<u64>, /// Shot ID in the scene.
-    shot: u64 }
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct PShotRange { /// Scene ID; omit to use the active scene.
-    scene: Option<u64>, /// Shot ID in the scene.
-    shot: u64, /// First integer scene frame; range is [start,end).
-    start: i64, /// End-exclusive integer scene frame at 24 fps.
-    end: i64 }
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct PShotCamKey { /// Scene ID; omit to use the active scene.
-    scene: Option<u64>, /// Shot ID in the scene.
-    shot: u64, /// Integer key frame at fixed 24 fps.
-    frame: i64, /// Camera position [x,y,z] in meters; Y is up.
-    pos: [f32;3], /// Optional yaw degrees about +Y; 0 looks along -Z. Ignored when look_at is given.
-    yaw_deg: Option<f32>, /// Optional pitch degrees; 0 is level, positive looks upward. Ignored when look_at is given.
-    pitch_deg: Option<f32>, /// Optional roll degrees (tilted horizon); 0 keeps the horizon level.
-    roll_deg: Option<f32>, /// Optional aim point [x,y,z] in meters: yaw/pitch are derived from pos toward it.
-    look_at: Option<[f32;3]>, /// Optional focal length in millimeters (>0) on this key: zoom inside the shot.
-    focal_mm: Option<f32>, /// Optional named lens preset (ultrawide 16 | wide 24 | normal 35 | portrait 50 | portrait_tele 85 | tele 135 | super_tele 200), used when focal_mm is omitted.
-    focal_preset: Option<String>, /// Optional interpolation to the next key: linear | ease_in | ease_out | ease_in_out.
-    ease: Option<String> }
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct PShotFocal { /// Scene ID; omit to use the active scene.
-    scene: Option<u64>, /// Shot ID in the scene.
-    shot: u64, /// Focal length in millimeters (>0), 35-mm camera model.
+struct PCameraLens { /// Scene ID; omit to use the active scene.
+    scene: Option<u64>, /// Camera ID in the scene.
+    camera: u64, /// Focal length in millimeters (>0), 35-mm camera model.
     focal_mm: f32 }
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PCameraTargetSet { /// Scene ID; omit to use the active scene.
+    scene: Option<u64>, /// Camera ID in the scene.
+    camera: u64, /// track — the camera stands and turns to keep the subject in view | follow — attached to the subject, travels and turns with it; omit with clear=true to detach.
+    mode: Option<String>, /// phantom:<id> or object:<id>; required unless clear=true.
+    subject: Option<String>, /// True detaches the camera from its subject.
+    clear: Option<bool> }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PFilmTrim { /// Film clip ID.
@@ -2025,16 +2051,102 @@ struct PRenderScene { /// Scene ID; omit to use the active scene.
     out: Option<String>, /// Output width in pixels, 1..=4096; defaults 1280.
     width: Option<u32>, /// Output height in pixels, 1..=4096; defaults 720.
     height: Option<u32>, /// Optional scene frame range [start,end), with end exclusive.
-    frames: Option<FrameRangeInput>, /// Optional shot ID selecting its camera.
-    shot: Option<u64>, /// On-twos Phantom pose sampling; defaults false.
-    twos: Option<bool> }
+    frames: Option<FrameRangeInput>, /// Optional camera ID selecting its view.
+    camera: Option<u64> }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PCatalogQuery {
-    /// Catalog section: primitive | furniture | interior; omit for all.
+    /// Catalog section: primitive | furniture | interior | animal | street | exterior; omit for all.
     kind: Option<String>,
     /// Case-insensitive substring of the entry name or its note; omit or empty for the whole section.
     query: Option<String>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PLook {
+    /// Scene ID; omit to use the active scene.
+    scene: Option<u64>,
+    /// `angles` (default) — directions around the scene at one frame; `frames` — a strip over a range.
+    mode: Option<String>,
+    /// Actor/object names to frame, or `phantom:<id>` / `object:<id>`; omit for everything staged.
+    target: Option<Vec<String>>,
+    /// angles: view names (front|back|left|right|top|three_quarter) or [x,y,z] directions from the target; default front,right,top,three_quarter.
+    views: Option<Vec<serde_json::Value>>,
+    /// Metres from the target center to the eye; omit to auto-frame by the target's size.
+    distance: Option<f32>,
+    /// angles: the frame to review; default the first frame of the camera's scene range.
+    frame: Option<i64>,
+    /// frames: camera whose view to use; omit for the scene's active camera.
+    camera: Option<u64>,
+    /// frames: explicit frame numbers (at most 12); overrides every/count.
+    frames: Option<Vec<i64>>,
+    /// frames: every Nth frame of the range (at most 12 tiles).
+    every: Option<u32>,
+    /// frames: how many evenly spaced frames, both ends included (at most 12).
+    count: Option<u32>,
+    /// frames: a review direction instead of the camera — a view name or [x,y,z].
+    view: Option<serde_json::Value>,
+    /// Tile width in pixels, 1..=4096; default 480.
+    width: Option<u32>,
+    /// Tile height in pixels, 1..=4096; default 270.
+    height: Option<u32>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PScatter {
+    /// Scene ID; omit to use the active scene.
+    scene: Option<u64>,
+    /// Fill preset: `forest`, `grove`, `undergrowth`, `hedge`, `street_row`, `pole_row`.
+    preset: String,
+    /// World rectangle [x0,z0,x1,z1] in meters to fill (an area preset).
+    area: Option<[f32; 4]>,
+    /// Object id of an outdoor ground plate (street_yard/street_park/street_crossing) to fill instead of a rectangle.
+    plate: Option<u64>,
+    /// Keep this margin in meters clear of the plate edge; default 0.5.
+    inset: Option<f32>,
+    /// The zone the scene is shot in [x0,z0,x1,z1]: inside it the fill places movable props.
+    action: Option<[f32; 4]>,
+    /// Props per square meter; the preset's own density by default.
+    density: Option<f32>,
+    /// Line presets: segment start [x,z] in meters.
+    from: Option<[f32; 2]>,
+    /// Line presets: segment end [x,z] in meters.
+    to: Option<[f32; 2]>,
+    /// Line presets: spacing in meters; the preset's step by default.
+    step: Option<f32>,
+    /// Determinism seed; omit to draw one (it comes back in the answer and is stored).
+    seed: Option<u64>,
+    /// Name prefix for the created objects; default the scene name.
+    prefix: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PPropGrid {
+    /// Scene ID; omit to use the active scene.
+    scene: Option<u64>,
+    /// Catalog entry name from catalog_query (e.g. chair, stool, box, room_kitchen). A furnished room places its furniture too.
+    prop: String,
+    /// Name prefix for the created objects; default the prop name.
+    prefix: Option<String>,
+    /// Rows along +Z; 1 or more (rows*cols <= 256).
+    rows: u32,
+    /// Columns along +X; 1 or more (rows*cols <= 256).
+    cols: u32,
+    /// Position of the first (row 0, col 0) object [x,y,z] in meters.
+    origin: [f32; 3],
+    /// Explicit spacing [dx, dz] in meters; default the prop's size times gap.
+    step: Option<[f32; 2]>,
+    /// Gap factor for the default step: size*gap; default 1.2 (items do not touch).
+    gap: Option<f32>,
+    /// Yaw in degrees about +Y for every item.
+    yaw_deg: Option<f32>,
+    /// Pitch in degrees for every item.
+    pitch_deg: Option<f32>,
+    /// Roll in degrees for every item.
+    roll_deg: Option<f32>,
+    /// Uniform or per-axis scale, each finite and > 0.
+    scale: Option<[f32; 3]>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -2058,11 +2170,11 @@ struct PPropAdd {
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct PShotReport {
+struct PCameraReport {
     /// Scene ID; omit to use the active scene.
     scene: Option<u64>,
-    /// Shot ID to report on.
-    shot: u64,
+    /// Camera ID to report on.
+    camera: u64,
     /// Sample every Nth frame; omit for up to 5 evenly spaced frames (hard cap 12 frames either way).
     every: Option<u32>,
     /// Render width in pixels, 1..=4096; defaults 480.
@@ -2094,8 +2206,8 @@ struct PRenderStill { /// Scene ID; omit to use the active scene.
     scene: Option<u64>, /// Integer scene frame at fixed 24 fps.
     frame: i64, /// PNG width in pixels, 1..=4096; omit for 1024x576, or 480x270 when report=true.
     width: Option<u32>, /// PNG height in pixels, 1..=4096; omit for 1024x576, or 480x270 when report=true.
-    height: Option<u32>, /// Optional shot ID selecting its camera.
-    shot: Option<u64>, /// True adds pure frame metrics (mean_luma/luma_p5/luma_p95 over opaque pixels, empty_coverage = alpha==0 share, objects_in_frame/objects_total = forged Mesh3d visibility, non-cryptographic scene_digest) to structuredContent; pairs with the cheap 480x270 default.
+    height: Option<u32>, /// Optional camera ID selecting its view.
+    camera: Option<u64>, /// True adds pure frame metrics (mean_luma/luma_p5/luma_p95 over opaque pixels, empty_coverage = alpha==0 share, objects_in_frame/objects_total = forged Mesh3d visibility, non-cryptographic scene_digest) to structuredContent; pairs with the cheap 480x270 default.
     report: Option<bool> }
 
 /// Default render_still sizes: a normal frame is 1024x576, a cheap
@@ -2143,53 +2255,6 @@ struct PMute { /// Global audio track ID.
 struct PClipRemove { /// Global audio track ID.
     track: u64, /// Audio clip ID on the track.
     clip: u64 }
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct PTakeAdd { /// Scene ID; omit to use the active scene.
-    scene: Option<u64>, /// Phantom actor ID in the scene.
-    phantom: u64, /// Non-empty human-readable take name.
-    name: String, /// Optional first frame; defaults to minimum motion frame; range is [start,end).
-    start: Option<i64>, /// Optional end-exclusive frame; defaults to maximum motion frame + 1.
-    end: Option<i64>, /// Non-empty typed controller keys used by this take.
-    motion: Vec<MotionEntry> }
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct PTakeActive { /// Scene ID; omit to use the active scene.
-    scene: Option<u64>, /// Phantom actor ID in the scene.
-    phantom: u64, /// Take ID; null selects manual motion (take_remove requires an ID).
-    take: Option<u64> }
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct PPhantomClip {
-    /// Scene ID; omit to use the active scene.
-    scene: Option<u64>,
-    /// Phantom actor ID in the scene.
-    phantom: u64,
-    /// Motion FBX asset ID; null clears legacy clip mode.
-    clip: Option<u64>,
-    /// Optional first integer frame for track mode; range is [start,end).
-    start: Option<i64>,
-    /// Optional end-exclusive integer frame for track mode; required with start.
-    end: Option<i64>,
-    /// Playback speed multiplier, finite and >0; defaults 1.
-    speed: Option<f32>,
-    /// Blend-in duration in seconds, finite and >=0.
-    blend_in: Option<f32>,
-    /// Blend-out duration in seconds, finite and >=0.
-    blend_out: Option<f32>,
-    /// Animation stack name; null selects the longest stack.
-    stack: Option<String>,
-    /// Root-motion owner: controller (default) or clip.
-    root_motion: Option<String>,
-    /// Optional retarget profile: humanoid or quadruped.
-    retarget: Option<String>,
-}
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct PClipUseRef { /// Scene ID; omit to use the active scene.
-    scene: Option<u64>, /// Phantom actor ID in the scene.
-    phantom: u64, /// Clip-use ID in the actor track.
-    clip_use: u64 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PAssetRef { /// Imported asset ID.
@@ -2262,25 +2327,38 @@ impl ServerHandler for PhantomMcp {
         info.server_info.name = "phantom-animate".into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
         info.instructions = Some(
-            "Phantom-animate: command-first animation staging. Start with studio_capabilities, then \
+            "Phantom-animate: command-first layout staging for a playblast. Start with studio_capabilities, then \
              project_new/project_open and scene_add; a new scene or the first opened scene becomes active. \
              scene_select/scene_current control the active scene of this MCP session only; the scene parameter of \
              scene tools may be omitted, and with no selection no_active_scene is returned. state_get includes \
              active_scene and allowed_root. Frames are integers at 24 fps, ranges are always [start,end) with end \
-             exclusive; coordinates are in meters, Y up. MCP angles are yaw_deg/pitch_deg/roll_deg in degrees \
-             (core stores radians). Audio MCP accepts seconds and converts them to 48 kHz. motion_replace/take_add \
-             take typed {frame,pos,action,yaw_deg?}; key_set preserves omitted fields by default. brush_stroke sets \
+             exclusive; coordinates are in meters, Y up. Each scene has a stage: the box actors and props are \
+             confined to (stage_set/stage_get; presets small 10x10x4 m, medium 30x20x8, large 80x60x20, or an \
+             explicit width+height+depth). Every placement command clamps the entity's whole bounding box into \
+             the stage, and the answer then carries clamped:true plus clamps[] with the coordinates before and \
+             after — a position you sent may have been corrected. validate reports out_of_stage for a document \
+             that predates the stage. MCP angles are yaw_deg/pitch_deg/roll_deg in degrees \
+             (core stores radians). Actors are NOT animated: key_set/motion_replace place a figure with a held pose \
+             — typed keys are {frame,pos,pose,yaw_deg?}, where pose is stand|sit|lie and the species must have it \
+             (builtin_catalog lists the poses per actor; an unavailable pose is unsupported_pose). Position and yaw \
+             interpolate between keys, the pose switches at its own key. An imported rig has no poses and renders in \
+             bind pose. key_set preserves omitted fields (pose included) by default. Audio MCP accepts seconds and \
+             converts them to 48 kHz. brush_stroke sets \
              canvas/screen/ndc explicitly and normalizes to 1920x1080. render_scene writes frames/ inside \
              allowed_root by default; render_still is available standalone and over the bridge, and requires a GPU; \
              report=true gives mean_luma/luma_p5/luma_p95/empty_coverage/scene_digest plus a cheap 480x270 \
              preview — this stands in for the agent's eyes (check lighting and frame emptiness before a full \
-             render). audio_report before rendering shows track/clip durations against the video and the RMS/peak \
+             render). A scene holds a list of cameras (camera_add/camera_remove/camera_select); one camera is \
+             active and is the view a render without a camera uses. A camera can be attached to a moving subject \
+             in two modes (camera_target_set: track stand-and-turn, follow travels-with-it), and every camera key \
+             must keep the camera looking at the scene (at least 20 % of the stage volume in frame). \
+             audio_report before rendering shows track/clip durations against the video and the RMS/peak \
              of the fragments actually used: \"music 360 s vs a 2 s film\" and a quiet offset are visible there; \
              film_add warns when a clip is shorter than the scene's longest track; state_get carries audio_summary. \
              Lighting: light_add (point/spot/directional, degrees, lumens/lux) plus light_key_set/light_key_remove \
              animate pose, intensity and on/off per frame; scene_ambient_set (from_background|fixed|off) and \
              scene_sky_set (null = transparency) control the frame background. Getters are queries: \
-             shot_get/asset_get/film_get return canonical snapshots carrying the current revision and do not bump \
+             camera_get/asset_get/film_get return canonical snapshots carrying the current revision and do not bump \
              it; project_recent returns the last successfully created/opened project and the current directory with \
              no open project. job_wait waits for a job up to timeout_secs (0..=300) and returns the job_status \
              shape plus timed_out; a timeout does not cancel the job. describe {tool} returns the exact \
@@ -2292,11 +2370,14 @@ impl ServerHandler for PhantomMcp {
              deterministically, so scene→phantom→key chains work inside one package. Pure diagnostics without \
              render and GPU: validate {scene?} runs the invariants (screen, FOV coverage, motion gaps, \
              audio/editing ranges, files) and returns findings with code/severity/where/why/suggested_fix (without \
-             scene and without an active scene — the whole project); camera_coverage {scene?, frame?, shot?, \
+             scene and without an active scene — the whole project); camera_coverage {scene?, frame?, camera?, \
              aspect?} — screen coverage of the frame and in_frame points (angles in the response are degrees, \
-             aspect defaults to 16:9); background_fit {scene?, frame?, shot?, margin_deg?, aspect?} — suggested \
-             screen geometry with a margin_deg safety margin (5° by default) and panorama_aspect for a panorama \
-             generator; all three are queries and do not bump the revision. structuredContent is the \
+             aspect defaults to 16:9); background_fit {scene?, frame?, camera?, margin_deg?, aspect?} — suggested \
+             the flat screen size that closes the frame at its current plane, with a margin_deg safety margin (5° by \
+             default), size_covers false when no size helps (move the screen with background_set) and \
+             panorama_aspect for a panorama generator; all three are queries and do not bump the revision. prop_grid \
+             places a row or grid of catalog props in one atomic step (one undo), with the spacing derived from the \
+             prop's own size. structuredContent is the \
              authoritative result; ordinary content is empty except for the render_still image block."
                 .into(),
         );
@@ -2344,7 +2425,7 @@ mod contract_tests {
         }))
         .unwrap_err();
         assert!(err.to_string().contains("colr"));
-        let err = serde_json::from_value::<PCamera>(serde_json::json!({
+        let err = serde_json::from_value::<PCameraKey>(serde_json::json!({
             "scene": 1,
             "frame": 0,
             "pos": [0.0, 0.0, 0.0],
@@ -2354,7 +2435,7 @@ mod contract_tests {
         assert!(err.to_string().contains("target"));
         for schema in [
             rmcp::handler::server::tool::schema_for_type::<PSkySet>(),
-            rmcp::handler::server::tool::schema_for_type::<PCamera>(),
+            rmcp::handler::server::tool::schema_for_type::<PCameraKey>(),
         ] {
             assert_eq!(serde_json::to_value(schema).unwrap()["additionalProperties"], false);
         }
@@ -2461,7 +2542,7 @@ mod contract_tests {
 
         let invalid = call(
             &server,
-            Op::RenderStill { scene: 1, frame: 0, width: 0, height: 64, shot: None, report: false },
+            Op::RenderStill { scene: 1, frame: 0, width: 0, height: 64, camera: None, report: false },
         );
         assert_eq!(assert_structured(&invalid, true)["code"], "invalid_input");
 
@@ -2482,8 +2563,7 @@ mod contract_tests {
                 width: 64,
                 height: 64,
                 frames: None,
-                shot: None,
-                twos: false,
+                camera: None,
             },
         );
         assert_eq!(assert_structured(&forbidden, true)["code"], "path_forbidden");
@@ -2515,10 +2595,10 @@ mod contract_tests {
 
     #[test]
     fn render_still_has_image_and_metadata_without_base64_duplication() {
-        let result = render_still_result(Ok(serde_json::json!({
+        let result = image_result(Ok(serde_json::json!({
             "scene": 4,
             "frame": 12,
-            "shot": 9,
+            "camera": 9,
             "width": 320,
             "height": 180,
             "mime_type": "image/png",
@@ -2530,7 +2610,7 @@ mod contract_tests {
         let metadata = result.structured_content.as_ref().unwrap();
         assert_eq!(metadata["scene"], 4);
         assert_eq!(metadata["frame"], 12);
-        assert_eq!(metadata["shot"], 9);
+        assert_eq!(metadata["camera"], 9);
         assert_eq!(metadata["width"], 320);
         assert_eq!(metadata["height"], 180);
         assert_eq!(metadata["mime_type"], "image/png");
@@ -2561,9 +2641,9 @@ mod contract_tests {
 
         // render_still is routed through the bridge too. Invalid dimensions
         // fail before GPU creation, so parity is covered without rendering.
-        let still = Op::RenderStill { scene: 1, frame: 0, width: 0, height: 64, shot: None, report: false };
-        let standalone_still = standalone(Session::new()).exec_render_still(still.clone()).unwrap();
-        let bridge_still = bridge_once(Session::new()).exec_render_still(still).unwrap();
+        let still = Op::RenderStill { scene: 1, frame: 0, width: 0, height: 64, camera: None, report: false };
+        let standalone_still = standalone(Session::new()).exec_image(still.clone()).unwrap();
+        let bridge_still = bridge_once(Session::new()).exec_image(still).unwrap();
         assert_eq!(wire(&standalone_still), wire(&bridge_still));
         assert_eq!(bridge_still.structured_content.as_ref().unwrap()["code"], "invalid_input");
     }
@@ -2624,16 +2704,16 @@ mod contract_tests {
     }
 
     #[test]
-    fn key_preserve_lighting_patch_and_typed_take_inference() {
+    fn key_preserve_lighting_patch_and_pose_defaults() {
         let mut session = Session::new();
         session.project = Some(phantom_core::Project::new("ergonomics"));
         let scene = session.execute(Op::SceneAdd { name: "s".into(), start: 0, end: 48 }).unwrap()["scene"].as_u64().unwrap();
         let phantom = session.execute(Op::PhantomAdd { scene, name: "p".into(), rig_asset: None, rig_actor: None }).unwrap()["phantom"].as_u64().unwrap();
-        session.execute(Op::KeySet { scene, phantom, frame: 8, pos: [1.0, 2.0, 3.0], action: phantom_core::Action::Walk, yaw: 0.25 }).unwrap();
+        session.execute(Op::KeySet { scene, phantom, frame: 8, pos: [1.0, 2.0, 3.0], pose: phantom_core::ActorPose::Sit, yaw: 0.25 }).unwrap();
         let server = standalone(session);
 
         let changed = block_on(server.key_set(Parameters(PKey {
-            scene: None, phantom, frame: 8, pos: None, action: None, yaw_deg: Some(90.0), preserve: None,
+            scene: None, phantom, frame: 8, pos: None, pose: None, yaw_deg: Some(90.0), preserve: None,
         }))).unwrap();
         assert_structured(&changed, false);
         let patched = block_on(server.scene_lighting_set(Parameters(PLightingSet {
@@ -2643,25 +2723,31 @@ mod contract_tests {
             rim: None,
         }))).unwrap();
         assert_structured(&patched, false);
-        let take = block_on(server.take_add(Parameters(PTakeAdd {
-            scene: None, phantom, name: "typed".into(), start: None, end: None,
-            motion: vec![MotionEntry { frame: 10, pos: [0.0; 3], action: "walk".into(), yaw_deg: Some(180.0) }],
+        // A pose the species does not have is refused at the MCP boundary —
+        // checked before the session mutex is taken below.
+        let horse = block_on(server.phantom_add(Parameters(PPhantom {
+            scene: None, name: "horse".into(), rig_asset: None, rig_actor: Some("horse".into()),
         }))).unwrap();
-        assert_structured(&take, false);
+        let horse = assert_structured(&horse, false)["phantom"].as_u64().unwrap();
+        let refused = block_on(server.key_set(Parameters(PKey {
+            scene: None, phantom: horse, frame: 0, pos: None, pose: Some("sit".into()), yaw_deg: None, preserve: None,
+        }))).unwrap();
+        let refused = assert_structured(&refused, true);
+        assert_eq!(refused["code"], "unsupported_pose");
+        assert_eq!(refused["details"]["actor"], "horse");
+        assert_eq!(refused["details"]["pose"], "sit");
 
         let Backend::Standalone(session) = &*server.backend else { unreachable!() };
         let guard = session.lock().unwrap();
         let scene_doc = &guard.project.as_ref().unwrap().scenes[&phantom_core::SceneId(scene)];
         let key = scene_doc.phantoms[&phantom_core::PhantomId(phantom)].motion.iter().find(|k| k.frame == 8).unwrap();
         assert_eq!(key.position.to_array(), [1.0, 2.0, 3.0]);
-        assert_eq!(key.action, phantom_core::Action::Walk);
+        assert_eq!(key.pose, phantom_core::ActorPose::Sit, "the omitted pose is preserved from the exact key");
         assert!((key.yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
         assert_eq!(scene_doc.lighting.key, phantom_core::SceneLighting::default().key);
         assert_eq!(scene_doc.lighting.fill.intensity, 123.0);
         assert!(!scene_doc.lighting.fill.enabled);
-        let take = &scene_doc.phantoms[&phantom_core::PhantomId(phantom)].takes[0];
-        assert_eq!((take.range.start, take.range.end), (10, 11));
-        assert!((take.motion[0].yaw - std::f32::consts::PI).abs() < 1e-6);
+        assert_eq!(scene_doc.phantoms.len(), 2, "the refused horse key did not create a phantom");
     }
 
     #[test]
@@ -2934,19 +3020,19 @@ mod contract_tests {
         let mut session = Session::new();
         session.project = Some(phantom_core::Project::new("camera-mcp"));
         session.execute(Op::SceneAdd { name: "s".into(), start: 0, end: 48 }).unwrap();
-        session.execute(Op::ShotAdd { scene: 1, name: "wide".into(), start: 0, end: 24 }).unwrap();
+        session.execute(Op::CameraAdd { scene: 1, name: "wide".into(), start: Some(0), end: Some(24) }).unwrap();
         let server = standalone(session);
 
         // look_at without angles: the program computes yaw/pitch; tilt and preset are supplied.
-        let aimed = block_on(server.shot_camera_key_set(Parameters(PShotCamKey {
-            scene: None, shot: 2, frame: 0, pos: [0.0, 1.5, 0.0], yaw_deg: None, pitch_deg: None,
+        let aimed = block_on(server.camera_key_set(Parameters(PCameraKey {
+            scene: None, camera: Some(2), frame: 0, pos: [0.0, 1.5, 0.0], yaw_deg: None, pitch_deg: None,
             roll_deg: Some(6.0), look_at: Some([0.0, 1.5, -5.0]),
             focal_mm: None, focal_preset: Some("portrait".into()), ease: Some("ease_in_out".into()),
         }))).unwrap();
         assert_structured(&aimed, false);
         let Backend::Standalone(session) = &*server.backend else { unreachable!() };
         let guard = session.lock().unwrap();
-        let key = &guard.project.as_ref().unwrap().scenes[&phantom_core::SceneId(1)].shots[&phantom_core::ShotId(2)].camera.keys[0];
+        let key = &guard.project.as_ref().unwrap().scenes[&phantom_core::SceneId(1)].cameras[&phantom_core::CameraId(2)].camera.keys[0];
         assert_eq!(key.look_at, Some(glam::Vec3::new(0.0, 1.5, -5.0)));
         assert!((key.roll.to_degrees() - 6.0).abs() < 1e-3, "roll in degrees out");
         assert_eq!(key.focal_mm, Some(50.0), "portrait = 50 mm");
@@ -2955,24 +3041,41 @@ mod contract_tests {
 
         // Unknown preset and unknown ease — invalid_input, not a silent default.
         let bad_preset = block_on(server.camera_key_set(Parameters(PCameraKey {
-            scene: None, shot: None, frame: 0, pos: [0.0, 1.4, 4.0], yaw_deg: Some(0.0), pitch_deg: None,
+            scene: None, camera: None, frame: 0, pos: [0.0, 1.4, 4.0], yaw_deg: Some(0.0), pitch_deg: None,
             roll_deg: None, look_at: None, focal_mm: None, focal_preset: Some("cinemascope".into()), ease: None,
         }))).unwrap();
         assert_eq!(assert_structured(&bad_preset, true)["code"], "invalid_input");
         let bad_ease = block_on(server.camera_key_set(Parameters(PCameraKey {
-            scene: None, shot: None, frame: 0, pos: [0.0, 1.4, 4.0], yaw_deg: Some(0.0), pitch_deg: None,
+            scene: None, camera: None, frame: 0, pos: [0.0, 1.4, 4.0], yaw_deg: Some(0.0), pitch_deg: None,
             roll_deg: None, look_at: None, focal_mm: Some(35.0), focal_preset: None, ease: Some("bounce".into()),
         }))).unwrap();
         assert_eq!(assert_structured(&bad_ease, true)["code"], "invalid_input");
 
-        // Shot focal key: zoom inside a shot without changing the pose.
-        let zoom = block_on(server.shot_focal_key_set(Parameters(PShotFocalKey { scene: None, shot: 2, frame: 12, focal_mm: None, focal_preset: Some("tele".into()) }))).unwrap();
+        // Camera focal key: zoom inside the camera's range without changing the pose.
+        let zoom = block_on(server.camera_focal_key_set(Parameters(PCameraFocalKey { scene: None, camera: 2, frame: 12, focal_mm: 135.0 }))).unwrap();
         assert_structured(&zoom, false);
         let guard = session.lock().unwrap();
-        let cam = &guard.project.as_ref().unwrap().scenes[&phantom_core::SceneId(1)].shots[&phantom_core::ShotId(2)].camera;
+        let cam = &guard.project.as_ref().unwrap().scenes[&phantom_core::SceneId(1)].cameras[&phantom_core::CameraId(2)].camera;
         let key12 = cam.keys.iter().find(|k| k.frame == 12).expect("focal key added");
         assert_eq!(key12.focal_mm, Some(135.0));
         assert_eq!(cam.sample(6).focal_mm, 92.5, "focal interpolates between 50 and 135");
+    }
+
+    #[test]
+    fn camera_target_set_rejects_bad_mode_and_subject() {
+        let mut session = Session::new();
+        session.project = Some(phantom_core::Project::new("camera-target-mcp"));
+        let server = standalone(session);
+        block_on(server.scene_add(Parameters(PSceneAdd { name: "main".into(), start: 0, end: 48 }))).unwrap();
+        // The scene's own camera (id 0) always exists, so only mode/subject can fail.
+        let bad_mode = block_on(server.camera_target_set(Parameters(PCameraTargetSet {
+            scene: None, camera: 0, mode: Some("orbit".into()), subject: Some("phantom:1".into()), clear: None,
+        }))).unwrap();
+        assert_eq!(assert_structured(&bad_mode, true)["code"], "invalid_input");
+        let bad_subject = block_on(server.camera_target_set(Parameters(PCameraTargetSet {
+            scene: None, camera: 0, mode: Some("track".into()), subject: Some("nobody".into()), clear: None,
+        }))).unwrap();
+        assert_eq!(assert_structured(&bad_subject, true)["code"], "invalid_input");
     }
 
     #[test]
@@ -3051,13 +3154,13 @@ mod contract_tests {
 
         let added = block_on(server.batch(Parameters(PBatch { ops: vec![
             serde_json::json!({"op":"phantom_add","name":"hero","rig_actor":"wolf"}),
-            serde_json::json!({"op":"key_set","phantom":2,"frame":0,"pos":[0,0,0],"action":"Walk","yaw":0.5}),
-            serde_json::json!({"op":"shot_add","name":"close","start":0,"end":24}),
+            serde_json::json!({"op":"key_set","phantom":2,"frame":0,"pos":[0,0,0],"pose":"sit","yaw":0.5}),
+            serde_json::json!({"op":"camera_add","name":"close","start":0,"end":24}),
         ] }))).unwrap();
         let value = assert_structured(&added, false);
         assert_eq!(value["applied"], 3);
         assert_eq!(value["revision"], 2, "scene_add + one batch = two revisions");
-        assert_eq!(value["entity"]["kind"], "shot");
+        assert_eq!(value["entity"]["kind"], "camera");
         let results = value["results"].as_array().unwrap();
         assert_eq!(results[0]["phantom"], 2);
         assert_eq!(results[1]["entity"]["kind"], "motion_key");
@@ -3067,7 +3170,7 @@ mod contract_tests {
         let guard = session.lock().unwrap();
         let scene = &guard.project.as_ref().unwrap().scenes[&phantom_core::SceneId(1)];
         assert!(scene.phantoms.contains_key(&phantom_core::PhantomId(2)));
-        assert_eq!(scene.shots.len(), 1);
+        assert_eq!(scene.cameras.len(), 2, "the scene's own camera plus the added one");
         drop(guard);
 
         // A parse error carries the operation index.
@@ -3080,18 +3183,18 @@ mod contract_tests {
         let before = call(&server, Op::StateGet);
         let revision_before = before.structured_content.as_ref().unwrap()["revision"].as_u64().unwrap();
         let failed = block_on(server.batch(Parameters(PBatch { ops: vec![
-            serde_json::json!({"op":"shot_add","name":"temp","start":0,"end":10}),
-            serde_json::json!({"op":"shot_remove","shot":999}),
+            serde_json::json!({"op":"camera_add","name":"temp","start":0,"end":10}),
+            serde_json::json!({"op":"camera_remove","camera":999}),
         ] }))).unwrap();
         let error = assert_structured(&failed, true);
         assert_eq!(error["code"], "batch_failed");
         assert_eq!(error["details"]["index"], 1);
-        assert_eq!(error["details"]["op"], "shot_remove");
+        assert_eq!(error["details"]["op"], "camera_remove");
         assert_eq!(error["details"]["code"], "not_found");
         let after = call(&server, Op::StateGet);
         let structured = after.structured_content.as_ref().unwrap();
         assert_eq!(structured["revision"].as_u64().unwrap(), revision_before, "a rolled-back batch does not move the revision");
-        assert_eq!(structured["shots"].as_array().unwrap().len(), 1, "the temporary shot was rolled back");
+        assert_eq!(structured["cameras"].as_array().unwrap().len(), 2, "the temporary camera was rolled back");
 
         // Bridge parity: the same package over the bridge yields the same structure.
         let mut bridge_session = Session::new();
@@ -3109,13 +3212,13 @@ mod contract_tests {
     fn describe_is_generated_from_tool_router_metadata_without_drift() {
         let server = standalone(Session::new());
         let tools = PhantomMcp::tool_router().list_all();
-        let expected = tools.iter().find(|t| t.name.as_ref() == "shot_get").expect("shot_get registered");
+        let expected = tools.iter().find(|t| t.name.as_ref() == "camera_get").expect("camera_get registered");
 
-        let result = block_on(server.describe(Parameters(PDescribe { tool: "shot_get".into() }))).unwrap();
+        let result = block_on(server.describe(Parameters(PDescribe { tool: "camera_get".into() }))).unwrap();
         let structured = assert_structured(&result, false);
         // Field-for-field identity with the tools/list entry: describe cannot
         // drift because both come from the same ToolRouter metadata.
-        assert_eq!(structured["name"], "shot_get");
+        assert_eq!(structured["name"], "camera_get");
         assert_eq!(structured["description"].as_str().unwrap(), expected.description.as_deref().unwrap_or_default());
         assert_eq!(structured["inputSchema"], serde_json::to_value(&expected.input_schema).unwrap());
         assert_eq!(structured["outputSchema"], serde_json::to_value(&expected.output_schema).unwrap());
@@ -3136,12 +3239,12 @@ mod contract_tests {
         }
 
         // Unknown tool: stable not_found with nearest registered names.
-        let missing = block_on(server.describe(Parameters(PDescribe { tool: "shot_gett".into() }))).unwrap();
+        let missing = block_on(server.describe(Parameters(PDescribe { tool: "camera_gett".into() }))).unwrap();
         let error = assert_structured(&missing, true);
         assert_eq!(error["code"], "not_found");
         assert_eq!(error["details"]["entity"], "tool");
         let nearest: Vec<&str> = error["details"]["nearest_tools"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        assert!(nearest.contains(&"shot_get"), "nearest tools for shot_gett: {nearest:?}");
+        assert!(nearest.contains(&"camera_get"), "nearest tools for camera_gett: {nearest:?}");
         assert!(nearest.len() <= 5);
     }
 
@@ -3171,14 +3274,14 @@ mod contract_tests {
             let mut session = Session::new();
             session.project = Some(phantom_core::Project::new(name));
             let scene = session.execute(Op::SceneAdd { name: "main".into(), start: 0, end: 48 }).unwrap()["scene"].as_u64().unwrap();
-            let shot = session.execute(Op::ShotAdd { scene, name: "wide".into(), start: 0, end: 24 }).unwrap()["shot"].as_u64().unwrap();
-            session.execute(Op::FilmAdd { scene, start: 0, end: 24, shot: Some(shot) }).unwrap();
-            (session, scene, shot)
+            let camera = session.execute(Op::CameraAdd { scene, name: "wide".into(), start: Some(0), end: Some(24) }).unwrap()["camera"].as_u64().unwrap();
+            session.execute(Op::FilmAdd { scene, start: 0, end: 24, camera: Some(camera) }).unwrap();
+            (session, scene, camera)
         };
-        let (standalone_session, scene, shot) = build("parity-a");
+        let (standalone_session, scene, camera) = build("parity-a");
         let (bridge_session, _, _) = build("parity-b");
         // Shared Session Op means the bridge returns the identical structured shape.
-        let op = Op::ShotGet { scene, shot };
+        let op = Op::CameraGet { scene, camera };
         assert_eq!(wire(&call(&standalone(standalone_session), op.clone())), wire(&call(&bridge_once(bridge_session), op)));
 
         let (standalone_session, _, _) = build("parity-c");
@@ -3209,13 +3312,49 @@ mod contract_tests {
     }
 
     #[test]
+    fn stage_tools_clamp_and_report_over_the_mcp_envelope() {
+        let mut session = Session::new();
+        session.project = Some(phantom_core::Project::new("stage-mcp"));
+        let server = standalone(session);
+        let added = block_on(server.scene_add(Parameters(PSceneAdd { name: "main".into(), start: 0, end: 48 }))).unwrap();
+        let scene = assert_structured(&added, false)["scene"].as_u64().unwrap();
+
+        let got = block_on(server.stage_get(Parameters(PSceneRef { scene: None }))).unwrap();
+        let got = assert_structured(&got, false);
+        assert_eq!(got["stage"]["preset"], "medium");
+        assert_eq!(got["stage"]["size"]["height"].as_f64().unwrap(), 8.0);
+        assert!(got.get("revision").is_none(), "stage_get is a query");
+
+        let set = block_on(server.stage_set(Parameters(PStageSet { scene: None, preset: Some("small".into()), width: None, height: None, depth: None, center: None }))).unwrap();
+        let set = assert_structured(&set, false);
+        assert_eq!(set["stage"]["preset"], "small");
+        assert!(set.get("revision").is_some(), "stage_set is a mutation");
+        assert_eq!(set["entity"]["kind"], "stage");
+
+        // A phantom key outside the small stage comes back corrected.
+        let ph = block_on(server.phantom_add(Parameters(PPhantom { scene: None, name: "actor".into(), rig_asset: None, rig_actor: Some("humanoid".into()) }))).unwrap();
+        let phantom = assert_structured(&ph, false)["phantom"].as_u64().unwrap();
+        let keyed = block_on(server.key_set(Parameters(PKey { scene: None, phantom, frame: 0, pos: Some([90.0, 0.0, 0.0]), pose: Some("stand".into()), yaw_deg: None, preserve: None }))).unwrap();
+        let keyed = assert_structured(&keyed, false);
+        assert_eq!(keyed["clamped"], true);
+        assert_eq!(keyed["clamps"][0]["kind"], "phantom");
+        assert!((keyed["clamps"][0]["to"][0].as_f64().unwrap() - 4.7).abs() < 1e-4);
+
+        // A half-specified stage is invalid_input before any mutation.
+        let bad = block_on(server.stage_set(Parameters(PStageSet { scene: Some(scene), preset: None, width: Some(4.0), height: None, depth: None, center: None }))).unwrap();
+        assert_eq!(assert_structured(&bad, true)["code"], "invalid_input");
+        let bad_preset = block_on(server.stage_set(Parameters(PStageSet { scene: Some(scene), preset: Some("huge".into()), width: None, height: None, depth: None, center: None }))).unwrap();
+        assert_eq!(assert_structured(&bad_preset, true)["code"], "invalid_input");
+    }
+
+    #[test]
     fn diagnostics_tools_contract_active_scene_and_no_revision() {
         let mut session = Session::new();
         session.project = Some(phantom_core::Project::new("diag"));
         let server = standalone(session);
 
         // camera_coverage without scene and without an active scene: stable no_active_scene.
-        let missing = block_on(server.camera_coverage(Parameters(PCameraCoverage { scene: None, frame: None, shot: None, aspect: None }))).unwrap();
+        let missing = block_on(server.camera_coverage(Parameters(PCameraCoverage { scene: None, frame: None, camera: None, aspect: None }))).unwrap();
         assert_eq!(assert_structured(&missing, true)["code"], "no_active_scene");
         // validate without any scene resolves to the whole project (empty here).
         let whole = block_on(server.validate(Parameters(PValidate { scene: None }))).unwrap();
@@ -3232,7 +3371,7 @@ mod contract_tests {
             session.lock().unwrap().project.as_ref().unwrap().revision
         };
 
-        let cov = block_on(server.camera_coverage(Parameters(PCameraCoverage { scene: None, frame: None, shot: None, aspect: None }))).unwrap();
+        let cov = block_on(server.camera_coverage(Parameters(PCameraCoverage { scene: None, frame: None, camera: None, aspect: None }))).unwrap();
         let structured = assert_structured(&cov, false);
         assert_eq!(structured["scene"].as_u64().unwrap(), scene);
         assert_eq!(structured["frame"], 0);
@@ -3243,10 +3382,11 @@ mod contract_tests {
         assert_eq!(structured["background"], serde_json::Value::Null, "no background yet");
         assert_eq!(structured["findings"][0]["code"], "background_absent");
 
-        let fit = block_on(server.background_fit(Parameters(PBackgroundFit { scene: None, frame: None, shot: None, margin_deg: None, aspect: None }))).unwrap();
+        let fit = block_on(server.background_fit(Parameters(PBackgroundFit { scene: None, frame: None, camera: None, margin_deg: None, aspect: None }))).unwrap();
         let structured = assert_structured(&fit, false);
         assert_eq!(structured["margin_deg"], 5.0);
-        assert!(structured["suggested"]["arc_deg"].as_f64().unwrap() > 0.0);
+        assert!(structured["suggested"]["width"].as_f64().unwrap() > 0.0);
+        assert!(structured["suggested"]["height"].as_f64().unwrap() > 0.0);
         assert!(structured["panorama_aspect"].as_f64().unwrap() > 0.0);
 
         let report = block_on(server.validate(Parameters(PValidate { scene: None }))).unwrap();
