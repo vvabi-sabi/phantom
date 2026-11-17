@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::HUMAN_ROLES;
 use crate::error::CoreError;
-use crate::project::BuiltinActor;
 use crate::scatter::SeedRng;
 
 /// People in one crowd. A skinned humanoid is heavier than a prop, and every
@@ -26,11 +25,20 @@ pub const MAX_CROWD_PHANTOMS: usize = 128;
 /// reads as one mass from a camera, far enough that two people do not swap arms.
 pub const CROWD_SPACING: f32 = 0.8;
 
+/// How far a scattered person may drift off their grid point, as a fraction of
+/// the cell. The closest two neighbors then cannot come nearer than 2/3 of the
+/// spacing (0.53 m at the default 0.8). Half a cell reads wilder and put two
+/// people 0.2 m apart in a smoke test — bodies through bodies, which is the one
+/// thing a crowd generator may never do. [`crowd_footprint`] bounds the same
+/// shape, so the two must not drift apart.
+const JITTER_FRACTION: f32 = 1.0 / 6.0;
+
 /// A person the planner put somewhere.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlacedPerson {
-    /// Wire actor name (`adult`, `child`, `teen`, `elder`) — what a phantom is
-    /// created with.
+    /// Human role from [`crate::catalog::HUMAN_ROLES`] (`adult|child|teen|
+    /// elder`). The core speaks roles; turning one into a rig name belongs to the
+    /// surface that creates a phantom.
     pub actor: &'static str,
     /// Local position, feet on `y = 0`, in the crowd's own frame: +X across the
     /// formation, -Z the direction it faces.
@@ -135,26 +143,6 @@ fn roles_of(mix: &CrowdMix) -> Vec<(&'static str, f32)> {
     }
 }
 
-fn actor_of(role: &str) -> BuiltinActor {
-    match role {
-        "child" => BuiltinActor::Child,
-        "teen" => BuiltinActor::Teen,
-        "elder" => BuiltinActor::Elder,
-        _ => BuiltinActor::Humanoid,
-    }
-}
-
-/// The wire name a phantom is created with, and the same table the catalog
-/// measures roles by — one source for what "child" means.
-fn wire_of(actor: BuiltinActor) -> &'static str {
-    match actor {
-        BuiltinActor::Child => "child",
-        BuiltinActor::Teen => "teen",
-        BuiltinActor::Elder => "elder",
-        _ => "adult",
-    }
-}
-
 fn pick_role(roles: &[(&'static str, f32)], rng: &mut SeedRng) -> &'static str {
     let total: f32 = roles.iter().map(|(_, w)| *w).sum();
     let mut roll = rng.next_f32() * total;
@@ -178,7 +166,9 @@ fn grid_of(count: usize, forced: Option<usize>) -> (usize, usize) {
 }
 
 /// The spot of person `i` in a formation of `count`, in the crowd's local frame.
-/// Pure geometry: no randomness, so a test can assert the shape without a seed.
+/// Four of the five shapes are pure geometry — a test can assert them without a
+/// seed. `scattered` is the exception: its jitter comes from `rng`, which is why
+/// [`crowd_footprint`] measures that shape's envelope from the grid instead.
 fn slot(formation: CrowdFormation, spec: &CrowdSpec, i: usize, rng: &mut SeedRng) -> [f32; 2] {
     let d = spec.spacing;
     match formation {
@@ -217,14 +207,9 @@ fn slot(formation: CrowdFormation, spec: &CrowdSpec, i: usize, rng: &mut SeedRng
             let (rows, cols) = grid_of(spec.count, spec.rows);
             let ix = i % cols;
             let iz = i / cols;
-            // Jitter is capped at a sixth of the cell, so the closest two
-            // neighbors cannot come nearer than 2/3 of the spacing (0.53 m at the
-            // default 0.8). Half a cell reads wilder and put two people 0.2 m
-            // apart in a smoke test — bodies through bodies, which is the one
-            // thing a crowd generator may never do.
             [
-                ix as f32 * d - (cols as f32 - 1.0) * d * 0.5 + rng.between(-1.0 / 6.0, 1.0 / 6.0) * d,
-                iz as f32 * d - (rows as f32 - 1.0) * d * 0.5 + rng.between(-1.0 / 6.0, 1.0 / 6.0) * d,
+                ix as f32 * d - (cols as f32 - 1.0) * d * 0.5 + rng.between(-JITTER_FRACTION, JITTER_FRACTION) * d,
+                iz as f32 * d - (rows as f32 - 1.0) * d * 0.5 + rng.between(-JITTER_FRACTION, JITTER_FRACTION) * d,
             ]
         }
     }
@@ -284,12 +269,14 @@ pub fn plan_crowd(spec: &CrowdSpec, seed: u64) -> Result<Vec<PlacedPerson>, Core
     let mut rng = SeedRng::new(seed);
     let mut people = Vec::with_capacity(spec.count);
     for i in 0..spec.count {
-        // Drawn in person order, always, before any culling — see the docstring.
+        // Drawn in person order, always, before the spot is even computed:
+        // nothing downstream may skip a draw, or one person's role would shift
+        // the whole crowd's style. See the function's doc comment.
         let role = pick_role(&roles, &mut rng);
         let glance = rng.between(-jitter, jitter);
         let [x, z] = slot(spec.formation, spec, i, &mut rng);
         people.push(PlacedPerson {
-            actor: wire_of(actor_of(role)),
+            actor: role,
             position: [x, 0.0, z],
             yaw: glance,
         });
@@ -383,6 +370,37 @@ mod tests {
     }
 
     #[test]
+    fn the_crowd_envelope_holds_what_the_plan_can_produce() {
+        // The envelope decides whether a crowd is refused, so it may not be one
+        // lucky sample: a tighter box would turn down a crowd that fits, and
+        // which seed was asked for would decide the answer.
+        let mut spec = spec("scattered", 60);
+        spec.rows = Some(6);
+        let box_ = crowd_footprint(&spec);
+        for seed in 0..40u64 {
+            for person in plan_crowd(&spec, seed).unwrap() {
+                let at = [person.position[0], 0.0, person.position[2]];
+                let lo = [
+                    box_.offset[0] - box_.half[0],
+                    box_.offset[1] - box_.half[1],
+                    box_.offset[2] - box_.half[2],
+                ];
+                let hi = [
+                    box_.offset[0] + box_.half[0],
+                    box_.offset[1] + box_.half[1],
+                    box_.offset[2] + box_.half[2],
+                ];
+                for axis in 0..3 {
+                    assert!(
+                        at[axis] >= lo[axis] - 1e-4 && at[axis] <= hi[axis] + 1e-4,
+                        "seed {seed}: person outside the envelope on axis {axis}: {at:?} not in {lo:?}..{hi:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_too_big_crowd_is_a_clear_error_with_the_limit_in_it() {
         let err = plan_crowd(&spec("scattered", MAX_CROWD_PHANTOMS + 1), 1).unwrap_err().to_string();
         assert!(err.contains("128"), "{err}");
@@ -428,12 +446,32 @@ pub fn crowd_footprint(spec: &CrowdSpec) -> crate::stage::Footprint {
     // narrow, and calling it a square would turn down a queue that fits along
     // the wall. Half-extent plus the center, so the formation may sit anywhere
     // inside it — the origin is not its middle.
-    let mut rng = SeedRng::new(0);
     let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
-    for i in 0..spec.count {
-        let [x, z] = slot(spec.formation, spec, i, &mut rng);
-        lo = [lo[0].min(x), lo[1].min(z)];
-        hi = [hi[0].max(x), hi[1].max(z)];
+    if spec.formation == CrowdFormation::Scattered {
+        // The jitter is a random draw, so the measured box above is one
+        // particular crowd's, and an unlucky seed would report a tighter box
+        // than the plan is allowed to produce — which is a refusal the caller
+        // could not reproduce. Take the grid and add the cap instead: this box
+        // holds every seed, and refuses nothing that would actually fit.
+        let (rows, cols) = grid_of(spec.count, spec.rows);
+        let (jx, jz) = (JITTER_FRACTION * spec.spacing, JITTER_FRACTION * spec.spacing);
+        lo = [
+            -(cols as f32 - 1.0) * spec.spacing * 0.5 - jx,
+            -(rows as f32 - 1.0) * spec.spacing * 0.5 - jz,
+        ];
+        hi = [
+            (cols as f32 - 1.0) * spec.spacing * 0.5 + jx,
+            (rows as f32 - 1.0) * spec.spacing * 0.5 + jz,
+        ];
+    } else {
+        // The other four shapes are deterministic, so their envelope is simply
+        // the box their spots occupy.
+        let mut rng = SeedRng::new(0);
+        for i in 0..spec.count {
+            let [x, z] = slot(spec.formation, spec, i, &mut rng);
+            lo = [lo[0].min(x), lo[1].min(z)];
+            hi = [hi[0].max(x), hi[1].max(z)];
+        }
     }
     let height = roles_of(&spec.mix)
         .iter()
